@@ -179,7 +179,7 @@ export class Engine {
   constructor(d: EngineDeps) {
     // The config is the engine's, the executor's and every trigger's: nobody may change it under the caps.
     deepFreeze(d.cfg);
-    this.stopped = new Promise<void>((r) => (this.signalStop = r));
+
     this.d = d;
     this.now = d.now ?? Date.now;
     mkdirSync(join(d.cfg.stateDir, "requests"), { recursive: true });
@@ -252,14 +252,43 @@ export class Engine {
     return this.stopRequested;
   };
 
-  /** Resolved once STOP or a signal is seen: every run-loop sleep races it. */
-  private stopped!: Promise<void>;
-  private signalStop: () => void = () => undefined;
+  /** Run-loop sleeps waiting now: STOP ends them all. Each removes itself when it ends (nothing accumulates). */
+  private sleepers = new Set<() => void>();
+
+  /** STOP or a signal: end every sleep and the entries loop's idle wait. */
+  private signalStop(): void {
+    for (const r of [...this.sleepers]) r();
+    const w = this.wakeWaiter;
+    this.wakeWaiter = null;
+    w?.();
+  }
+
+  /** p, or STOP if it comes first. The STOP wait is dropped as soon as either ends. */
+  private untilStopOr<T>(p: Promise<T>): Promise<T | void> {
+    if (this.stopRequested) return Promise.resolve();
+    let done!: () => void;
+    const stop = new Promise<void>((r) => {
+      done = () => {
+        this.sleepers.delete(done);
+        r();
+      };
+      this.sleepers.add(done);
+    });
+    return Promise.race([p, stop]).finally(() => done());
+  }
 
   /** Sleep ms (real time), or less if STOP arrives. */
   private sleepUnlessStopped(ms: number): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    return Promise.race([new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, ms)))), this.stopped]).finally(() => clearTimeout(timer));
+    if (this.stopRequested) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.sleepers.delete(done);
+        resolve();
+      };
+      const timer = setTimeout(done, Math.max(0, ms));
+      this.sleepers.add(done);
+    });
   }
 
   /** Each cycle has a time budget; work left over waits for the next cycle. */
@@ -353,17 +382,22 @@ export class Engine {
           this.wakePending = false;
           nextPoll = this.now() + loopMs;
           this.lanes++;
-          await this.guard("poll", () => this.pollOnce());
+          // A slow poll does not hold up STOP (the poll itself is bounded by the trigger timeout).
+          await this.untilStopOr(this.guard("poll", () => this.pollOnce()));
+          if (this.shouldStop()) break;
         }
         this.startDecides(k, loopMs);
         // Until a decide ends, a wake, STOP, or the next poll is due, or a re-ask when a decide slot is free. Never a
         // spin: at least a few ms between rounds.
         const askAt = this.inflight.size < k ? this.nextAskDue() : Number.POSITIVE_INFINITY;
         const dueIn = Math.max(5, Math.min(nextPoll, askAt) - this.now());
-        await Promise.race([...this.inflight.values(), this.idle(dueIn), this.stopped]);
+        await Promise.race([...this.inflight.values(), this.idle(dueIn)]);
       }
     })();
     await Promise.all([exitsLoop, fullLoop, entriesLoop]);
+    // Drain the money lock: a booking's build and submit, or a sweep, in flight when STOP came finishes before run()
+    // returns (the runtime then closes the ledger). Anything that gets the lock after STOP books nothing.
+    await this.exclusive(async () => undefined);
     this.writeStatus();
   }
 
@@ -391,7 +425,13 @@ export class Engine {
         }
       }],
       ["nag", () => locked("nag", async () => this.nag())],
-      ["surplus", () => locked("surplus", () => this.surplus())],
+      // Surplus: which coins are due and the verdicts under the lock, the balance reads outside it.
+      ["surplus", async () => {
+        const due = await this.exclusive(async () => this.surplusDue());
+        if (!due.length || this.shouldStop()) return;
+        const balances = await this.surplusReads(due);
+        await locked("surplus", async () => this.surplusJudge(due, balances));
+      }],
     ];
     for (const [name, fn] of steps) {
       if (this.shouldStop()) break;
@@ -621,12 +661,18 @@ export class Engine {
    * coin is in flight.
    */
   private async surplus(): Promise<void> {
-    if (this.dry) return;
+    const due = this.surplusDue();
+    if (!due.length) return;
+    this.surplusJudge(due, await this.surplusReads(due));
+  }
+
+  /** The coins due a surplus check now (and their next check time set). */
+  private surplusDue(): string[] {
+    if (this.dry) return [];
     const held = this.mine("opening", "open", "exit_stuck");
     // Also coins whose position ended within the last hour: a late second execution can outlive the position.
     const recent = this.mine("closed", "failed").filter((p) => p.closed_at !== null && this.now() - p.closed_at < SURPLUS_TAIL_MS);
     const mints = [...new Set([...held, ...recent].map((p) => p.mint))];
-    // The coins due a check, then their balances read SURPLUS_READS at a time (reads only), then judged in order.
     const due: string[] = [];
     for (const mint of mints) {
       if ((this.surplusAt.get(mint) ?? 0) > this.now()) continue;
@@ -635,16 +681,28 @@ export class Engine {
       this.surplusAt.set(mint, this.now() + SURPLUS_CHECK_MS);
       due.push(mint);
     }
+    return due;
+  }
+
+  /** The wallet's balance of each coin, SURPLUS_READS at a time (reads only). */
+  private async surplusReads(due: string[]): Promise<Map<string, bigint | null>> {
     const balances = new Map<string, bigint | null>();
     for (let i = 0; i < due.length; i += SURPLUS_READS) {
-      if (this.shouldStop()) return;
+      if (this.shouldStop()) break;
       const part = due.slice(i, i + SURPLUS_READS);
       const got = await Promise.all(part.map((m) => tokenBalance(this.d.rpc, this.d.cfg.wallet, m)));
       part.forEach((m, j) => balances.set(m, got[j]));
     }
+    return balances;
+  }
+
+  /** Judge each coin against what the ledger holds now; a coin with an order in flight now waits for its next check. */
+  private surplusJudge(due: string[], balances: Map<string, bigint | null>): void {
+    const held = this.mine("opening", "open", "exit_stuck");
     for (const mint of due) {
       if (this.shouldStop()) return;
       const ps = held.filter((p) => p.mint === mint);
+      if (ps.some((p) => p.status === "opening" || this.d.ledger.openOrderFor(p.id))) continue;
       const bal = balances.get(mint) ?? null;
       if (bal === null) continue;
       const booked = ps.reduce((t, p) => t + BigInt(p.remaining_raw), 0n);
@@ -813,6 +871,7 @@ export class Engine {
   /** The entries step of cycle() (under the lock). Returns true when it stopped on its budget with candidates left. */
   private async entries(t0: number = this.now()): Promise<boolean> {
     const t = this.d.trigger;
+    this.pruneCurves();
     if (!this.hung.has("poll")) {
       const got = await this.bounded("poll", t0, () => t.poll(this.ctx));
       for (const raw of Array.isArray(got) ? got : []) {
