@@ -259,14 +259,6 @@ export class Ledger {
       .all(now + leaseMs, now, now, now, opts.dryOnly ? 1 : 0, limit) as unknown as OrderRow[];
   }
 
-  /** Orders of one side and mode that are due an attempt now (pending, past their next_attempt_at). Read only. */
-  dueOrders(now: number, side: Side, dry: boolean): number {
-    const r = this.db
-      .prepare("select count(*) n from orders o join positions p on p.id = o.position_id where o.side = ? and o.status = 'pending' and o.next_attempt_at <= ? and p.dry = ?")
-      .get(side, now, dry ? 1 : 0) as { n: number };
-    return Number(r.n);
-  }
-
   updateOrder(id: number, fields: Partial<Omit<OrderRow, "id">>): void {
     const keys = Object.keys(fields);
     if (!keys.length) return;

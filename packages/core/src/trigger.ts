@@ -138,6 +138,11 @@ export interface Trigger {
   readonly name: string;
   /** The status.json `stats` key that counts candidates (default "candidates"). */
   readonly candidateLabel?: string;
+  /**
+   * (0.2.0) How many candidates the run loop may decide at once (different coins; default 1, at most 16). Decides run
+   * outside the money lock; bookings are one at a time.
+   */
+  readonly concurrency?: number;
   /** Prefix of buy order ids (clientTradeId `<prefix>-<uuid>`), default "bot". */
   readonly buyIdPrefix?: string;
   /** Prefix of sell order ids, default "bots". */

@@ -33,6 +33,8 @@ export interface Config {
   signer?: SignerConfig;
   stateDir: string;
   loopMs: number;
+  /** (0.2.0) The exit-only tick: market reads, exits and sells every exitMs in the run loop (200 ms to loopMs). */
+  exitMs: number;
   buy: {
     sol: number;
     maxSlippageBps: number;
@@ -131,7 +133,7 @@ export type Sections = Record<string, SectionParser<unknown>>;
 export type BotConfig<S extends Sections> = Config & { [K in keyof S]: ReturnType<S[K]> };
 
 const CORE_KEYS = ["mode", "apiUrl", "apiKeyEnv", "rpcUrlEnv", "rpcWsUrlEnv", "wallet", "linkedWalletId", "privyWalletId", "privyAppId",
-  "signer", "payer", "stateDir", "loopMs", "buy", "sell", "exit", "retry", "alerts", "$schema", "comment"];
+  "signer", "payer", "stateDir", "loopMs", "exitMs", "buy", "sell", "exit", "retry", "alerts", "$schema", "comment"];
 
 export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = process.cwd(), sections: S = {} as S): BotConfig<S> {
   if (!isObj(raw)) throw new ConfigError("config: must be a JSON object");
@@ -177,6 +179,7 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
 
   const stateDir = resolve(baseDir, str(raw, "stateDir", "config", { def: "./state" })!);
   const loopMs = num(raw, "loopMs", "config", { min: 200, max: 60_000, int: true, def: 2000 });
+  const exitMs = num(raw, "exitMs", "config", { min: 200, max: loopMs, int: true, def: Math.min(500, loopMs) });
 
   if (!isObj(raw.buy)) throw new ConfigError("config.buy: required object");
   const b = raw.buy;
@@ -235,7 +238,7 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
   };
 
   // Frozen through: the engine, the executor and every trigger read this one object, and none may change it.
-  return deepFreeze({ mode, payer, apiUrl, apiKeyEnv, rpcUrlEnv, rpcWsUrlEnv, wallet, linkedWalletId, privyWalletId, privyAppId, signer, stateDir, loopMs, buy, sell, ...own, exit, retry, alerts, configDir: resolve(baseDir) }) as BotConfig<S>;
+  return deepFreeze({ mode, payer, apiUrl, apiKeyEnv, rpcUrlEnv, rpcWsUrlEnv, wallet, linkedWalletId, privyWalletId, privyAppId, signer, stateDir, loopMs, exitMs, buy, sell, ...own, exit, retry, alerts, configDir: resolve(baseDir) }) as BotConfig<S>;
 }
 
 export function loadConfig<S extends Sections = {}>(path: string, sections: S = {} as S): BotConfig<S> {

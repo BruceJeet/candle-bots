@@ -46,10 +46,7 @@ export const STRATEGY_ERROR_ALERT = 3;
  * looks at the exits again; what is left goes on in the next lane.
  */
 export const LANE_BUDGET_MS = 1_000;
-/** The expected-fill check reuses the trigger's curve read only if it is at most this old. */
-export const CURVE_REUSE_MS = 1_000;
-/** Most queued buy orders one lane builds (its time budget usually ends it first). */
-export const LANE_SWEEP_MAX = 50;
+
 /** A wake waits until no new wake came for this long before its lane runs: a burst gives one lane, not a storm. */
 export const WAKE_DEBOUNCE_MS = 10;
 /** ... but never longer than this after the first wake. */
@@ -149,8 +146,14 @@ export class Engine {
   /** What every trigger call gets. */
   readonly ctx: TriggerContext;
 
-  /** Fast entry lanes run (see run()). */
+  /** Entries-loop polls run (run(), lane()). */
   lanes = 0;
+  /** Exit ticks run (run()). */
+  exitTicks = 0;
+  /** Decides in flight (the entries loop), by mint. */
+  private inflight = new Map<string, Promise<void>>();
+  /** When a waiting candidate is asked again (the entries loop). */
+  private nextAsk = new Map<string, number>();
   /** A wake arrived and its lane has not run yet. */
   private wakePending = false;
   private lastWakeAt = 0;
@@ -159,6 +162,11 @@ export class Engine {
   private work: Promise<unknown> = Promise.resolve();
   /** The engine's own curve reads in this entries step, by account (a trigger's ctx.readCurve and expectedOut share it). */
   private curveCache = new Map<string, { at: number; read: Promise<CurveRead> }>();
+  /** Drop curve reads too old to be reused by anyone. */
+  private pruneCurves(): void {
+    const keep = this.d.cfg.exitMs * 10;
+    for (const [k, v] of this.curveCache) if (this.now() - v.at > keep) this.curveCache.delete(k);
+  }
   /** Where the next entries step starts when the last one stopped on its budget (round robin; null: the head). */
   private resumeAt: string | null = null;
   /** Consecutive exit-strategy errors per position. */
@@ -169,6 +177,7 @@ export class Engine {
   constructor(d: EngineDeps) {
     // The config is the engine's, the executor's and every trigger's: nobody may change it under the caps.
     deepFreeze(d.cfg);
+    this.stopped = new Promise<void>((r) => (this.signalStop = r));
     this.d = d;
     this.now = d.now ?? Date.now;
     mkdirSync(join(d.cfg.stateDir, "requests"), { recursive: true });
@@ -221,6 +230,7 @@ export class Engine {
 
   requestStop(): void {
     this.stopRequested = true;
+    this.signalStop();
     const w = this.wakeWaiter;
     this.wakeWaiter = null;
     w?.();
@@ -235,16 +245,30 @@ export class Engine {
     if (!this.stopRequested && readControl(join(this.d.cfg.stateDir, "STOP")) !== null) {
       this.d.log.info("stop_file_seen");
       this.stopRequested = true;
+      this.signalStop();
     }
     return this.stopRequested;
   };
+
+  /** Resolved once STOP or a signal is seen: every run-loop sleep races it. */
+  private stopped!: Promise<void>;
+  private signalStop: () => void = () => undefined;
+
+  /** Sleep ms (real time), or less if STOP arrives. */
+  private sleepUnlessStopped(ms: number): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([new Promise<void>((r) => (timer = setTimeout(r, Math.max(0, ms)))), this.stopped]).finally(() => clearTimeout(timer));
+  }
 
   /** Each cycle has a time budget; work left over waits for the next cycle. */
   private overBudget(t0: number): boolean {
     return this.now() - t0 > CYCLE_BUDGET_MS;
   }
 
-  /** Run fn when no other cycle or lane is running. */
+  /**
+   * The money lock: fn runs when no other holder runs. Held by full cycles, exit ticks and each booking (the cap check,
+   * the booking transaction and that order's build and submit). Never held by a trigger call (poll, decide).
+   */
   private exclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.work.then(fn, fn);
     this.work = run.catch(() => undefined);
@@ -266,6 +290,9 @@ export class Engine {
 
   /** Wait up to ms, or until a wake or a stop request. */
   private idle(ms: number): Promise<void> {
+    // One idle wait at a time: a new one ends the last (its timer cleared, its promise resolved).
+    this.wakeWaiter?.();
+    this.wakeWaiter = null;
     if (this.wakePending || this.stopRequested || ms <= 0) return Promise.resolve();
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
@@ -280,85 +307,264 @@ export class Engine {
   }
 
   /**
-   * The run loop. A full cycle (exits first, then entries and orders) runs loopMs after the last one ended, as in 0.1.0.
-   * Between full cycles the loop sleeps, and a wake (ctx.wake, from the trigger's source) runs a fast entry lane: new
-   * candidates are decided and their buys built and submitted at once, without waiting for the next full cycle. A full
-   * cycle that is due always runs before another lane, so a stop-loss waits for at most one lane. Returns on STOP.
+   * The run loop: three loops that share only the money lock.
+   *  - exits: every cfg.exitMs (a stop-aware sleep after each tick), the exit tick under the lock: sells in flight, one
+   *    batched market read for the open coins, the exit strategy, new sells. Skipped (no RPC) with no open position.
+   *  - full cycle: every loopMs after the last one ended, under the lock: sell requests, settle buys, the orders sweep,
+   *    alerts, the surplus check, status.json.
+   *  - entries: polls on a wake (debounced) or every loopMs, and decides pending candidates, trigger.concurrency at a
+   *    time (default 1), OUTSIDE the lock. A candidate that waits is asked again after loopMs. Each buy verdict takes
+   *    the lock to check the caps again, book (one ledger transaction) and build and submit that order.
+   * A hung or slow trigger call never holds the lock, so it never delays an exit. Returns once STOP is seen.
    */
   async run(loopMs: number): Promise<void> {
-    // Due times use the engine's clock (this.now); the debounce uses real time. A clock that never advances (a frozen
-    // test clock) gives one full cycle and then lanes only.
-    let nextFull = 0;
-    for (;;) {
-      if (this.now() >= nextFull) {
-        const ok = await this.cycle();
-        nextFull = this.now() + loopMs;
-        if (!ok) return;
+    const exitMs = Math.max(200, Math.min(this.d.cfg.exitMs ?? loopMs, loopMs));
+    const k = Math.max(1, Math.min(16, Math.floor(Number(this.d.trigger.concurrency ?? 1)) || 1));
+    const exitsLoop = (async () => {
+      while (!this.shouldStop()) {
+        await this.exclusive(() => this.exitTick());
+        await this.sleepUnlessStopped(exitMs);
+      }
+    })();
+    const fullLoop = (async () => {
+      while (!this.shouldStop()) {
+        if (!(await this.runCycle())) break;
+        await this.sleepUnlessStopped(loopMs);
+      }
+    })();
+    const entriesLoop = (async () => {
+      let nextPoll = 0;
+      while (!this.shouldStop()) {
+        if (this.wakePending || this.now() >= nextPoll) {
+          if (this.wakePending) {
+            // Debounce: wait for WAKE_DEBOUNCE_MS without a new wake (at most WAKE_DEBOUNCE_MAX_MS): a burst gives one poll.
+            const first = Date.now();
+            while (Date.now() - this.lastWakeAt < WAKE_DEBOUNCE_MS && Date.now() - first < WAKE_DEBOUNCE_MAX_MS) await new Promise((r) => setTimeout(r, WAKE_DEBOUNCE_MS));
+          }
+          this.wakePending = false;
+          nextPoll = this.now() + loopMs;
+          this.lanes++;
+          await this.guard("poll", () => this.pollOnce());
+        }
+        this.startDecides(k, loopMs);
+        // Until a decide ends, a wake, STOP, or the next poll is due, or a re-ask when a decide slot is free. Never a
+        // spin: at least a few ms between rounds.
+        const askAt = this.inflight.size < k ? this.nextAskDue() : Number.POSITIVE_INFINITY;
+        const dueIn = Math.max(5, Math.min(nextPoll, askAt) - this.now());
+        await Promise.race([...this.inflight.values(), this.idle(dueIn), this.stopped]);
+      }
+    })();
+    await Promise.all([exitsLoop, fullLoop, entriesLoop]);
+    this.writeStatus();
+  }
+
+  /**
+   * The run loop's full cycle: sell requests, settle buys, the orders sweep, alerts, the surplus check, status.json.
+   * Each step takes the lock on its own and the orders sweep takes it once per order, so an exit tick waits at most for
+   * one step or one order attempt, never a whole cycle.
+   */
+  private async runCycle(): Promise<boolean> {
+    const t0 = this.now();
+    const budget = () => Math.max(1_000, CYCLE_BUDGET_MS - (this.now() - t0));
+    const locked = (name: string, fn: () => Promise<void>) => this.exclusive(() => this.guard(name, fn));
+    const steps: Array<[string, () => Promise<void>]> = [
+      ["requests", () => locked("requests", () => this.manualRequests())],
+      ["settle-buys", async () => {
+        for (const id of this.dueOrderIds({ side: "buy", reconcileOnly: true })) {
+          if (this.shouldStop()) break;
+          await locked("settle-buys", () => this.d.executor.sweep(1, { onlyIds: [id], side: "buy", reconcileOnly: true, budgetMs: budget(), shouldStop: this.shouldStop }));
+        }
+      }],
+      ["orders", async () => {
+        for (const id of this.dueOrderIds({})) {
+          if (this.shouldStop() || this.overBudget(t0)) break;
+          await locked("orders", () => this.d.executor.sweep(1, { onlyIds: [id], budgetMs: budget(), shouldStop: this.shouldStop }));
+        }
+      }],
+      ["nag", () => locked("nag", async () => this.nag())],
+      ["surplus", () => locked("surplus", () => this.surplus())],
+    ];
+    for (const [name, fn] of steps) {
+      if (this.shouldStop()) break;
+      if (this.overBudget(t0) && !["settle-buys", "nag"].includes(name)) continue;
+      await fn();
+    }
+    await this.exclusive(async () => {
+      if (!this.shouldStop()) {
+        this.cycles++;
+        this.lastCycleMs = this.now() - t0;
+      }
+      this.writeStatus();
+    });
+    return !this.shouldStop();
+  }
+
+  /**
+   * The orders a sweep of 5 would claim now, in its order (sells first, then by next attempt): each is then swept on
+   * its own (its claim checks again that it is due), so every order runs at most once per step, as in sweep(5).
+   */
+  private dueOrderIds(opts: { side?: "buy" | "sell"; reconcileOnly?: boolean }): number[] {
+    const now = this.now();
+    const side = opts.side === "buy" ? "and o.side = 'buy'" : opts.side === "sell" ? "and o.side = 'sell'" : "";
+    const rec = opts.reconcileOnly ? "and (o.signature is not null or o.ever_signed = 1)" : "";
+    const rows = this.d.ledger.db
+      .prepare(
+        `select o.id id from orders o join positions p on p.id = o.position_id
+          where ((o.status = 'pending' and o.next_attempt_at <= ?) or (o.status = 'inflight' and o.lease_until <= ?))
+            and (? = 0 or p.dry = 1) ${side} ${rec}
+          order by (o.side = 'sell') desc, o.next_attempt_at limit 5`,
+      )
+      .all(now, now, this.dry ? 1 : 0) as Array<{ id: number }>;
+    return rows.map((r) => Number(r.id));
+  }
+
+  /** The exit tick (under the lock): sells in flight, market reads, exits, new sells. No RPC without open positions. */
+  private async exitTick(): Promise<void> {
+    if (this.shouldStop() || !this.mine("open", "exit_stuck").length) return;
+    const t0 = this.now();
+    const sweep = () => this.d.executor.sweep(5, { side: "sell", budgetMs: Math.max(1_000, CYCLE_BUDGET_MS - (this.now() - t0)), shouldStop: this.shouldStop });
+    await this.guard("sells", sweep);
+    if (this.shouldStop()) return;
+    await this.guard("exits", () => this.exits());
+    if (this.shouldStop()) return;
+    await this.guard("sells2", sweep);
+    this.exitTicks++;
+  }
+
+  /** Poll the trigger (outside the lock) and add its candidates to the pending set. */
+  private async pollOnce(): Promise<void> {
+    const t = this.d.trigger;
+    if (this.hung.has("poll")) return;
+    const got = await this.bounded("poll", this.now(), () => t.poll(this.ctx));
+    for (const raw of Array.isArray(got) ? got : []) {
+      this.stats.candidates++;
+      const c = this.snapshot(raw);
+      if ("bad" in c) {
+        this.stats.skips++;
+        this.d.log.warn("candidate_refused", { mint: c.mint, reason: c.bad });
         continue;
       }
-      if (this.wakePending) {
-        // Debounce: wait for WAKE_DEBOUNCE_MS without a new wake (at most WAKE_DEBOUNCE_MAX_MS), so a burst gives one lane.
-        const first = Date.now();
-        while (Date.now() - this.lastWakeAt < WAKE_DEBOUNCE_MS && Date.now() - first < WAKE_DEBOUNCE_MAX_MS) await new Promise((r) => setTimeout(r, WAKE_DEBOUNCE_MS));
-        this.wakePending = false;
-        // The lane yields at the next full cycle's due time (or its own budget), whichever comes first.
-        if (!(await this.lane(nextFull))) return;
-        continue;
-      }
-      if (this.stopRequested) {
-        this.writeStatus();
-        return;
-      }
-      await this.idle(nextFull - this.now());
+      this.pending.set(c.mint, { candidate: c, firstSeenMs: this.now(), lastReason: "" });
+      this.nextAsk.delete(c.mint);
+    }
+    this.pruneCurves();
+    if (t.afterEntries) this.hook("afterEntries", () => t.afterEntries!(this.ctx));
+  }
+
+  /** The earliest time a waiting candidate is due to be asked again (Infinity: none). */
+  private nextAskDue(): number {
+    let at = Number.POSITIVE_INFINITY;
+    for (const mint of this.pending.keys()) {
+      if (this.inflight.has(mint) || this.hung.has(`decide:${mint}`)) continue;
+      at = Math.min(at, this.nextAsk.get(mint) ?? 0);
+    }
+    return at;
+  }
+
+  /** Start decides for due pending candidates, up to k in flight (each runs outside the lock). */
+  private startDecides(k: number, reaskMs: number): void {
+    for (const [mint, p] of this.pending) {
+      if (this.inflight.size >= k || this.shouldStop()) return;
+      if (this.inflight.has(mint) || this.hung.has(`decide:${mint}`)) continue;
+      if ((this.nextAsk.get(mint) ?? 0) > this.now()) continue;
+      const task = this.decideOne(mint, p, reaskMs).finally(() => this.inflight.delete(mint));
+      this.inflight.set(mint, task);
     }
   }
 
   /**
-   * A fast entry lane: STOP, then the entries step, where each buy is built and submitted as soon as it is booked, for
-   * at most LANE_BUDGET_MS of deciding (the buy in flight finishes). No exit work: the next full cycle does that.
-   * Returns false when STOP was seen.
+   * One candidate: the trigger's verdict (outside the lock, under the trigger timeout), the engine's caps and expected
+   * fill (outside the lock: reads), then for a buy the lock: STOP, the caps again, onVerdict, the booking transaction
+   * (caps checked once more inside it), and that order's build and submit. A verdict that comes back after STOP books
+   * nothing and leaves the candidate pending. Never throws.
    */
-  lane(dueAt = Number.POSITIVE_INFINITY): Promise<boolean> {
-    return this.exclusive(async () => {
-      const t0 = this.now();
-      const until = Math.min(t0 + LANE_BUDGET_MS, dueAt);
-      this.lanes++;
-      if (this.shouldStop()) {
-        this.writeStatus();
-        return false;
+  private async decideOne(mint: string, p: Pending, reaskMs: number): Promise<void> {
+    const t = this.d.trigger;
+    try {
+      const info = (): PendingInfo => Object.freeze({ firstSeenMs: p.firstSeenMs, lastReason: p.lastReason });
+      let v = this.checked(await this.bounded(`decide:${mint}`, this.now(), () => t.decide(p.candidate, this.ctx, info())), p.candidate);
+      if (this.pending.get(mint) !== p || this.shouldStop()) return;
+      if (v.verdict === "buy") v = this.capCheck(mint, v);
+      if (v.verdict === "buy") {
+        const expected = await this.expectedOut(mint, v.lamports, v.expectedOutRaw);
+        if (this.pending.get(mint) !== p || this.shouldStop()) return;
+        v = Object.freeze({ ...v, expectedOutRaw: expected });
       }
-      let more = false;
-      await this.guard("lane", async () => void (more = await this.entries(t0, true, until)));
-      // Then buy orders already queued (a full cycle builds 5 per cycle), within what is left of the lane's time.
-      const left = until - this.now();
-      if (left > 0 && !this.shouldStop()) await this.d.executor.sweep(LANE_SWEEP_MAX, { side: "buy", budgetMs: left, shouldStop: this.shouldStop });
-      // Candidates or due buys left when the lane's budget ran out: another lane, after any full cycle that is due.
-      if (more || this.d.ledger.dueOrders(this.now(), "buy", this.dry) > 0) this.wakePending = true;
-      const stop = this.shouldStop();
-      this.writeStatus();
-      return !stop;
-    });
+      if (v.verdict === "wait") {
+        if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(v), this.ctx, info()));
+        else if (v.reason !== p.lastReason) this.d.log.info("candidate_wait", { mint, source: p.candidate.source, reason: v.reason });
+        p.lastReason = v.reason;
+        this.nextAsk.set(mint, this.now() + reaskMs);
+        return;
+      }
+      if (v.verdict === "skip") {
+        this.pending.delete(mint);
+        if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(v), this.ctx, info()));
+        else this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: v.reason });
+        this.stats.skips++;
+        return;
+      }
+      const buyV = v;
+      await this.exclusive(async () => {
+        // Under the lock: nothing books after STOP; the caps as they stand now (another booking may have run).
+        if (this.shouldStop() || this.pending.get(mint) !== p) return;
+        const final = this.capCheck(mint, buyV);
+        this.pending.delete(mint);
+        if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(final), this.ctx, info()));
+        else if (final.verdict === "skip") this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: final.reason });
+        if (final.verdict !== "buy") {
+          this.stats.skips++;
+          return;
+        }
+        const order = this.buy(p.candidate, final);
+        if (order !== null) await this.d.executor.sweep(1, { onlyIds: [order], side: "buy", budgetMs: CYCLE_BUDGET_MS, shouldStop: this.shouldStop });
+      });
+    } catch (e) {
+      // A throw or a timeout: logged as a failed entries step; the candidate stays pending and is asked again later.
+      this.d.log.error("cycle_step_failed", { step: "entries", mint, error: String((e as Error)?.stack ?? e) });
+      this.nextAsk.set(mint, this.now() + reaskMs);
+    }
+  }
+
+  /**
+   * One round of the entries loop, for callers that drive the engine themselves: poll, then decide every due candidate
+   * (trigger.concurrency at a time) and wait for those decides and their bookings. Returns false when STOP was seen.
+   */
+  async lane(): Promise<boolean> {
+    if (this.shouldStop()) return false;
+    this.lanes++;
+    await this.guard("poll", () => this.pollOnce());
+    const k = Math.max(1, Math.min(16, Math.floor(Number(this.d.trigger.concurrency ?? 1)) || 1));
+    const reask = this.d.cfg.loopMs;
+    for (;;) {
+      this.startDecides(k, reask);
+      if (!this.inflight.size) break;
+      await Promise.race(this.inflight.values());
+      if (this.shouldStop()) break;
+    }
+    await Promise.all(this.inflight.values());
+    return !this.shouldStop();
   }
 
   /** One full cycle. Returns false when STOP was seen (the caller exits cleanly). */
+  /**
+   * One full cycle, entries included (for callers that drive the engine themselves; run() keeps entries and exits on
+   * their own loops). Its entries step decides for at most LANE_BUDGET_MS, under the lock. Returns false on STOP.
+   */
   cycle(): Promise<boolean> {
-    return this.exclusive(() => this.fullCycle());
+    return this.exclusive(() => this.fullCycle(true));
   }
 
-  private async fullCycle(): Promise<boolean> {
+  private async fullCycle(all: boolean): Promise<boolean> {
     const t0 = this.now();
     const sweep = (side?: "buy" | "sell", reconcileOnly = false) => this.d.executor.sweep(5, { side, reconcileOnly, budgetMs: Math.max(1_000, CYCLE_BUDGET_MS - (this.now() - t0)), shouldStop: this.shouldStop });
     // Exits first: a stop-loss never waits behind new entries.
     const steps: Array<[string, () => Promise<void>]> = [
       ["requests", () => this.manualRequests()],
-      ["sells", () => sweep("sell")],
-      ["exits", () => this.exits()],
-      ["sells2", () => sweep("sell")],
+      ...(all ? ([["sells", () => sweep("sell")], ["exits", () => this.exits()], ["sells2", () => sweep("sell")]] as Array<[string, () => Promise<void>]>) : []),
       // Buys that may already have executed get their own slot: settling them never waits behind a slow sell side.
       ["settle-buys", () => sweep("buy", true)],
-      ["entries", async () => {
-        if (await this.entries(t0)) this.wakePending = true;
-      }],
+      ...(all ? ([["entries", async () => void (await this.entries(t0))]] as Array<[string, () => Promise<void>]>) : []),
       ["orders", () => sweep()],
       ["nag", async () => this.nag()],
       ["surplus", () => this.surplus()],
@@ -570,8 +776,10 @@ export class Engine {
    */
   private readCurve(mint: string, address?: string, opts: { maxAgeMs?: number; fresh?: (r: CurveRead) => boolean } = {}): Promise<CurveRead> {
     const key = typeof address === "string" && address ? address : curveOf(mint);
+    // A read is reused while at most exitMs old (and, for the bound, only if it did not fail).
     const hit = this.curveCache.get(key);
-    let p = hit && (opts.maxAgeMs === undefined || this.now() - hit.at <= opts.maxAgeMs) ? hit.read : undefined;
+    const maxAge = opts.maxAgeMs ?? this.d.cfg.exitMs;
+    let p = hit && this.now() - hit.at <= maxAge ? hit.read : undefined;
     if (!p) {
       p = (async (): Promise<CurveRead> => {
         let v: any;
@@ -593,9 +801,9 @@ export class Engine {
   }
 
   /** Returns true when it stopped on its time budget with candidates still pending. */
-  private async entries(t0: number = this.now(), lane = false, until = Number.POSITIVE_INFINITY): Promise<boolean> {
+  /** The entries step of cycle() (under the lock). Returns true when it stopped on its budget with candidates left. */
+  private async entries(t0: number = this.now()): Promise<boolean> {
     const t = this.d.trigger;
-    this.curveCache = new Map();
     if (!this.hung.has("poll")) {
       const got = await this.bounded("poll", t0, () => t.poll(this.ctx));
       for (const raw of Array.isArray(got) ? got : []) {
@@ -613,7 +821,6 @@ export class Engine {
     // Every entries step, in a lane or a full cycle, decides for at most LANE_BUDGET_MS; the rest goes on in lanes, so
     // the next exit pass never waits behind a long backlog.
     const tEntries = this.now();
-    let decided = 0;
     // Round robin across steps: a step that stopped on its budget resumes at the first candidate it did not reach, so
     // slow candidates at the head cannot starve the rest. A step that reaches the end starts the next one at the head
     // (the 0.1.0 order whenever everything fits in one step).
@@ -627,14 +834,12 @@ export class Engine {
         break;
       }
       if (!this.pending.has(mint)) continue;
-      // A lane decides at least one candidate, then yields at its deadline (a full cycle due).
-      if (this.overBudget(t0) || this.now() - tEntries > LANE_BUDGET_MS || (decided > 0 && this.now() >= until)) {
+      if (this.overBudget(t0) || this.now() - tEntries > LANE_BUDGET_MS) {
         more = true;
         this.resumeAt = mint;
         break;
       }
       if (this.hung.has(`decide:${mint}`)) continue;
-      decided++;
       const info = (): PendingInfo => Object.freeze({ firstSeenMs: p.firstSeenMs, lastReason: p.lastReason });
       let v = this.checked(await this.bounded(`decide:${mint}`, t0, () => t.decide(p.candidate, this.ctx, info())), p.candidate);
       if (v.verdict === "buy") v = this.capCheck(mint, v);
@@ -661,11 +866,8 @@ export class Engine {
         this.stats.skips++;
         continue;
       }
-      const order = this.buy(p.candidate, v);
-      // A fast lane builds and submits each buy at once (the full cycle's orders step does it otherwise).
-      if (lane && order !== null) await this.d.executor.sweep(1, { onlyIds: [order], side: "buy", budgetMs: CYCLE_BUDGET_MS, shouldStop: this.shouldStop });
+      this.buy(p.candidate, v);
     }
-    this.curveCache = new Map();
     if (t.afterEntries) this.hook("afterEntries", () => t.afterEntries!(this.ctx));
     return more;
   }
@@ -693,10 +895,10 @@ export class Engine {
   private async expectedOut(mint: string, lamports: bigint, fromTrigger: bigint | null): Promise<bigint | null> {
     // The engine's own read of the mint's curve PDA (shared with the trigger's ctx.readCurve in this step, never one
     // the trigger supplied).
-    // Reused only while fresh (CURVE_REUSE_MS: a slow decide can hold a read for seconds) and when it did not fail;
-    // otherwise read again, as 0.1.0 did.
+    // The engine's read for this booking: a cached read is reused only if it is at most exitMs old (a slow decide can
+    // hold one for seconds) and did not fail; otherwise read again, as 0.1.0 did.
     let mine: bigint | null = null;
-    let r = await this.readCurve(mint, undefined, { maxAgeMs: CURVE_REUSE_MS });
+    let r = await this.readCurve(mint, undefined, { maxAgeMs: this.d.cfg.exitMs });
     if (r.status === "failed") {
       this.curveCache.delete(curveOf(mint));
       r = await this.readCurve(mint);
