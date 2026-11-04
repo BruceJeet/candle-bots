@@ -79,6 +79,12 @@ type Outcome =
   | { kind: "retry"; code: string; detail: string; afterMs?: number }
   | { kind: "wait"; untilMs: number; why: string };
 
+/** (0.3.0) What an attempt started by startDue is told: the stop request, and when a first buy attempt is rechecked. */
+interface AttemptControl {
+  shouldStop?: () => boolean;
+  recheckAfterMs?: number;
+}
+
 export interface ErrorInfo {
   code: string;
   /** True when the error is Candle's own structured refusal (CandleApiError: string code + HTTP status). */
@@ -164,7 +170,7 @@ export class Executor {
    * these ids, whatever the lease says (a lease can expire while an attempt is still inside its Candle calls; within
    * one process that no longer lets a second claim in). The lease still covers a restart after a crash.
    */
-  private live = new Map<number, { mint: string; side: "buy" | "sell"; done: Promise<void> }>();
+  private live = new Map<number, { mint: string; side: "buy" | "sell" | "settle"; done: Promise<void> }>();
   /** Coins with a live attempt or reserved by the engine (reserveMint): at most one of either per coin. */
   private busy = new Map<string, "attempt" | "reserved">();
   /** Bumped whenever an attempt on the coin starts or ends (the engine's surplus check skips a coin that moved). */
@@ -179,8 +185,8 @@ export class Executor {
     return Number.isInteger(n) && n >= 1 ? n : 1;
   }
 
-  /** Live attempts by side. */
-  liveCount(side?: "buy" | "sell"): number {
+  /** Live attempts by side ("settle": settle-only buy attempts, outside the buy slots). */
+  liveCount(side?: "buy" | "sell" | "settle"): number {
     let n = 0;
     for (const l of this.live.values()) if (!side || l.side === side) n++;
     return n;
@@ -230,7 +236,7 @@ export class Executor {
    * Register a claimed order as live (synchronously, before anything awaits), run it, then free it. Never rejects:
    * runOne's own last-resort handler can still throw (a ledger write that fails), and nobody awaits a started attempt.
    */
-  private track(o: OrderRow, run: () => Promise<void>): Promise<void> {
+  private track(o: OrderRow, run: () => Promise<void>, kind: "buy" | "sell" | "settle" = o.side): Promise<void> {
     const mint = this.d.ledger.position(o.position_id)!.mint;
     this.busy.set(mint, "attempt");
     this.epochs.set(mint, this.mintEpoch(mint) + 1);
@@ -242,7 +248,7 @@ export class Executor {
         if (this.busy.get(mint) === "attempt") this.busy.delete(mint);
         this.epochs.set(mint, this.mintEpoch(mint) + 1);
       });
-    this.live.set(o.id, { mint, side: o.side, done });
+    this.live.set(o.id, { mint, side: kind, done });
     return done;
   }
 
@@ -253,28 +259,50 @@ export class Executor {
    * statement and is registered before the next, so two callers never start one order twice. Returns the started
    * attempts (each never rejects).
    */
-  startDue(opts: { onlyIds?: number[]; side?: "buy" | "sell"; shouldStop?: () => boolean } = {}): Array<Promise<void>> {
+  startDue(opts: { onlyIds?: number[]; side?: "buy" | "sell"; shouldStop?: () => boolean; settleEveryMs?: number } = {}): Array<Promise<void>> {
     const started: Array<Promise<void>> = [];
     const ran: number[] = [];
+    // A buy that waited for a slot longer than exitMs gets the impact recheck before its first build, as a retry does.
+    const ctl = { shouldStop: opts.shouldStop, recheckAfterMs: this.d.cfg.exitMs };
     for (;;) {
       if (opts.shouldStop?.()) break;
       const o = this.claimOne({ onlyIds: opts.onlyIds, excludeIds: ran, side: opts.side });
       if (!o) break;
       ran.push(o.id);
-      started.push(this.track(o, () => this.runOne(o, false, opts.shouldStop)));
+      started.push(this.track(o, () => this.runOne(o, false, ctl)));
+    }
+    // Every buy slot taken: buys that may already have executed (a signature, or a main-payer build) still settle
+    // beside them, settle-only (never a build), each at most once per settleEveryMs (a hand-back stays due).
+    if (opts.side !== "sell" && this.liveCount("buy") >= this.buySlots) {
+      const every = opts.settleEveryMs ?? 1_000;
+      for (const [id, at] of this.settledAt) if (this.now() - at >= every) this.settledAt.delete(id);
+      for (;;) {
+        if (opts.shouldStop?.()) break;
+        const due = this.d.ledger.claimDue(this.now(), LEASE_MS, 1, {
+          dryOnly: !this.d.rail, onlyIds: opts.onlyIds, excludeIds: [...ran, ...this.live.keys(), ...this.settledAt.keys()], excludeMints: [...this.busy.keys()], side: "buy", reconcileOnly: true,
+        });
+        const o = due[0];
+        if (!o) break;
+        ran.push(o.id);
+        this.settledAt.set(o.id, this.now());
+        started.push(this.track(o, () => this.runOne(o, true, ctl), "settle"));
+      }
     }
     return started;
   }
+
+  /** When each settle-only attempt beside full buy slots last ran (startDue). */
+  private settledAt = new Map<number, number>();
 
   /** Every live attempt has ended (those started while waiting too). */
   async drain(): Promise<void> {
     while (this.live.size) await Promise.all([...this.live.values()].map((l) => l.done));
   }
 
-  private async runOne(o: OrderRow, reconcileOnly = false, shouldStop?: () => boolean): Promise<void> {
+  private async runOne(o: OrderRow, reconcileOnly = false, ctl: AttemptControl = {}): Promise<void> {
     {
       try {
-        await this.attempt(o, reconcileOnly, shouldStop);
+        await this.attempt(o, reconcileOnly, ctl);
         return;
       } catch (e) {
         // Last-resort guard: count the attempt and reschedule. Never terminal while a signature may still land.
@@ -292,10 +320,12 @@ export class Executor {
     }
   }
 
-  private async attempt(o: OrderRow, reconcileOnly = false, shouldStop?: () => boolean): Promise<void> {
-    // (0.3.0) After a stop request an attempt only settles: it never starts a new build (a build already started
-    // runs to its end). Same hand-back as a settle-only sweep.
+  private async attempt(o: OrderRow, reconcileOnly = false, ctl: AttemptControl = {}): Promise<void> {
+    // (0.3.0) After a stop request an attempt only settles: it never starts a new build, and a linked-payer build that
+    // was under way is neither signed nor submitted. Same hand-back as a settle-only sweep.
+    const shouldStop = ctl.shouldStop;
     const settleOnly = () => reconcileOnly || !!shouldStop?.();
+    const paused = () => o.side === "buy" && !!this.d.buysPaused?.();
     const pos = this.d.ledger.position(o.position_id)!;
     if (pos.dry) return this.dryAttempt(o, pos);
     if (!this.d.rail) {
@@ -338,7 +368,7 @@ export class Executor {
           if (o.built_seen_at === null) this.d.ledger.updateOrder(o.id, { built_seen_at: seen });
           // A same-id build of a buy can execute it anew if the old job died: only while the buy itself would still
           // be placed (before its deadline, buys not paused, the impact recheck passing).
-          if (!o.probed && this.now() - seen >= this.d.cfg.retry.builtProbeMs && !settleOnly() && !o.ending && (await this.buyStillGood(o, pos)) && !settleOnly()) {
+          if (!o.probed && this.now() - seen >= this.d.cfg.retry.builtProbeMs && !settleOnly() && !o.ending && (await this.buyStillGood(o, pos)) && !settleOnly() && !paused()) {
             this.d.ledger.updateOrder(o.id, { probed: 1 });
             return this.probe(o, pos);
           }
@@ -380,7 +410,8 @@ export class Executor {
     if (o.attempts >= o.max_attempts) {
       // A failed main job at the cap: one same-id build is the check (Candle replays a landed id, or answers
       // IDEMPOTENCY_CONFLICT for one in flight). Never for a stale buy, where a rebuild could buy anew.
-      if (failedMain && job?.status === "failed" && !o.final_check && (await this.buyStillGood(o, pos))) {
+      // (0.3.0) PAUSE_BUYS read again after the recheck's await: a pause written during it stops the check build too.
+      if (failedMain && job?.status === "failed" && !o.final_check && (await this.buyStillGood(o, pos)) && !paused()) {
         // The check is a build: a settle-only sweep (or a stop request) hands the order back without using it up.
         if (settleOnly()) {
           this.d.ledger.updateOrder(o.id, { status: "pending", lease_until: 0 });
@@ -397,7 +428,8 @@ export class Executor {
     if (o.side === "buy" && !finalCheck) {
       if (pastDeadline) return stopBuy("DEADLINE", "the entry decision is stale");
       if (this.d.buysPaused?.()) return stopBuy("PAUSE_BUYS", "buys paused before this attempt");
-      if (o.attempts > 0) {
+      // (0.3.0) Also a first attempt that waited for a buy slot longer than exitMs (run(): never chase a pump).
+      if (o.attempts > 0 || (ctl.recheckAfterMs !== undefined && this.now() - o.created_at > ctl.recheckAfterMs)) {
         const stop = await this.recheckBuy(o, pos);
         if (stop) return stop.kind === "rejected" ? stopBuy(stop.code, stop.detail) : this.apply(o, pos, stop);
       }
@@ -449,6 +481,12 @@ export class Executor {
       if (built.walletAddress !== cfg.wallet) {
         this.d.ledger.endAttempt(att, this.now(), "rejected", "WRONG_WALLET", JSON.stringify({ walletAddress: built.walletAddress }));
         return this.apply(o, pos, { kind: "rejected", code: "WRONG_WALLET", detail: `build names ${built.walletAddress}` });
+      }
+      // (0.3.0) STOP while the build was under way: nothing is signed or submitted. The built transaction is dropped
+      // (it was never signed, so it can never land); the order goes back as it was, its attempt counted.
+      if (shouldStop?.()) {
+        this.d.ledger.endAttempt(att, this.now(), "stopped", null, null);
+        return this.apply(o, pos, { kind: "wait", untilMs: this.now(), why: "stop requested before signing" });
       }
       phase = "sign";
       const signed = await this.d.rail.sign(built.artifacts.transactionBase64);

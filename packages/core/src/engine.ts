@@ -459,7 +459,7 @@ export class Engine {
    */
   private pump(): void {
     if (!this.running || this.shouldStop()) return;
-    for (const a of this.d.executor.startDue({ shouldStop: this.shouldStop })) void a.then(() => setImmediate(() => this.pump()));
+    for (const a of this.d.executor.startDue({ shouldStop: this.shouldStop, settleEveryMs: this.d.cfg.loopMs })) void a.then(() => setImmediate(() => this.pump()));
   }
 
   /**
@@ -1180,7 +1180,11 @@ export class Engine {
         if (p.last_price !== m.priceSol || p.peak_price !== peak) this.d.ledger.updatePosition(p.id, { last_price: m.priceSol, peak_price: peak });
       }
     });
-    for (const p of open) {
+    for (const p0 of open) {
+      // (0.3.0) Under run() a sell attempt runs outside the lock and may have filled during the market read: decide on
+      // the row as it is now, never on the one read before the await (a ladder rung would fire twice).
+      const p = this.running ? this.d.ledger.position(p0.id) : p0;
+      if (!p || (p.status !== "open" && p.status !== "exit_stuck")) continue;
       const m = this.markets.get(p.mint);
       if (!m) continue;
       if (this.shouldStop()) return;
@@ -1238,7 +1242,12 @@ export class Engine {
     const worker = async () => {
       while (next < toSell.length && !this.shouldStop()) {
         const x = toSell[next++];
-        if ((await this.placeSell(x.p, x.fraction, x.reason, false)) !== null) this.pump();
+        // One sell that throws ends neither the others nor the pass early (every worker is awaited below).
+        try {
+          if ((await this.placeSell(x.p, x.fraction, x.reason, false)) !== null) this.pump();
+        } catch (e) {
+          this.d.log.error("cycle_step_failed", { step: "exits", position: x.p.id, error: String((e as Error)?.stack ?? e) });
+        }
       }
     };
     await Promise.all(Array.from({ length: Math.min(BALANCE_READS, toSell.length) }, worker));
@@ -1263,9 +1272,14 @@ export class Engine {
 
   /** placeSell with the coin already held. */
   private async placeSellHeld(p: PositionRow, fraction: number, reason: string, manual: boolean): Promise<number | null> {
+    const seen = p;
     p = this.d.ledger.position(p.id) ?? p;
-    // Under the hold: one exit in flight at a time (a manual sell may have booked one since the exits pass looked).
-    if (!manual && this.d.ledger.openOrderFor(p.id)) return null;
+    if (!manual) {
+      // Under the hold: one exit in flight at a time (a manual sell may have booked one since the exits pass looked),
+      // and the strategy's decision stands only on the row it was made on (a fill since then: the next tick decides).
+      if (this.d.ledger.openOrderFor(p.id)) return null;
+      if (p.remaining_raw !== seen.remaining_raw || p.status !== seen.status) return null;
+    }
     if (!(fraction > 0 && fraction <= 1)) throw new Error("fraction must be in (0, 1]");
     let remaining = BigInt(p.remaining_raw);
     if (remaining <= 0n) return null;
