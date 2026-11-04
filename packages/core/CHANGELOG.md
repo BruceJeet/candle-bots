@@ -17,24 +17,52 @@ Order attempts run outside the money lock. The money rules are unchanged. A 0.1.
   attempt on that coin live.
 - **`buy.concurrency`** (new config key, default 4, 1 to 64): buy attempts in flight at once. 1 is 0.2.0's one at a
   time. **Sells have no limit and never wait for a buy.** When an attempt ends, the next due order starts at once
-  (it no longer waits for the next cycle's sweep). Buys already booked wait for a free slot in claim order.
+  (it no longer waits for the next cycle's sweep). Buys already booked wait for a free slot in claim order; one that
+  waited longer than `exitMs` gets the impact recheck before its first build, as a retry does (no chasing a pump).
+  With every slot taken, buys that may already have executed (a saved signature, a main-payer build) still settle
+  beside them, settle-only, at most once per `loopMs`, so a landed buy is booked (and its exits run) while other buys
+  hang. **An existing config gets 4 on upgrade**: set `buy.concurrency: 1` to keep 0.2.0's one buy at a time.
 - **SOL with several buys in flight.** No reserve: Candle can build each buy against the same balance. The chain cannot
   overdraw: at most `buy.concurrency - 1` of them fail at submit, and the executor ends them as any failed submit
   (signature checked on chain, its blockhash expired, then a rebuild Candle refuses). Such an order counts toward
   `lifetimeSol` (it was signed), as before. Fund the wallet for what the caps allow, or set `buy.concurrency` 1.
-- **STOP:** no attempt starts after STOP, and no attempt starts a new build after it (one claimed before STOP settles
-  what it has and hands the order back). A build already started runs to its end; `run()` returns after every attempt
-  in flight has ended. **PAUSE_BUYS** is read again right before each buy build, with nothing awaited in between.
-- **Exit tick:** due orders start first (never awaited), then the market read, the exit strategy, and the crossing
-  coins' balance reads all at once (`BALANCE_READS`, 16 at a time); each sell is booked and started as soon as its own
-  read is back. A stuck sell (one whose attempts keep failing) runs on its own backoff beside fresh ones and holds up
-  none.
+- **STOP:** no attempt starts after STOP, no attempt starts a new build after it (one claimed before STOP settles what
+  it has and hands the order back), and nothing is signed or submitted after it: a linked-payer build under way at
+  STOP finishes, its unsigned transaction is dropped (it can never land) and the order goes back as it was, its
+  attempt counted. A submit already under way, or a main-payer build (Candle sends it inside the build), is followed
+  to its end. `run()` returns after every attempt in flight has ended. **PAUSE_BUYS** is read again right before each
+  buy build, with nothing awaited in between, and after the recheck read of a long-built job's probe and of a failed
+  job's final check.
+- **Exit tick:** due orders start first (never awaited), then the market read, the exit strategy on each position's
+  row as it is after that read (a sell that filled meanwhile counts), and the crossing coins' balance reads all at once
+  (`BALANCE_READS`, 16 at a time); each sell is booked and started as soon as its own read is back, and only if the row
+  has not changed since the strategy decided. One sell that throws ends neither the others nor the pass. A stuck sell
+  (one whose attempts keep failing) runs on its own backoff beside fresh ones and holds up none.
 - **Batched curve reads.** A trigger that sets `readsCurves: true` (new, optional; the launch bot does) gets every due
   candidate's curve read in one `getMultipleAccounts` (100 keys a call) before its decides, each cached under its own
   key and time exactly like a single read (`ctx.readCurve` returns the same frozen copy; reused for at most `exitMs`).
   A batch that fails falls back to one read per curve (`curve_batch_failed`, logged). The fill bound still uses the
   engine's own read at most `exitMs` old.
-- **Stop-loss timing:** STOPLOSS_TEXT
+- **Stop-loss timing.** A crossing is acted on by the next exit tick (at most `exitMs` later). Before its sell is
+  built, only these can come first:
+  - the lock's current holder, which under `run()` is never an order attempt, a booking or a trigger call: an earlier
+    exit pass still in its reads (below), or a short ledger step (alerts, surplus verdicts, status.json);
+  - the tick's one batched market read (`getMultipleAccounts`);
+  - the coin's balance read (all crossing coins read together, 16 at a time);
+  - an attempt already live on the same coin: with `maxPerCoin` 1 only that position's own earlier sell, which the
+    exits pass waits for anyway (one exit in flight per position).
+
+  No buy attempt, however slow or hung, and no other coin's sell comes first. Under an RPC outage each read is bounded
+  by the RPC timeout (15 s): a crossing that comes while a pass is stuck in its reads waits for that pass, then its own
+  pass's two reads, so the worst case is about `exitMs` + 4 × the RPC timeout (about 60 s) before the build starts. No
+  Candle call comes before the sell's own build. One more cost, not a lock: the ledger commits to
+  disk on every write (`synchronous=FULL`, unchanged), so a burst of many attempts at once keeps the process busy for
+  a few ms per write. Measured on the bench (80 ms RPC, 150 ms Candle build, `exitMs` 500, median of runs):
+  - with 6 s buy builds and launches arriving (0.2.0's probe P5): 0.3 s, worst 0.6 s (0.2.0: 4.7 s, worst 6.4 s);
+  - with every buy build hung (no answer at all): under 0.8 s in the test suite;
+  - 20 positions crossing at once, to the last sell build: 0.35 s, worst 0.8 s (0.2.0: 11.6 s);
+  - at the start of a 50-launch burst: 0.8 s, worst 0.9 s (0.2.0 the same);
+  - one crossing, nothing else going on: 0.4 s, worst 0.65 s (0.2.0: 0.5 s, worst 0.8 s).
 - **Callers of `engine.cycle()`** keep 0.2.0's behavior: the whole cycle under the lock, attempts awaited in its
   sweeps, STOP between orders. `engine.lane()` keeps its 0.2.0 booking path too.
 - Ledger: `claimDue` takes `excludeMints` (additive). Executor: `startDue`, `drain`, `liveCount`, `mintBusy`,

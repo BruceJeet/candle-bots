@@ -1,5 +1,17 @@
 # Changelog: candle-launch-bot
 
+## 0.4.0
+
+- On candle-bot-core 0.3.0 (pinned exactly): buy and sell attempts (build, sign, submit) no longer run under the
+  money lock. A stop-loss sell is never queued behind a buy, including a buy whose Candle build hangs. Up to
+  `buy.concurrency` buys build at once (new optional config key, **default 4**; set it to 1 to keep 0.3.0's one buy at
+  a time). A burst of launches is decided and built in parallel, and its curves are read in one batched call instead
+  of one each. STOP: nothing is signed or submitted after it.
+- Same CLI, config file (one new optional key, `buy.concurrency`), state dir, ledger, `status.json` fields and events.
+  With `buy.concurrency` 1, money outcomes are 0.3.0's. With more, buys can be built against the same SOL balance:
+  the chain never overdraws, and a buy the balance cannot cover ends failed after its submit is refused (see the core
+  CHANGELOG).
+
 ## 0.3.0
 
 - On candle-bot-core 0.2.0 (pinned exactly): a launch the detector sees wakes the engine and is decided at once

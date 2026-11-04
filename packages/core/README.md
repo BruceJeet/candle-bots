@@ -31,17 +31,17 @@ each cycle (the engine):
 A bot writes the two middle lines. It never places an order, books a fill or touches a position: a buy verdict is a
 request the engine may still refuse.
 
-**Timing (0.2.0).** `run()` keeps exits and entries apart. An **exit tick** every `exitMs` (default 500 ms) reads the
-open coins' markets in one call and runs the exit strategy and sells. A **full cycle** every `loopMs` handles sell
-requests, settling, queued orders, alerts and status. **Entries** run as soon as the trigger's source calls
-`ctx.wake()` (or every `loopMs`): candidates are decided outside the money lock, `trigger.concurrency` at a time, so a
-slow or hung decide never delays an exit. Each buy takes the lock to re-check the caps, book (one ledger transaction,
-caps checked inside it) and build and submit. A stop-loss is acted on by the next exit tick (at most `exitMs` later, and the tick goes first on the lock), after
-whatever holds the lock then (one buy attempt, one settle or orders attempt, or the sell-requests step), the tick's own
-leading sweep of up to 5 due sells, its market read, and one balance read per position crossing at once. Typically
-well under a second; under a Candle or RPC outage there is no fixed ceiling, because one attempt chains several calls,
-each bounded by its own timeout. See the CHANGELOG. A trigger without `wake` still works: it is polled every
-`loopMs`.
+**Timing (0.3.0).** `run()` keeps exits, entries and order attempts apart. An **exit tick** every `exitMs` (default
+500 ms) reads the open coins' markets in one call, runs the exit strategy, reads the crossing coins' balances together
+and books and starts each sell at once. **Entries** run as soon as the trigger's source calls `ctx.wake()` (or every
+`loopMs`): candidates are decided outside the money lock, `trigger.concurrency` at a time, and a buy verdict is booked
+in one ledger transaction (caps checked inside it). **Order attempts** (build, sign, submit) never run under the lock:
+one per order and per coin, up to `buy.concurrency` buys at once (default 4), sells with no limit and never behind a
+buy. A **full cycle** every `loopMs` handles sell requests, alerts and status. So a stop-loss is acted on by the next
+exit tick (at most `exitMs` later) after one market read and its coin's balance read: no buy, however slow or hung,
+and no trigger call comes first. Typically under a second; under an RPC outage each read is bounded by the RPC
+timeout, about `exitMs` + 4 × 15 s at worst. See the CHANGELOG. A trigger without `wake` still works: it is polled
+every `loopMs`.
 
 ## The trigger interface
 

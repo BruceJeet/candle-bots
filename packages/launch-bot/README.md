@@ -172,6 +172,9 @@ on the CLI.
 
 Send SOL to the wallet that pays (embedded or TEE): tickets (`buy.sol` × the number of entries you allow) plus about 0.003 SOL per coin for
 token-account rent and network fees. Every buy also pays Candle's platform fee on top of the ticket.
+Up to `buy.concurrency` buys (default 4) are built at once against the same balance. A buy the balance cannot cover
+fails at submit and ends after its retry (the chain never overdraws, and the failed buy still counts toward
+`lifetimeSol`), so fund for what `maxOpen` and `lifetimeSol` allow, or set `buy.concurrency` to 1.
 
 ### 6. Run
 
@@ -266,6 +269,7 @@ Unknown keys are refused at every level, so a typo fails at start instead of bei
 | `buy.maxOpen` | most positions open at once (open, opening, or stuck) |
 | `buy.lifetimeSol` | most SOL in tickets ever committed to buys by this state dir. Candle's platform fee (its `bps`, about 0.25 %) and network fees come on top. A buy refused before anything was signed, or reverted, doesn't count; a refusal after signing does, because it might have landed |
 | `buy.maxPerCoin` | entries per coin: 1 (the only value; re-entering a coin is not supported) |
+| `buy.concurrency` | buys built at once (1 to 64, default 4); sells never wait for them. 1 is one buy at a time, as before 0.4.0 |
 | `buy.maxPriorityFeeLamports`, `sell.maxPriorityFeeLamports` | priority-fee ceiling Candle's build may bid (Jupiter venue) |
 | `sell.maxSlippageBps` | slippage tolerance on sells (default: the larger of the buy's and 1000) |
 | `filters.launchModes` | Candle launch modes to buy: `open`, `exclusive`, `exp-a`, `exp-b`, `exp-c`, `exp-custom` (also `test-open`, `test-exclusive`); anything else is a config error |
