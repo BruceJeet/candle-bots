@@ -1,5 +1,47 @@
 # Changelog: candle-bot-core
 
+## 0.3.0
+
+Order attempts run outside the money lock. The money rules are unchanged. A 0.1.0 or 0.2.0 trigger works as is.
+
+- **Attempts off the lock (`Engine.run`).** Every order attempt (job read, build, sign, submit, settle) runs on its own
+  instead of inside a sweep under the money lock. Under `run()` the lock is now held only by the exit tick's exits pass
+  and the full cycle's short ledger steps (alerts, the surplus verdicts, status.json). A booking is one synchronous
+  ledger transaction (the caps checked inside it, as before) and holds no lock.
+- **One attempt per order, one per coin.** The Executor keeps the attempts it runs in memory (`live`) and every claim
+  excludes them, whatever the order's lease says. A lease can run out while an attempt is still in its Candle calls;
+  inside one process that no longer lets a second attempt claim the order. The lease (180 s) is unchanged and still
+  covers a restart after a crash. At most one attempt per coin is in flight: a buy and a sell on one coin, or an
+  uncertain buy's adoption scan and another attempt on that coin, never overlap. Balance decisions hold their coin too
+  (`Executor.reserveMint`): a sell's clamp (`placeSell`) and a manual `sell` (its reopen scan included) run with no
+  attempt on that coin live.
+- **`buy.concurrency`** (new config key, default 4, 1 to 64): buy attempts in flight at once. 1 is 0.2.0's one at a
+  time. **Sells have no limit and never wait for a buy.** When an attempt ends, the next due order starts at once
+  (it no longer waits for the next cycle's sweep). Buys already booked wait for a free slot in claim order.
+- **SOL with several buys in flight.** No reserve: Candle can build each buy against the same balance. The chain cannot
+  overdraw: at most `buy.concurrency - 1` of them fail at submit, and the executor ends them as any failed submit
+  (signature checked on chain, its blockhash expired, then a rebuild Candle refuses). Such an order counts toward
+  `lifetimeSol` (it was signed), as before. Fund the wallet for what the caps allow, or set `buy.concurrency` 1.
+- **STOP:** no attempt starts after STOP, and no attempt starts a new build after it (one claimed before STOP settles
+  what it has and hands the order back). A build already started runs to its end; `run()` returns after every attempt
+  in flight has ended. **PAUSE_BUYS** is read again right before each buy build, with nothing awaited in between.
+- **Exit tick:** due orders start first (never awaited), then the market read, the exit strategy, and the crossing
+  coins' balance reads all at once (`BALANCE_READS`, 16 at a time); each sell is booked and started as soon as its own
+  read is back. A stuck sell (one whose attempts keep failing) runs on its own backoff beside fresh ones and holds up
+  none.
+- **Batched curve reads.** A trigger that sets `readsCurves: true` (new, optional; the launch bot does) gets every due
+  candidate's curve read in one `getMultipleAccounts` (100 keys a call) before its decides, each cached under its own
+  key and time exactly like a single read (`ctx.readCurve` returns the same frozen copy; reused for at most `exitMs`).
+  A batch that fails falls back to one read per curve (`curve_batch_failed`, logged). The fill bound still uses the
+  engine's own read at most `exitMs` old.
+- **Stop-loss timing:** STOPLOSS_TEXT
+- **Callers of `engine.cycle()`** keep 0.2.0's behavior: the whole cycle under the lock, attempts awaited in its
+  sweeps, STOP between orders. `engine.lane()` keeps its 0.2.0 booking path too.
+- Ledger: `claimDue` takes `excludeMints` (additive). Executor: `startDue`, `drain`, `liveCount`, `mintBusy`,
+  `reserveMint`/`releaseMint`, `mintEpoch` (additive). The surplus check skips a coin whose attempt started or ended
+  while its balance was read. A crash inside an attempt's last-resort handler is logged (`order_attempt_crashed`), never
+  an unhandled rejection. No change to refusal rules, adoption, fills, the lease, or ledger durability.
+
 ## 0.2.0
 
 Speed, with the money rules unchanged. A 0.1.0 trigger works as is.
