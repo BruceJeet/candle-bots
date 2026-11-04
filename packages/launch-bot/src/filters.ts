@@ -4,9 +4,9 @@
  */
 import type { Config } from "./config.ts";
 import type { Launch } from "./detect/detector.ts";
-import type { CandleCurve } from "./market/curve.ts";
-import { buyImpact, curveClass } from "./market/curve.ts";
-import { WSOL } from "./solana/pda.ts";
+import type { CandleCurve } from "candle-bot-core/market/curve";
+import { buyImpact, curveClass } from "candle-bot-core/market/curve";
+import { WSOL } from "candle-bot-core/solana/pda";
 
 
 export type Verdict = { verdict: "buy"; impactBps: number; expectedOutRaw: bigint } | { verdict: "skip"; reason: string } | { verdict: "wait"; reason: string };

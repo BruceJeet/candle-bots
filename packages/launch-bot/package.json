@@ -1,12 +1,13 @@
 {
   "name": "candle-launch-bot",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Buys Candle launches as they appear and exits them by a pluggable strategy. A Solana bot built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BruceJeet/candle-launch-bot.git"
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/launch-bot"
   },
   "homepage": "https://github.com/BruceJeet/candle-launch-bot#readme",
   "bugs": {
@@ -24,6 +25,7 @@
     "examples",
     "skills",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
@@ -32,7 +34,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@candledottv/agent-sdk": "0.6.14"
+    "candle-bot-core": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

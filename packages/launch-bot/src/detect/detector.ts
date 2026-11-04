@@ -9,12 +9,12 @@
  *
  * Chains other than Solana plug in as further sources with their own `chain` value.
  */
-import { asAddress } from "../solana/base58.ts";
-import { CANDLE_CURVE_PROGRAM, WSOL, candleCurve, findPda } from "../solana/pda.ts";
-import { b58decode } from "../solana/base58.ts";
-import { getTransaction, type Rpc } from "../solana/rpc.ts";
-import { subscribeLogs, type LogsEvent, type LogsSocket } from "../solana/logs-ws.ts";
-import type { Logger } from "../log.ts";
+import { asAddress } from "candle-bot-core/solana/base58";
+import { CANDLE_CURVE_PROGRAM, WSOL, candleCurve, findPda } from "candle-bot-core/solana/pda";
+import { b58decode } from "candle-bot-core/solana/base58";
+import { getTransaction, type Rpc } from "candle-bot-core/solana/rpc";
+import { subscribeLogs, type LogsEvent, type LogsSocket } from "candle-bot-core/solana/logs-ws";
+import type { Logger } from "candle-bot-core/log";
 
 export type Source = "api" | "chain";
 

@@ -6,7 +6,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { LAUNCH_MODES, parseConfig, ConfigError } from "./config.ts";
-import { loadStrategy } from "./strategies/load.ts";
+import { loadStrategy } from "candle-bot-core/strategies/load";
 
 const DEFAULT_API = "https://api.alpha.candle.tv";
 /** A valid address that is nobody's wallet: lets a dry run start before a wallet is chosen. */

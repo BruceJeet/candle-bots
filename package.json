@@ -1,0 +1,22 @@
+{
+  "name": "candle-bots",
+  "private": true,
+  "description": "Candle trading bots: one shared core, one npm package per bot.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/core",
+    "packages/launch-bot",
+    "packages/example-bot"
+  ],
+  "scripts": {
+    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "check": "sh scripts/check-neutral.sh .",
+    "pack:all": "sh scripts/release.sh pack"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  }
+}

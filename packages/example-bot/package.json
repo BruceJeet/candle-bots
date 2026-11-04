@@ -1,0 +1,20 @@
+{
+  "name": "candle-example-bot",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The smallest Candle bot on candle-bot-core: buys a mint you drop into a file in its state folder, exits by a configured strategy.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "candle-example-bot": "bin/candle-example-bot"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "candle-bot-core": "^0.1.0"
+  }
+}
