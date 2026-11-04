@@ -40,7 +40,7 @@ export interface BuyVerdict {
   lamports?: bigint;
   /** No attempt of the buy is built after this time (ms); null or absent: no deadline. */
   deadlineAtMs?: number | null;
-  /** Tokens the trigger expects for the ticket (raw): the cap on adopting tokens of an uncertain buy. Absent: no adoption. */
+  /** Tokens the trigger expects for the ticket (raw): the cap on adopting tokens of an uncertain buy (Candle's build replaces it once one answers). */
   expectedOutRaw?: bigint | null;
   /** The coin's decimals when known (default 6). */
   decimals?: number;
@@ -50,6 +50,7 @@ export interface BuyVerdict {
   log?: Record<string, unknown> | ((nowMs: number) => Record<string, unknown>);
 }
 
+/** Anything but an exact "wait", "skip" or a well-typed "buy" is taken as a skip. */
 export type Verdict = BuyVerdict | { verdict: "wait"; reason: string } | { verdict: "skip"; reason: string };
 
 /** The engine's caps as they stand for one coin, for triggers that want to skip early (the engine checks them again). */

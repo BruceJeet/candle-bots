@@ -32,6 +32,8 @@ export interface EngineDeps {
   now?: () => number;
 }
 
+const CORE_STATUS_KEYS = new Set(["at", "mode", "wallet", "strategy", "paused", "stopping", "cycles", "lastCycleMs", "equity", "caps", "queue", "alertsSent", "positions", "stats"]);
+
 export function lamportsOf(sol: number): bigint {
   return BigInt(Math.round(sol * 1e9));
 }
@@ -262,6 +264,26 @@ export class Engine {
     return v;
   }
 
+  /**
+   * A verdict as the engine will act on it: only an exact "wait", "skip" or "buy" with well-typed fields; anything else
+   * (a typo, a plug-in's own word, a bad field) is a skip, never a buy.
+   */
+  private checked(v: unknown): Verdict {
+    const x = v as Record<string, unknown> | null;
+    if (!x || typeof x !== "object") return { verdict: "skip", reason: "trigger gave no verdict" };
+    const reason = typeof x.reason === "string" ? x.reason : "";
+    if (x.verdict === "wait" || x.verdict === "skip") return { ...(x as object), reason } as Verdict;
+    if (x.verdict !== "buy") return { verdict: "skip", reason: `unknown verdict ${JSON.stringify(String(x.verdict)).slice(0, 40)}` };
+    const bad =
+      (x.lamports !== undefined && typeof x.lamports !== "bigint") ? "lamports" :
+      (x.deadlineAtMs !== undefined && x.deadlineAtMs !== null && !(typeof x.deadlineAtMs === "number" && Number.isFinite(x.deadlineAtMs))) ? "deadlineAtMs" :
+      (x.expectedOutRaw !== undefined && x.expectedOutRaw !== null && !(typeof x.expectedOutRaw === "bigint" && x.expectedOutRaw >= 0n)) ? "expectedOutRaw" :
+      (x.decimals !== undefined && !(Number.isInteger(x.decimals) && (x.decimals as number) >= 0 && (x.decimals as number) <= 18)) ? "decimals" :
+      (x.log !== undefined && typeof x.log !== "function" && (typeof x.log !== "object" || x.log === null)) ? "log" : null;
+    if (bad) return { verdict: "skip", reason: `buy verdict: bad ${bad}` };
+    return x as unknown as Verdict;
+  }
+
   private async entries(t0: number = this.now()): Promise<void> {
     const t = this.d.trigger;
     for (const c of await t.poll(this.ctx)) {
@@ -270,7 +292,7 @@ export class Engine {
     }
     for (const [mint, p] of [...this.pending]) {
       if (this.shouldStop() || this.overBudget(t0)) break;
-      let v = await t.decide(p.candidate, this.ctx, p);
+      let v = this.checked(await t.decide(p.candidate, this.ctx, p));
       if (v.verdict === "buy") v = this.capCheck(mint, v);
       if (v.verdict === "wait") {
         if (t.onVerdict) t.onVerdict(p.candidate, v, this.ctx, p);
@@ -303,7 +325,10 @@ export class Engine {
     });
     this.stats.buys++;
     const extra = typeof v.log === "function" ? v.log(now) : v.log ?? { sol: Number(lamports) / 1e9 };
-    this.d.log.info(dry ? "dry_buy" : "buy_order", { position: id, mint: c.mint, ...extra });
+    // The trigger's fields never overwrite the engine's (key order stays position, mint, then the trigger's).
+    const fields: Record<string, unknown> = { position: id, mint: c.mint };
+    for (const [k, val] of Object.entries(extra)) if (!(k in fields)) fields[k] = val;
+    this.d.log.info(dry ? "dry_buy" : "buy_order", fields);
   }
 
   // ---------------------------------------------------------------- exits
@@ -500,7 +525,9 @@ export class Engine {
       }
     }
     const { candidates, ...counts } = this.stats;
-    const extra = this.d.trigger.status?.([...this.pending.values()].map((p) => ({ candidate: p.candidate, firstSeenMs: p.firstSeenMs, lastReason: p.lastReason }))) ?? {};
+    const own = this.d.trigger.status?.([...this.pending.values()].map((p) => ({ candidate: p.candidate, firstSeenMs: p.firstSeenMs, lastReason: p.lastReason }))) ?? {};
+    // The trigger's fields never shadow the engine's.
+    const extra = Object.fromEntries(Object.entries(own).filter(([k]) => !CORE_STATUS_KEYS.has(k)));
     return redactDeep({
       at: new Date(now).toISOString(),
       mode: this.d.cfg.mode,
