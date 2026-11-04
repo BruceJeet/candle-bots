@@ -152,8 +152,19 @@ export class Engine {
       lifetimeBuyLamports: () => d.ledger.lifetimeBuyLamports(self.dry),
       openCount: () => self.openCount(),
     });
+    // The trigger gets its own frozen handles: replacing ctx.rpc.call (or the log, or the alerter) cannot reach the
+    // engine's and the executor's own objects.
+    const rpc: Rpc = Object.freeze({ call: <T>(method: string, params: unknown[]) => d.rpc.call<T>(method, params) });
+    const log: Logger = Object.freeze({
+      log: (l: Parameters<Logger["log"]>[0], e: string, f?: Record<string, unknown>) => d.log.log(l, e, f),
+      info: (e: string, f?: Record<string, unknown>) => d.log.info(e, f),
+      warn: (e: string, f?: Record<string, unknown>) => d.log.warn(e, f),
+      error: (e: string, f?: Record<string, unknown>) => d.log.error(e, f),
+    });
+    // Alerts a trigger raises go through the bot's alerter; it cannot replace or silence it.
+    const alerter = Object.freeze({ raise: (key: string, message: string, fields?: Record<string, unknown>) => d.alerter.raise(key, message, fields), get sent() { return d.alerter.sent; } }) as unknown as Alerter;
     this.ctx = Object.freeze({
-      cfg: d.cfg, ledger: view, rpc: d.rpc, log: d.log, alerter: d.alerter,
+      cfg: d.cfg, ledger: view, rpc, log, alerter,
       get dry() { return self.dry; },
       now: () => self.now(),
       caps: (mint: string) => Object.freeze(self.caps(mint)),
@@ -381,7 +392,10 @@ export class Engine {
    */
   private async bounded<T>(key: string, t0: number, call: () => T | Promise<T>): Promise<T> {
     const left = CYCLE_BUDGET_MS - (this.now() - t0);
-    const ms = Math.max(50, Math.min(this.d.triggerTimeoutMs ?? TRIGGER_TIMEOUT_MS, left));
+    // Within the cycle budget left, but never under 5 s (or the configured limit, if smaller): a slow but working
+    // decide near the end of a cycle is not cut short.
+    const limit = this.d.triggerTimeoutMs ?? TRIGGER_TIMEOUT_MS;
+    const ms = Math.max(Math.min(limit, 5_000), Math.min(limit, left));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const p = Promise.resolve().then(call);
     try {
@@ -418,6 +432,13 @@ export class Engine {
       const info = (): PendingInfo => Object.freeze({ firstSeenMs: p.firstSeenMs, lastReason: p.lastReason });
       let v = this.checked(await this.bounded(`decide:${mint}`, t0, () => t.decide(p.candidate, this.ctx, info())), p.candidate);
       if (v.verdict === "buy") v = this.capCheck(mint, v);
+      if (v.verdict === "buy") {
+        // The engine's own expected fill (a curve read), then the caps once more: PAUSE_BUYS or STOP may have arrived
+        // during the read. STOP leaves the candidate pending, untouched.
+        const expected = await this.expectedOut(mint, v.lamports, v.expectedOutRaw);
+        if (this.shouldStop()) break;
+        v = this.capCheck(mint, Object.freeze({ ...v, expectedOutRaw: expected }));
+      }
       if (v.verdict === "wait") {
         if (t.onVerdict) t.onVerdict(p.candidate, publicVerdict(v), this.ctx, info());
         else if (v.reason !== p.lastReason) this.d.log.info("candidate_wait", { mint, source: p.candidate.source, reason: v.reason });
@@ -431,7 +452,7 @@ export class Engine {
         this.stats.skips++;
         continue;
       }
-      await this.buy(p.candidate, v);
+      this.buy(p.candidate, v);
     }
     t.afterEntries?.(this.ctx);
   }
@@ -453,8 +474,9 @@ export class Engine {
     return fromTrigger !== null && fromTrigger < mine ? fromTrigger : mine;
   }
 
-  private async buy(c: Readonly<Candidate>, v: Buy): Promise<void> {
-    const expected = await this.expectedOut(c.mint, v.lamports, v.expectedOutRaw);
+  /** Book the buy: a position in `opening` and its order, from the engine's checked copy only (expectedOutRaw final). */
+  private buy(c: Readonly<Candidate>, v: Buy): void {
+    const expected = v.expectedOutRaw;
     const now = this.now();
     const dry = this.d.cfg.mode === "dry";
     const t = this.d.trigger;
@@ -465,16 +487,16 @@ export class Engine {
       return pid;
     });
     this.stats.buys++;
-    let extra: Record<string, unknown> = { sol: Number(v.lamports) / 1e9 };
-    try {
-      if (typeof v.log === "function") extra = v.log(now) ?? {};
-      else if (v.log) extra = v.log;
-    } catch {
-      extra = { sol: Number(v.lamports) / 1e9, logError: true };
-    }
-    // The trigger's fields never overwrite the engine's (key order stays position, mint, then the trigger's).
+    // The trigger's fields never overwrite the engine's (key order stays position, mint, then the trigger's). The order
+    // is booked: nothing the trigger's log fields do can undo it or end the entries step.
     const fields: Record<string, unknown> = { position: id, mint: c.mint };
-    for (const [k, val] of Object.entries(extra)) if (!(k in fields)) fields[k] = val;
+    try {
+      const extra = typeof v.log === "function" ? v.log(now) ?? {} : v.log ?? { sol: Number(v.lamports) / 1e9 };
+      for (const [k, val] of Object.entries(extra)) if (!(k in fields)) fields[k] = val;
+    } catch {
+      fields.sol = Number(v.lamports) / 1e9;
+      fields.logError = true;
+    }
     this.d.log.info(dry ? "dry_buy" : "buy_order", fields);
   }
 

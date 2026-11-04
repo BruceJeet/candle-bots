@@ -95,7 +95,10 @@ export interface LedgerView {
   openCount(): number;
 }
 
-/** Handed to every trigger call. Frozen; `cfg` is deep-frozen. */
+/**
+ * Handed to every trigger call. Frozen; `cfg` is deep-frozen; `rpc`, `log` and `alerter` are frozen wrappers around the
+ * engine's own (a trigger cannot replace what the engine and the executor use). `alerter` offers `raise` and `sent`.
+ */
 export interface TriggerContext {
   readonly cfg: Config;
   readonly ledger: LedgerView;

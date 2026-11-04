@@ -84,9 +84,16 @@ The engine never trusts the trigger's objects:
   nothing;
 - the expected fill of a buy (the cap on adopting tokens of an uncertain buy) is the smaller of the trigger's and the
   engine's own read of the Candle curve; with no readable curve there is none, and nothing is adopted;
-- each `poll` and `decide` call has a time limit (`triggerTimeoutMs`, default 10 s, within the cycle budget). A call
+- `ctx.rpc`, `ctx.log` and `ctx.alerter` are frozen wrappers: a trigger cannot replace what the engine and the
+  executor use; after the engine's curve read, the caps are checked once more (PAUSE_BUYS may have arrived);
+- each `poll` and `decide` call has a time limit (`triggerTimeoutMs`, default 10 s, within the cycle budget left but
+  never under 5 s). A call
   that throws or does not answer costs that cycle's entries step (logged `cycle_step_failed`); the candidate stays
   pending and is not asked again until the hung call ends; exits, sells and STOP run as usual.
+
+These guards hold against mistakes and against ordinary trigger code doing odd things through what it is handed. They
+are not a sandbox: code running in the same process can still import `fs`, open the ledger file or read the keys
+store, so run only bot code you trust with your wallet.
 
 `onVerdict` sees every verdict after the engine's caps, so a buy the caps refuse arrives as a skip; without it the
 engine logs `candidate_wait` and `candidate_skip`.

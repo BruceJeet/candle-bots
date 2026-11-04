@@ -30,7 +30,8 @@ same exit strategies.
 2. Write its trigger (which coins, when) and its config section. The [core README](packages/core/README.md) has the
    trigger interface and the money rules. A bot needs no change to the core; if it seems to, open an issue first.
 3. Pin the core exactly (`"candle-bot-core": "0.1.0"`, as the SDK is pinned) and version the bot on its own;
-   `scripts/release.sh bump core <version>` moves every bot's pin with the core.
+   `scripts/release.sh bump core <version>` moves every bot's pin with the core (bump each bot's own version too
+   before publishing it).
 
 ## Working in the repo
 

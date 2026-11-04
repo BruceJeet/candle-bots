@@ -52,10 +52,12 @@ export interface Config {
 export class ConfigError extends Error {}
 
 /** Freeze an object and everything it holds (plain objects and arrays). Returns it. */
-export function deepFreeze<T>(o: T): T {
-  if (o && typeof o === "object" && !Object.isFrozen(o)) {
+export function deepFreeze<T>(o: T, seen = new WeakSet<object>()): T {
+  // Into already-frozen objects too: a config frozen only at the top still gets its sections frozen.
+  if (o && typeof o === "object" && !seen.has(o)) {
+    seen.add(o);
     Object.freeze(o);
-    for (const v of Object.values(o as object)) deepFreeze(v);
+    for (const v of Object.values(o as object)) deepFreeze(v, seen);
   }
   return o;
 }
