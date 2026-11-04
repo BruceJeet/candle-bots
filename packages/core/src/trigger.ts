@@ -12,11 +12,15 @@
  */
 import type { Alerter } from "./alerts.ts";
 import type { Config } from "./config.ts";
-import type { Ledger } from "./ledger.ts";
+import type { OrderRow, PositionRow, PositionStatus } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import type { Rpc } from "./solana/rpc.ts";
 
-/** Something the trigger wants judged: a coin, when and where it was seen, and the trigger's own data. */
+/**
+ * Something the trigger wants judged: a coin, when and where it was seen, and the trigger's own data. The engine copies
+ * the fields when `poll` returns: `mint` must be a Solana address as is (no padding) and `chain` "solana", else the
+ * candidate is skipped. Later calls get the engine's frozen copy.
+ */
 export interface Candidate {
   mint: string;
   /** "solana" (the only chain the core trades). */
@@ -34,13 +38,17 @@ export interface Candidate {
 /** A buy verdict. Every field but `reason` is optional; the engine fills the defaults. */
 export interface BuyVerdict {
   verdict: "buy";
-  /** The order's reason (ledger orders.reason). */
+  /** The order's reason (ledger orders.reason): a non-empty string, else the verdict is a skip. */
   reason: string;
   /** Ticket in lamports, at most buy.sol (default buy.sol). A larger one is refused as a skip. */
   lamports?: bigint;
   /** No attempt of the buy is built after this time (ms); null or absent: no deadline. */
   deadlineAtMs?: number | null;
-  /** Tokens the trigger expects for the ticket (raw): the cap on adopting tokens of an uncertain buy (Candle's build replaces it once one answers). */
+  /**
+   * Tokens the trigger expects for the ticket (raw), for the cap on adopting tokens of an uncertain buy. The engine
+   * reads the Candle curve itself at the buy and keeps the smaller of the two; with no readable curve the order has
+   * no expected fill (nothing is adopted). Candle's build replaces it once one answers.
+   */
   expectedOutRaw?: bigint | null;
   /** The coin's decimals when known (default 6). */
   decimals?: number;
@@ -50,7 +58,10 @@ export interface BuyVerdict {
   log?: Record<string, unknown> | ((nowMs: number) => Record<string, unknown>);
 }
 
-/** Anything but an exact "wait", "skip" or a well-typed "buy" is taken as a skip. */
+/**
+ * Anything but an exact "wait", "skip" or a well-typed "buy" is taken as a skip. The engine reads each field once
+ * into its own frozen copy; changing the trigger's object afterwards changes nothing.
+ */
 export type Verdict = BuyVerdict | { verdict: "wait"; reason: string } | { verdict: "skip"; reason: string };
 
 /** The engine's caps as they stand for one coin, for triggers that want to skip early (the engine checks them again). */
@@ -68,10 +79,26 @@ export interface PendingInfo {
   lastReason: string;
 }
 
-/** Handed to every trigger call. */
+/**
+ * The ledger as a trigger sees it: reads only, this run's mode only (a dry run sees dry rows). Rows are frozen copies.
+ * A bot's own tables are the bot's business: it keeps its own Ledger subclass and passes it to its trigger itself.
+ */
+export interface LedgerView {
+  position(id: number): Readonly<PositionRow> | undefined;
+  positions(...statuses: PositionStatus[]): ReadonlyArray<Readonly<PositionRow>>;
+  ordersFor(positionId: number): ReadonlyArray<Readonly<OrderRow>>;
+  /** Entries in the coin that may hold or have held tokens (what maxPerCoin counts). */
+  entriesForMint(mint: string): number;
+  /** Lamports committed to buys (what lifetimeSol counts). */
+  lifetimeBuyLamports(): bigint;
+  /** Positions opening, open or exit_stuck (what maxOpen counts). */
+  openCount(): number;
+}
+
+/** Handed to every trigger call. Frozen; `cfg` is deep-frozen. */
 export interface TriggerContext {
   readonly cfg: Config;
-  readonly ledger: Ledger;
+  readonly ledger: LedgerView;
   readonly rpc: Rpc;
   readonly log: Logger;
   readonly alerter: Alerter;
@@ -94,9 +121,12 @@ export interface Trigger {
   /** Start any sources (sockets, timers). The engine never calls it; the runner does, before the first cycle. */
   start?(): Promise<void>;
   stop?(): void;
-  /** Candidates new since the last call. One already pending is replaced (its wait state starts over). */
+  /** Candidates new since the last call (same timeout rule as decide). One already pending is replaced (its wait state starts over). */
   poll(ctx: TriggerContext): Candidate[] | Promise<Candidate[]>;
-  /** The verdict on one pending candidate. A throw ends this cycle's entries step (logged, cycle_step_failed); the candidate stays pending. */
+  /**
+   * The verdict on one pending candidate. A throw, or no answer within the engine's trigger timeout, ends this cycle's
+   * entries step (logged, cycle_step_failed); the candidate stays pending and is not asked again until that call ends.
+   */
   decide(c: Candidate, ctx: TriggerContext, pending: PendingInfo): Promise<Verdict> | Verdict;
   /**
    * Every verdict, after the engine's own cap check (so a buy the caps refuse arrives here as a skip). Called before

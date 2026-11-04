@@ -181,10 +181,10 @@ export class Ledger {
 
   // ---------------------------------------------------------------- positions
   /** A new position in `opening`. `entry` is the trigger's context for the buy, stored as JSON in launch_json. */
-  createPosition(p: { mint: string; chain: string; dry: boolean; now: number; decimals: number; strategy: string; entry?: unknown; note?: string }): number {
+  createPosition(p: { mint: string; chain: string; dry: boolean; now: number; decimals: number; strategy: string; entry?: unknown; entryJson?: string; note?: string }): number {
     const r = this.db
       .prepare("insert into positions (mint, chain, status, dry, opened_at, decimals, strategy, launch_json, note) values (?, ?, 'opening', ?, ?, ?, ?, ?, ?)")
-      .run(p.mint, p.chain, p.dry ? 1 : 0, p.now, p.decimals, p.strategy, JSON.stringify(p.entry ?? null), p.note ?? null);
+      .run(p.mint, p.chain, p.dry ? 1 : 0, p.now, p.decimals, p.strategy, p.entryJson ?? JSON.stringify(p.entry ?? null), p.note ?? null);
     return Number(r.lastInsertRowid);
   }
 

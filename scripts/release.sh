@@ -2,7 +2,8 @@
 # Release helper for the workspaces (plain npm, no extra tool). Each package versions on its own.
 #   scripts/release.sh pack                    typecheck, build, and npm pack every published package into ./packs
 #   scripts/release.sh bump <package> <ver>    set a package's version (npm version, no git tag); a core bump
-#                                               prints the bots whose core range it leaves
+#                                               also sets every bot's exact core pin to <ver> (bots pin the core
+#                                               exactly, as the SDK is pinned), and prints them
 # Publishing is not done here: `npm publish packs/<file>.tgz` by hand, core first.
 set -e
 cd "$(dirname "$0")/.."
@@ -17,13 +18,19 @@ case "$1" in
     ;;
   bump)
     [ -n "$2" ] && [ -n "$3" ] || { echo "bump <package dir name> <version>" >&2; exit 2; }
-    (cd "packages/$2" && npm version "$3" --no-git-tag-version)
-    if [ "$2" = core ]; then
-      for p in packages/*/package.json; do
-        r=$(node -e 'const d=require(process.argv[1]).dependencies||{};process.stdout.write(d["candle-bot-core"]||"")' "$PWD/$p")
-        [ -n "$r" ] && echo "$(dirname "$p"): candle-bot-core $r"
-      done
-    fi
+    echo "$3" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || { echo "bump: $3 is not a version" >&2; exit 2; }
+    # Edit the files directly (npm version would resolve the bots' old exact pin from the registry first).
+    node -e '
+      const fs = require("fs"), [dir, pkg, v] = process.argv.slice(1);
+      const set = (f, fn) => { const d = JSON.parse(fs.readFileSync(f, "utf8")); fn(d); fs.writeFileSync(f, JSON.stringify(d, null, 2) + "\n"); };
+      set(`${dir}/packages/${pkg}/package.json`, (d) => { d.version = v; });
+      console.log(`packages/${pkg}: ${v}`);
+      if (pkg === "core") for (const b of fs.readdirSync(`${dir}/packages`)) {
+        const f = `${dir}/packages/${b}/package.json`;
+        if (!fs.existsSync(f)) continue;
+        set(f, (d) => { if (d.dependencies && d.dependencies["candle-bot-core"] !== undefined) { d.dependencies["candle-bot-core"] = v; console.log(`packages/${b}: candle-bot-core ${v}`); } });
+      }' "$PWD" "$2" "$3"
+    npm install --package-lock-only --ignore-scripts >/dev/null
     ;;
   *) echo "usage: release.sh pack | bump <package> <version>" >&2; exit 2 ;;
 esac

@@ -18,7 +18,11 @@ import { redactDeep } from "./redact.ts";
 import { tokenBalance, type Rpc } from "./solana/rpc.ts";
 import type { ExitStrategy, PositionView } from "./strategies/types.ts";
 import type { Alerter } from "./alerts.ts";
-import type { BuyVerdict, Candidate, EntryCaps, PendingInfo, Trigger, TriggerContext, Verdict } from "./trigger.ts";
+import type { BuyVerdict, Candidate, EntryCaps, LedgerView, PendingInfo, Trigger, TriggerContext, Verdict } from "./trigger.ts";
+import { deepFreeze } from "./config.ts";
+import { asAddress } from "./solana/base58.ts";
+import { buyImpact, decodeCandleCurve } from "./market/curve.ts";
+import { candleCurve as curveOf } from "./solana/pda.ts";
 
 export interface EngineDeps {
   cfg: Config;
@@ -30,9 +34,39 @@ export interface EngineDeps {
   log: Logger;
   alerter: Alerter;
   now?: () => number;
+  /** Longest one trigger call (poll, decide) may take, ms (default TRIGGER_TIMEOUT_MS; capped by the cycle budget left). */
+  triggerTimeoutMs?: number;
 }
 
+/** Default limit on one trigger call. */
+export const TRIGGER_TIMEOUT_MS = 10_000;
+
+/** The engine's copy of a buy verdict: primitives only, frozen. */
+interface Buy {
+  readonly verdict: "buy";
+  readonly reason: string;
+  readonly lamports: bigint;
+  readonly deadlineAtMs: number | null;
+  readonly expectedOutRaw: bigint | null;
+  readonly decimals: number;
+  /** The entry context, already serialized (what positions.launch_json gets). */
+  readonly entryJson: string;
+  readonly log: Readonly<Record<string, unknown>> | ((nowMs: number) => Record<string, unknown>) | undefined;
+}
+
+type Decided = Buy | { readonly verdict: "wait"; readonly reason: string } | { readonly verdict: "skip"; readonly reason: string };
+
 const CORE_STATUS_KEYS = new Set(["at", "mode", "wallet", "strategy", "paused", "stopping", "cycles", "lastCycleMs", "equity", "caps", "queue", "alertsSent", "positions", "stats"]);
+
+function skip(reason: string): Decided {
+  return Object.freeze({ verdict: "skip" as const, reason });
+}
+
+/** What onVerdict gets: a frozen copy in the public shape (changing it changes nothing). */
+function publicVerdict(v: Decided): Verdict {
+  if (v.verdict !== "buy") return Object.freeze({ verdict: v.verdict, reason: v.reason }) as Verdict;
+  return Object.freeze({ verdict: "buy", reason: v.reason, lamports: v.lamports, deadlineAtMs: v.deadlineAtMs, expectedOutRaw: v.expectedOutRaw, decimals: v.decimals, context: JSON.parse(v.entryJson) });
+}
 
 export function lamportsOf(sol: number): bigint {
   return BigInt(Math.round(sol * 1e9));
@@ -49,7 +83,8 @@ export const SURPLUS_TAIL_MS = 3_600_000;
 export const FLOOR_ROOM_MIN = 0.005;
 
 interface Pending extends PendingInfo {
-  candidate: Candidate;
+  /** The engine's frozen copy of the candidate (meta stays the trigger's). */
+  candidate: Readonly<Candidate>;
 }
 
 const DEFAULT_DECIMALS = 6;
@@ -95,18 +130,35 @@ export class Engine {
   /** What every trigger call gets. */
   readonly ctx: TriggerContext;
 
+  /** Trigger calls that timed out and have not ended yet: no new call while one is still running. */
+  private hung = new Set<string>();
+
   constructor(d: EngineDeps) {
+    // The config is the engine's, the executor's and every trigger's: nobody may change it under the caps.
+    deepFreeze(d.cfg);
     this.d = d;
     this.now = d.now ?? Date.now;
     mkdirSync(join(d.cfg.stateDir, "requests"), { recursive: true });
     const self = this;
-    this.ctx = {
-      cfg: d.cfg, ledger: d.ledger, rpc: d.rpc, log: d.log, alerter: d.alerter,
+    const mine = (rows: PositionRow[]) => Object.freeze(rows.filter((p) => !!p.dry === self.dry).map((r) => Object.freeze({ ...r })));
+    const view: LedgerView = Object.freeze({
+      position: (id: number) => {
+        const p = d.ledger.position(id);
+        return p && !!p.dry === self.dry ? Object.freeze({ ...p }) : undefined;
+      },
+      positions: (...st: Parameters<Ledger["positionsByStatus"]>) => mine(st.length ? d.ledger.positionsByStatus(...st) : d.ledger.allPositions()),
+      ordersFor: (id: number) => (view.position(id) ? Object.freeze(d.ledger.ordersFor(id).map((o) => Object.freeze({ ...o }))) : Object.freeze([])),
+      entriesForMint: (mint: string) => d.ledger.entriesForMint(mint, self.dry),
+      lifetimeBuyLamports: () => d.ledger.lifetimeBuyLamports(self.dry),
+      openCount: () => self.openCount(),
+    });
+    this.ctx = Object.freeze({
+      cfg: d.cfg, ledger: view, rpc: d.rpc, log: d.log, alerter: d.alerter,
       get dry() { return self.dry; },
       now: () => self.now(),
-      caps: (mint) => self.caps(mint),
+      caps: (mint: string) => Object.freeze(self.caps(mint)),
       shouldStop: () => self.shouldStop(),
-    };
+    });
   }
 
   get executor(): Executor {
@@ -250,81 +302,176 @@ export class Engine {
   }
 
   /**
-   * The engine's own caps on a buy verdict, whatever the trigger decided: a trigger cannot buy past them. Same reasons
-   * and order as the launch bot's filters always had.
+   * The engine's own caps on a buy, whatever the trigger decided: a trigger cannot buy past them. Same reasons and
+   * order as the launch bot's filters always had. Reads only the engine's copies.
    */
-  private capCheck(mint: string, v: BuyVerdict): Verdict {
-    const ticket = v.lamports ?? lamportsOf(this.d.cfg.buy.sol);
-    if (!(typeof ticket === "bigint" && ticket > 0n && ticket <= lamportsOf(this.d.cfg.buy.sol))) return { verdict: "skip", reason: `ticket ${String(ticket)} lamports outside (0, buy.sol]` };
+  private capCheck(mint: string, v: Buy): Decided {
+    const ticket = v.lamports;
+    if (!(ticket > 0n && ticket <= lamportsOf(this.d.cfg.buy.sol))) return skip(`ticket ${String(ticket)} lamports outside (0, buy.sol]`);
     const caps = this.caps(mint);
-    if (caps.paused) return { verdict: "skip", reason: "PAUSE_BUYS" };
-    if (caps.entriesForMint >= this.d.cfg.buy.maxPerCoin) return { verdict: "skip", reason: `maxPerCoin ${this.d.cfg.buy.maxPerCoin}` };
-    if (caps.open >= this.d.cfg.buy.maxOpen) return { verdict: "skip", reason: `maxOpen ${this.d.cfg.buy.maxOpen}` };
-    if (caps.lifetimeLamports + ticket > lamportsOf(this.d.cfg.buy.lifetimeSol)) return { verdict: "skip", reason: `lifetimeSol ${this.d.cfg.buy.lifetimeSol}` };
+    if (caps.paused) return skip("PAUSE_BUYS");
+    if (caps.entriesForMint >= this.d.cfg.buy.maxPerCoin) return skip(`maxPerCoin ${this.d.cfg.buy.maxPerCoin}`);
+    if (caps.open >= this.d.cfg.buy.maxOpen) return skip(`maxOpen ${this.d.cfg.buy.maxOpen}`);
+    if (caps.lifetimeLamports + ticket > lamportsOf(this.d.cfg.buy.lifetimeSol)) return skip(`lifetimeSol ${this.d.cfg.buy.lifetimeSol}`);
     return v;
   }
 
   /**
-   * A verdict as the engine will act on it: only an exact "wait", "skip" or "buy" with well-typed fields; anything else
-   * (a typo, a plug-in's own word, a bad field) is a skip, never a buy.
+   * A verdict as the engine will act on it: each field read once into a frozen copy of primitives. Only an exact
+   * "wait", "skip" or "buy" with well-typed fields counts; anything else (a typo, a plug-in's own word, a bad field, a
+   * getter that throws) is a skip, never a buy.
    */
-  private checked(v: unknown): Verdict {
-    const x = v as Record<string, unknown> | null;
-    if (!x || typeof x !== "object") return { verdict: "skip", reason: "trigger gave no verdict" };
-    const reason = typeof x.reason === "string" ? x.reason : "";
-    if (x.verdict === "wait" || x.verdict === "skip") return { ...(x as object), reason } as Verdict;
-    if (x.verdict !== "buy") return { verdict: "skip", reason: `unknown verdict ${JSON.stringify(String(x.verdict)).slice(0, 40)}` };
-    const bad =
-      (x.lamports !== undefined && typeof x.lamports !== "bigint") ? "lamports" :
-      (x.deadlineAtMs !== undefined && x.deadlineAtMs !== null && !(typeof x.deadlineAtMs === "number" && Number.isFinite(x.deadlineAtMs))) ? "deadlineAtMs" :
-      (x.expectedOutRaw !== undefined && x.expectedOutRaw !== null && !(typeof x.expectedOutRaw === "bigint" && x.expectedOutRaw >= 0n)) ? "expectedOutRaw" :
-      (x.decimals !== undefined && !(Number.isInteger(x.decimals) && (x.decimals as number) >= 0 && (x.decimals as number) <= 18)) ? "decimals" :
-      (x.log !== undefined && typeof x.log !== "function" && (typeof x.log !== "object" || x.log === null)) ? "log" : null;
-    if (bad) return { verdict: "skip", reason: `buy verdict: bad ${bad}` };
-    return x as unknown as Verdict;
+  private checked(v: unknown, c: Readonly<Candidate>): Decided {
+    try {
+      if (!v || typeof v !== "object") return skip("trigger gave no verdict");
+      const x = v as Record<string, unknown>;
+      const verdict = x.verdict;
+      const reason = x.reason;
+      if (verdict === "wait" || verdict === "skip") return Object.freeze({ verdict, reason: typeof reason === "string" ? reason : "" }) as Decided;
+      if (verdict !== "buy") return skip(`unknown verdict ${JSON.stringify(String(verdict)).slice(0, 40)}`);
+      const lamports = x.lamports;
+      const deadline = x.deadlineAtMs;
+      const expected = x.expectedOutRaw;
+      const decimals = x.decimals;
+      const context = x.context;
+      const log = x.log;
+      if (typeof reason !== "string" || !reason) return skip("buy verdict: bad reason");
+      if (lamports !== undefined && typeof lamports !== "bigint") return skip("buy verdict: bad lamports");
+      if (deadline !== undefined && deadline !== null && !(typeof deadline === "number" && Number.isFinite(deadline))) return skip("buy verdict: bad deadlineAtMs");
+      if (expected !== undefined && expected !== null && !(typeof expected === "bigint" && expected >= 0n)) return skip("buy verdict: bad expectedOutRaw");
+      if (decimals !== undefined && !(typeof decimals === "number" && Number.isInteger(decimals) && decimals >= 0 && decimals <= 18)) return skip("buy verdict: bad decimals");
+      if (log !== undefined && typeof log !== "function" && (typeof log !== "object" || log === null)) return skip("buy verdict: bad log");
+      let entryJson: string;
+      try {
+        entryJson = JSON.stringify(context !== undefined ? context : c.meta ?? null) ?? "null";
+      } catch {
+        return skip("buy verdict: context is not JSON");
+      }
+      return Object.freeze({
+        verdict: "buy" as const, reason, lamports: lamports ?? lamportsOf(this.d.cfg.buy.sol), deadlineAtMs: (deadline as number | null | undefined) ?? null,
+        expectedOutRaw: (expected as bigint | null | undefined) ?? null, decimals: (decimals as number | undefined) ?? DEFAULT_DECIMALS, entryJson,
+        log: typeof log === "function" ? (log as (n: number) => Record<string, unknown>) : log ? Object.freeze({ ...(log as Record<string, unknown>) }) : undefined,
+      });
+    } catch (e) {
+      return skip(`trigger verdict unreadable: ${String((e as Error)?.message ?? e).slice(0, 80)}`);
+    }
+  }
+
+  /** The engine's copy of a candidate, or why it is refused (mint a Solana address as given, chain "solana"). */
+  private snapshot(c: unknown): Readonly<Candidate> | { bad: string; mint: string } {
+    try {
+      const x = c as Record<string, unknown>;
+      const mint = x?.mint;
+      const chain = x?.chain;
+      const source = x?.source;
+      const seenAtMs = x?.seenAtMs;
+      const reason = x?.reason;
+      const meta = x?.meta;
+      if (typeof mint !== "string" || asAddress(mint) !== mint) return { bad: "mint is not a Solana address", mint: String(mint).slice(0, 60) };
+      if (chain !== "solana") return { bad: `chain ${String(chain).slice(0, 20)}`, mint };
+      return Object.freeze({ mint, chain, source: typeof source === "string" ? source : "unknown", seenAtMs: typeof seenAtMs === "number" ? seenAtMs : this.now(), ...(typeof reason === "string" ? { reason } : {}), meta });
+    } catch {
+      return { bad: "candidate unreadable", mint: "?" };
+    }
+  }
+
+  /**
+   * One trigger call, raced against the trigger timeout (within the cycle budget left). A call that does not answer
+   * throws here, so the entries step ends as for a throwing trigger; until it ends, `key` is not called again.
+   */
+  private async bounded<T>(key: string, t0: number, call: () => T | Promise<T>): Promise<T> {
+    const left = CYCLE_BUDGET_MS - (this.now() - t0);
+    const ms = Math.max(50, Math.min(this.d.triggerTimeoutMs ?? TRIGGER_TIMEOUT_MS, left));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const p = Promise.resolve().then(call);
+    try {
+      return await Promise.race([p, new Promise<never>((_r, rej) => (timer = setTimeout(() => rej(new Error(`trigger ${key} gave no answer in ${ms} ms`)), ms)))]);
+    } catch (e) {
+      if (/gave no answer/.test(String((e as Error)?.message))) {
+        this.hung.add(key);
+        p.then(() => this.hung.delete(key), () => this.hung.delete(key));
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async entries(t0: number = this.now()): Promise<void> {
     const t = this.d.trigger;
-    for (const c of await t.poll(this.ctx)) {
-      this.stats.candidates++;
-      this.pending.set(c.mint, { candidate: c, firstSeenMs: this.now(), lastReason: "" });
+    if (!this.hung.has("poll")) {
+      const got = await this.bounded("poll", t0, () => t.poll(this.ctx));
+      for (const raw of Array.isArray(got) ? got : []) {
+        this.stats.candidates++;
+        const c = this.snapshot(raw);
+        if ("bad" in c) {
+          this.stats.skips++;
+          this.d.log.warn("candidate_refused", { mint: c.mint, reason: c.bad });
+          continue;
+        }
+        this.pending.set(c.mint, { candidate: c, firstSeenMs: this.now(), lastReason: "" });
+      }
     }
     for (const [mint, p] of [...this.pending]) {
       if (this.shouldStop() || this.overBudget(t0)) break;
-      let v = this.checked(await t.decide(p.candidate, this.ctx, p));
+      if (this.hung.has(`decide:${mint}`)) continue;
+      const info = (): PendingInfo => Object.freeze({ firstSeenMs: p.firstSeenMs, lastReason: p.lastReason });
+      let v = this.checked(await this.bounded(`decide:${mint}`, t0, () => t.decide(p.candidate, this.ctx, info())), p.candidate);
       if (v.verdict === "buy") v = this.capCheck(mint, v);
       if (v.verdict === "wait") {
-        if (t.onVerdict) t.onVerdict(p.candidate, v, this.ctx, p);
+        if (t.onVerdict) t.onVerdict(p.candidate, publicVerdict(v), this.ctx, info());
         else if (v.reason !== p.lastReason) this.d.log.info("candidate_wait", { mint, source: p.candidate.source, reason: v.reason });
         p.lastReason = v.reason;
         continue;
       }
       this.pending.delete(mint);
-      if (t.onVerdict) t.onVerdict(p.candidate, v, this.ctx, p);
+      if (t.onVerdict) t.onVerdict(p.candidate, publicVerdict(v), this.ctx, info());
       else if (v.verdict === "skip") this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: v.reason });
       if (v.verdict === "skip") {
         this.stats.skips++;
         continue;
       }
-      this.buy(p.candidate, v);
+      await this.buy(p.candidate, v);
     }
     t.afterEntries?.(this.ctx);
   }
 
-  private buy(c: Candidate, v: BuyVerdict): void {
+  /**
+   * The tokens to expect for a ticket, for the adoption cap: the engine's own read of the Candle curve, and the smaller
+   * of that and the trigger's. With no readable curve, none (an uncertain buy then adopts nothing; it alerts).
+   */
+  private async expectedOut(mint: string, lamports: bigint, fromTrigger: bigint | null): Promise<bigint | null> {
+    let mine: bigint | null = null;
+    try {
+      const r = await this.d.rpc.call<any>("getAccountInfo", [curveOf(mint), { encoding: "base64", commitment: "confirmed" }]);
+      const c = r?.value ? decodeCandleCurve(r.value) : null;
+      if (c && c.baseMint === mint && !c.migrated) mine = buyImpact(c, lamports).expectedOutRaw;
+    } catch {
+      mine = null;
+    }
+    if (mine === null) return null;
+    return fromTrigger !== null && fromTrigger < mine ? fromTrigger : mine;
+  }
+
+  private async buy(c: Readonly<Candidate>, v: Buy): Promise<void> {
+    const expected = await this.expectedOut(c.mint, v.lamports, v.expectedOutRaw);
     const now = this.now();
     const dry = this.d.cfg.mode === "dry";
-    const lamports = v.lamports ?? lamportsOf(this.d.cfg.buy.sol);
     const t = this.d.trigger;
     const id = this.d.ledger.tx(() => {
-      const pid = this.d.ledger.createPosition({ mint: c.mint, chain: c.chain, dry, now, decimals: v.decimals ?? DEFAULT_DECIMALS, strategy: this.d.strategy.name, entry: v.context !== undefined ? v.context : c.meta });
+      const pid = this.d.ledger.createPosition({ mint: c.mint, chain: c.chain, dry, now, decimals: v.decimals, strategy: this.d.strategy.name, entryJson: v.entryJson });
       // The buy is only good while the trigger's decision is: no attempt is built past its deadline.
-      this.d.ledger.createOrder({ positionId: pid, side: "buy", clientTradeId: `${t.buyIdPrefix ?? "bot"}-${randomUUID()}`, amountRaw: lamports, slippageBps: this.d.cfg.buy.maxSlippageBps, maxAttempts: this.d.cfg.retry.maxAttempts, now, reason: v.reason, deadlineAt: v.deadlineAtMs ?? null, expectedOutRaw: v.expectedOutRaw ?? null });
+      this.d.ledger.createOrder({ positionId: pid, side: "buy", clientTradeId: `${t.buyIdPrefix ?? "bot"}-${randomUUID()}`, amountRaw: v.lamports, slippageBps: this.d.cfg.buy.maxSlippageBps, maxAttempts: this.d.cfg.retry.maxAttempts, now, reason: v.reason, deadlineAt: v.deadlineAtMs, expectedOutRaw: expected });
       return pid;
     });
     this.stats.buys++;
-    const extra = typeof v.log === "function" ? v.log(now) : v.log ?? { sol: Number(lamports) / 1e9 };
+    let extra: Record<string, unknown> = { sol: Number(v.lamports) / 1e9 };
+    try {
+      if (typeof v.log === "function") extra = v.log(now) ?? {};
+      else if (v.log) extra = v.log;
+    } catch {
+      extra = { sol: Number(v.lamports) / 1e9, logError: true };
+    }
     // The trigger's fields never overwrite the engine's (key order stays position, mint, then the trigger's).
     const fields: Record<string, unknown> = { position: id, mint: c.mint };
     for (const [k, val] of Object.entries(extra)) if (!(k in fields)) fields[k] = val;

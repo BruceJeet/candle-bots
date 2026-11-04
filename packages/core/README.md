@@ -70,11 +70,38 @@ interface Trigger {
 }
 ```
 
-`TriggerContext` gives the config, the ledger (read it, don't write positions or orders), the RPC, the logger, the
-alerter, `dry`, `now()`, `caps(mint)` and `shouldStop()`. `PendingInfo` is when the candidate joined and its last wait
-reason. `onVerdict` sees every verdict after the engine's caps, so a buy the caps refuse arrives as a skip; without it
-the engine logs `candidate_wait` and `candidate_skip`. A trigger that throws costs that cycle's entries step (logged
-`cycle_step_failed`); its candidates stay pending, and exits run as usual.
+`TriggerContext` gives the config (deep-frozen), a read-only view of the ledger (this run's mode only), the RPC, the
+logger, the alerter, `dry`, `now()`, `caps(mint)` and `shouldStop()`; the context itself is frozen. `PendingInfo` is when
+the candidate joined and its last wait reason.
+
+The engine never trusts the trigger's objects:
+
+- a candidate is copied when `poll` returns: `mint` must be a Solana address as given (no padding) and `chain`
+  `"solana"`, else it is refused (`candidate_refused`); later calls get the engine's frozen copy;
+- a verdict is read once, field by field, into the engine's own frozen copy: only an exact `"wait"`, `"skip"` or a
+  well-typed `"buy"` (non-empty `reason`, bigint `lamports`, ...) counts, anything else is a skip; the caps, the order
+  and `onVerdict` (which gets a copy) all work from that copy, so changing the trigger's object afterwards changes
+  nothing;
+- the expected fill of a buy (the cap on adopting tokens of an uncertain buy) is the smaller of the trigger's and the
+  engine's own read of the Candle curve; with no readable curve there is none, and nothing is adopted;
+- each `poll` and `decide` call has a time limit (`triggerTimeoutMs`, default 10 s, within the cycle budget). A call
+  that throws or does not answer costs that cycle's entries step (logged `cycle_step_failed`); the candidate stays
+  pending and is not asked again until the hung call ends; exits, sells and STOP run as usual.
+
+`onVerdict` sees every verdict after the engine's caps, so a buy the caps refuse arrives as a skip; without it the
+engine logs `candidate_wait` and `candidate_skip`.
+
+```ts
+// what ctx.ledger offers (no writes; a bot's own tables live on the bot's own Ledger subclass, passed to its trigger)
+interface LedgerView {
+  position(id: number): Readonly<PositionRow> | undefined;
+  positions(...statuses: PositionStatus[]): ReadonlyArray<Readonly<PositionRow>>;
+  ordersFor(positionId: number): ReadonlyArray<Readonly<OrderRow>>;
+  entriesForMint(mint: string): number;   // what maxPerCoin counts
+  lifetimeBuyLamports(): bigint;          // what lifetimeSol counts
+  openCount(): number;                    // what maxOpen counts
+}
+```
 
 ## Writing a bot
 

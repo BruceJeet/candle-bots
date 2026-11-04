@@ -3,10 +3,10 @@
  * the core runs the ledger, the executor, the exits, the controls and status.json. Every module is also importable
  * on its own path (`candle-bot-core/<module>`).
  */
-export type { Candidate, BuyVerdict, Verdict, EntryCaps, PendingInfo, Trigger, TriggerContext } from "./trigger.ts";
-export { Engine, readControl, acquireLock, lockHeld, lamportsOf, CYCLE_BUDGET_MS } from "./engine.ts";
+export type { Candidate, BuyVerdict, Verdict, EntryCaps, LedgerView, PendingInfo, Trigger, TriggerContext } from "./trigger.ts";
+export { Engine, readControl, acquireLock, lockHeld, lamportsOf, CYCLE_BUDGET_MS, TRIGGER_TIMEOUT_MS } from "./engine.ts";
 export type { EngineDeps } from "./engine.ts";
-export { parseConfig, loadConfig, ConfigError, isObj, only, num, str, bool, strList, regex, ENV_NAME } from "./config.ts";
+export { parseConfig, loadConfig, deepFreeze, ConfigError, isObj, only, num, str, bool, strList, regex, ENV_NAME } from "./config.ts";
 export type { Config, Mode, Payer, SignerConfig, SectionParser, Sections, BotConfig, Obj } from "./config.ts";
 export { Ledger } from "./ledger.ts";
 export type { PositionRow, OrderRow, PositionStatus, OrderStatus, Side, QtySource } from "./ledger.ts";

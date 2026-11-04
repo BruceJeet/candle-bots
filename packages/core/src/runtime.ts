@@ -7,7 +7,7 @@ import { CandleClient } from "@candledottv/agent-sdk";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { makeAlerter, type Alerter } from "./alerts.ts";
-import type { Config } from "./config.ts";
+import { deepFreeze, type Config } from "./config.ts";
 import { acquireLock, type Engine } from "./engine.ts";
 import { Executor } from "./exec/executor.ts";
 import { EmbeddedRail, makeSecretStore, resolveEmbedded, resolveWallet, SdkRail, timedFetch, type TradeRail } from "./exec/trader.ts";
@@ -61,7 +61,7 @@ export function context<C extends Config>(cfg: C, modeOverride?: string): Ctx<C>
   if (modeOverride) {
     if (modeOverride !== "dry" && modeOverride !== "live") die("--mode: dry or live");
     if (modeOverride === "live" && cfg.mode !== "live") die('--mode live needs "mode": "live" in the config too (and, for payer linked, its signer)');
-    cfg = { ...cfg, mode: modeOverride };
+    cfg = deepFreeze({ ...cfg, mode: modeOverride });
   }
   const apiKey = process.env[cfg.apiKeyEnv];
   addSecret(apiKey);

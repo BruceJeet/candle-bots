@@ -51,6 +51,15 @@ export interface Config {
 
 export class ConfigError extends Error {}
 
+/** Freeze an object and everything it holds (plain objects and arrays). Returns it. */
+export function deepFreeze<T>(o: T): T {
+  if (o && typeof o === "object" && !Object.isFrozen(o)) {
+    Object.freeze(o);
+    for (const v of Object.values(o as object)) deepFreeze(v);
+  }
+  return o;
+}
+
 export type Obj = Record<string, unknown>;
 
 export function isObj(v: unknown): v is Obj {
@@ -189,7 +198,9 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
   };
 
   const own: Record<string, unknown> = {};
-  for (const [k, parse] of Object.entries(sections)) own[k] = parse(raw[k], { mode, wallet, buy, baseDir });
+  // Sections see a frozen copy of the core sections: they cannot change the caps.
+  const seen = deepFreeze({ mode, wallet, buy: { ...buy }, baseDir });
+  for (const [k, parse] of Object.entries(sections)) own[k] = parse(raw[k], seen);
 
   if (!isObj(raw.exit)) throw new ConfigError("config.exit: required object with a strategy name");
   const strategy = str(raw.exit, "strategy", "config.exit", { re: /^[A-Za-z][A-Za-z0-9_-]{0,40}$/ })!;
@@ -221,7 +232,8 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
     holdAlertMs: num(al, "holdAlertMs", "config.alerts", { min: 0, int: true, def: 300_000 }),
   };
 
-  return { mode, payer, apiUrl, apiKeyEnv, rpcUrlEnv, rpcWsUrlEnv, wallet, linkedWalletId, privyWalletId, privyAppId, signer, stateDir, loopMs, buy, sell, ...own, exit, retry, alerts, configDir: resolve(baseDir) } as BotConfig<S>;
+  // Frozen through: the engine, the executor and every trigger read this one object, and none may change it.
+  return deepFreeze({ mode, payer, apiUrl, apiKeyEnv, rpcUrlEnv, rpcWsUrlEnv, wallet, linkedWalletId, privyWalletId, privyAppId, signer, stateDir, loopMs, buy, sell, ...own, exit, retry, alerts, configDir: resolve(baseDir) }) as BotConfig<S>;
 }
 
 export function loadConfig<S extends Sections = {}>(path: string, sections: S = {} as S): BotConfig<S> {

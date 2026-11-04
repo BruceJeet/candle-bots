@@ -70,12 +70,12 @@ interface LaunchState {
   /** When the market was last read, and why the last read did not pass. */
   marketCheckedAt?: number;
   marketWhy?: string;
+  /** The impact of the buy just decided (for the launch row; the engine hands onVerdict its own copy of the verdict). */
+  impactBps?: number;
 }
 
 type LaunchVerdict = { verdict: "buy"; impactBps: number; expectedOutRaw: bigint } | { verdict: "skip"; reason: string } | { verdict: "wait"; reason: string };
 
-/** A buy verdict that also carries the impact, for the launch row. */
-type LaunchBuy = Extract<Verdict, { verdict: "buy" }> & { impactBps: number };
 
 export class LaunchTrigger implements Trigger {
   readonly name = "launch";
@@ -123,9 +123,11 @@ export class LaunchTrigger implements Trigger {
 
   async decide(c: Candidate, ctx: TriggerContext, pending: PendingInfo): Promise<Verdict> {
     const l = this.launchOf(c);
-    const v = await this.decideLaunch(l, this.st(c.mint), pending.lastReason, ctx);
+    const st = this.st(c.mint);
+    const v = await this.decideLaunch(l, st, pending.lastReason, ctx);
     if (v.verdict !== "buy") return v;
-    const buy: LaunchBuy = {
+    st.impactBps = v.impactBps;
+    return {
       verdict: "buy",
       reason: `entry, impact ${v.impactBps} bps`,
       lamports: lamportsOf(this.d.cfg.buy.sol),
@@ -136,9 +138,7 @@ export class LaunchTrigger implements Trigger {
       decimals: l.decimals,
       context: l,
       log: (now) => ({ symbol: l.symbol, sol: this.d.cfg.buy.sol, impactBps: v.impactBps, ageMs: l.launchedAtMs ? now - l.launchedAtMs : null }),
-      impactBps: v.impactBps,
     };
-    return buy;
   }
 
   onVerdict(c: Candidate, v: Verdict, _ctx: TriggerContext, pending: PendingInfo): void {
@@ -149,13 +149,14 @@ export class LaunchTrigger implements Trigger {
     }
     const l = this.launchOf(c);
     const sights = this.d.detector.sightingsFor(mint);
+    const impactBps = this.state.get(mint)?.impactBps;
     this.state.delete(mint);
     this.d.ledger.recordLaunch({
       mint, chain: l.chain, first_source: l.source, first_seen_at: l.detectedAtMs, launched_at: l.launchedAtMs,
       api_seen_at: sights.api?.atMs ?? null, chain_seen_at: sights.chain?.atMs ?? null,
       api_latency_ms: sights.api?.latencyMs ?? null, chain_latency_ms: sights.chain?.latencyMs ?? null,
       symbol: l.symbol ?? null, name: l.name ?? null, creator: l.creator ?? l.signer ?? null, launch_mode: l.launchMode ?? null,
-      decision: v.verdict, reason: v.verdict === "skip" ? v.reason : `impact ${(v as LaunchBuy).impactBps} bps`,
+      decision: v.verdict, reason: v.verdict === "skip" ? v.reason : `impact ${impactBps} bps`,
     });
     if (v.verdict === "skip") this.d.log.info("launch_skip", { mint, symbol: l.symbol, reason: v.reason });
   }

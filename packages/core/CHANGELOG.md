@@ -14,4 +14,8 @@ First release. Taken from candle-launch-bot 0.1.3 with the money paths unchanged
   (new: `parseConfig(raw, baseDir, sections)`);
 - one change in the executor: the buy-retry impact limit is a required dependency (`maxBuyImpactBps`) instead of
   the launch bot's `filters.maxImpactBps`;
+- the engine holds its caps whatever a trigger does: candidates and verdicts are read once into frozen copies (mint
+  must be an address, chain solana, buy reason a non-empty string, typed fields), `onVerdict` gets copies, the config
+  is deep-frozen, `ctx.ledger` is a read-only view (`LedgerView`), each trigger call has a timeout
+  (`triggerTimeoutMs`, default 10 s), and a buy's expected fill is bounded by the engine's own curve read;
 - `runtime.ts`: the run loop, `status` and `sell` commands, rail and executor wiring for a bot's command line.
