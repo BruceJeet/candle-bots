@@ -46,6 +46,8 @@ export const STRATEGY_ERROR_ALERT = 3;
  * looks at the exits again; what is left goes on in the next lane.
  */
 export const LANE_BUDGET_MS = 1_000;
+/** The expected-fill check reuses the trigger's curve read only if it is at most this old. */
+export const CURVE_REUSE_MS = 1_000;
 /** Most queued buy orders one lane builds (its time budget usually ends it first). */
 export const LANE_SWEEP_MAX = 50;
 /** A wake waits until no new wake came for this long before its lane runs: a burst gives one lane, not a storm. */
@@ -156,7 +158,9 @@ export class Engine {
   /** Cycles and lanes never run at the same time (one engine, one worker). */
   private work: Promise<unknown> = Promise.resolve();
   /** The engine's own curve reads in this entries step, by account (a trigger's ctx.readCurve and expectedOut share it). */
-  private curveCache = new Map<string, Promise<CurveRead>>();
+  private curveCache = new Map<string, { at: number; read: Promise<CurveRead> }>();
+  /** Where the next entries step starts when the last one stopped on its budget (round robin; null: the head). */
+  private resumeAt: string | null = null;
   /** Consecutive exit-strategy errors per position. */
   private strategyErrors = new Map<number, number>();
   /** Trigger calls that timed out and have not ended yet: no new call while one is still running. */
@@ -282,6 +286,8 @@ export class Engine {
    * cycle that is due always runs before another lane, so a stop-loss waits for at most one lane. Returns on STOP.
    */
   async run(loopMs: number): Promise<void> {
+    // Due times use the engine's clock (this.now); the debounce uses real time. A clock that never advances (a frozen
+    // test clock) gives one full cycle and then lanes only.
     let nextFull = 0;
     for (;;) {
       if (this.now() >= nextFull) {
@@ -562,9 +568,10 @@ export class Engine {
    * The engine's own read of a Candle curve account (default the mint's curve PDA): once per entries step and account,
    * shared by the trigger (ctx.readCurve) and the expected-fill bound. Frozen.
    */
-  private readCurve(mint: string, address?: string): Promise<CurveRead> {
+  private readCurve(mint: string, address?: string, opts: { maxAgeMs?: number; fresh?: (r: CurveRead) => boolean } = {}): Promise<CurveRead> {
     const key = typeof address === "string" && address ? address : curveOf(mint);
-    let p = this.curveCache.get(key);
+    const hit = this.curveCache.get(key);
+    let p = hit && (opts.maxAgeMs === undefined || this.now() - hit.at <= opts.maxAgeMs) ? hit.read : undefined;
     if (!p) {
       p = (async (): Promise<CurveRead> => {
         let v: any;
@@ -580,7 +587,7 @@ export class Engine {
           return Object.freeze({ status: "invalid" as const, error: String((e as Error)?.message ?? e) });
         }
       })();
-      this.curveCache.set(key, p);
+      this.curveCache.set(key, { at: this.now(), read: p });
     }
     return p;
   }
@@ -607,11 +614,23 @@ export class Engine {
     // the next exit pass never waits behind a long backlog.
     const tEntries = this.now();
     let decided = 0;
-    for (const [mint, p] of [...this.pending]) {
-      if (this.shouldStop()) break;
+    // Round robin across steps: a step that stopped on its budget resumes at the first candidate it did not reach, so
+    // slow candidates at the head cannot starve the rest. A step that reaches the end starts the next one at the head
+    // (the 0.1.0 order whenever everything fits in one step).
+    let order = [...this.pending];
+    const from = this.resumeAt === null ? -1 : order.findIndex(([m]) => m === this.resumeAt);
+    if (from > 0) order = [...order.slice(from), ...order.slice(0, from)];
+    this.resumeAt = null;
+    for (const [mint, p] of order) {
+      if (this.shouldStop()) {
+        this.resumeAt = mint;
+        break;
+      }
+      if (!this.pending.has(mint)) continue;
       // A lane decides at least one candidate, then yields at its deadline (a full cycle due).
       if (this.overBudget(t0) || this.now() - tEntries > LANE_BUDGET_MS || (decided > 0 && this.now() >= until)) {
         more = true;
+        this.resumeAt = mint;
         break;
       }
       if (this.hung.has(`decide:${mint}`)) continue;
@@ -623,7 +642,10 @@ export class Engine {
         // The engine's own expected fill (a curve read), then the caps once more: PAUSE_BUYS or STOP may have arrived
         // during the read. STOP leaves the candidate pending, untouched.
         const expected = await this.expectedOut(mint, v.lamports, v.expectedOutRaw);
-        if (this.shouldStop()) break;
+        if (this.shouldStop()) {
+          this.resumeAt = mint;
+          break;
+        }
         v = this.capCheck(mint, Object.freeze({ ...v, expectedOutRaw: expected }));
       }
       if (v.verdict === "wait") {
@@ -671,8 +693,14 @@ export class Engine {
   private async expectedOut(mint: string, lamports: bigint, fromTrigger: bigint | null): Promise<bigint | null> {
     // The engine's own read of the mint's curve PDA (shared with the trigger's ctx.readCurve in this step, never one
     // the trigger supplied).
+    // Reused only while fresh (CURVE_REUSE_MS: a slow decide can hold a read for seconds) and when it did not fail;
+    // otherwise read again, as 0.1.0 did.
     let mine: bigint | null = null;
-    const r = await this.readCurve(mint);
+    let r = await this.readCurve(mint, undefined, { maxAgeMs: CURVE_REUSE_MS });
+    if (r.status === "failed") {
+      this.curveCache.delete(curveOf(mint));
+      r = await this.readCurve(mint);
+    }
     if (r.status === "ok" && r.curve.baseMint === mint && !r.curve.migrated) {
       try {
         mine = buyImpact(r.curve, lamports).expectedOutRaw;
