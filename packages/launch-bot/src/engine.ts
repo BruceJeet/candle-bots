@@ -84,6 +84,8 @@ export class LaunchTrigger implements Trigger {
   readonly sellIdPrefix = "cls";
   /** Launches are decided four at a time in the run loop (each its own coin; market and curve reads are slow). */
   readonly concurrency = 4;
+  /** decide reads each launch's curve through ctx.readCurve: the run loop reads them for a whole batch at once (0.3.0). */
+  readonly readsCurves = true;
   private d: EngineDeps;
   private now: () => number;
   private state = new Map<string, LaunchState>();

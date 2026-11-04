@@ -242,8 +242,11 @@ export class Ledger {
   }
 
   /** Claim due orders in one statement: lease them so no other sweep (or a restart) re-runs them mid-attempt. */
-  claimDue(now: number, leaseMs: number, limit = 5, opts: { dryOnly?: boolean; onlyIds?: number[]; excludeIds?: number[]; side?: "buy" | "sell"; reconcileOnly?: boolean } = {}): OrderRow[] {
+  claimDue(now: number, leaseMs: number, limit = 5, opts: { dryOnly?: boolean; onlyIds?: number[]; excludeIds?: number[]; excludeMints?: string[]; side?: "buy" | "sell"; reconcileOnly?: boolean } = {}): OrderRow[] {
     const ex = opts.excludeIds?.length ? `and o.id not in (${opts.excludeIds.map((i) => Number(i)).join(",")})` : "";
+    // (0.3.0) Orders of coins that have an attempt in flight (or are held for a balance decision) are not claimed.
+    const mints = opts.excludeMints ?? [];
+    const exm = mints.length ? `and p.mint not in (${mints.map(() => "?").join(",")})` : "";
     const rec = opts.reconcileOnly ? "and (o.signature is not null or o.ever_signed = 1)" : "";
     const ids = opts.onlyIds?.length ? `and o.id in (${opts.onlyIds.map((i) => Number(i)).join(",")})` : "";
     const side = opts.side === "buy" ? "and o.side = 'buy'" : opts.side === "sell" ? "and o.side = 'sell'" : "";
@@ -252,11 +255,11 @@ export class Ledger {
         `update orders set status = 'inflight', lease_until = ?, updated_at = ?
           where id in (select o.id from orders o join positions p on p.id = o.position_id
                         where ((o.status = 'pending' and o.next_attempt_at <= ?) or (o.status = 'inflight' and o.lease_until <= ?))
-                          and (? = 0 or p.dry = 1) ${ids} ${ex} ${side} ${rec}
+                          and (? = 0 or p.dry = 1) ${ids} ${ex} ${exm} ${side} ${rec}
                         order by (o.side = 'sell') desc, o.next_attempt_at limit ?)
           returning *`,
       )
-      .all(now + leaseMs, now, now, now, opts.dryOnly ? 1 : 0, limit) as unknown as OrderRow[];
+      .all(now + leaseMs, now, now, now, opts.dryOnly ? 1 : 0, ...mints, limit) as unknown as OrderRow[];
   }
 
   updateOrder(id: number, fields: Partial<Omit<OrderRow, "id">>): void {

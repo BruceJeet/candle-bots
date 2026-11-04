@@ -15,7 +15,7 @@ import type { Ledger, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import { readMarkets, type MarketRead } from "./market/reader.ts";
 import { redactDeep } from "./redact.ts";
-import { tokenBalance, type Rpc } from "./solana/rpc.ts";
+import { getAccounts, tokenBalance, type Rpc } from "./solana/rpc.ts";
 import type { ExitStrategy, PositionView } from "./strategies/types.ts";
 import type { Alerter } from "./alerts.ts";
 import type { BuyVerdict, Candidate, CurveRead, EntryCaps, LedgerView, PendingInfo, Trigger, TriggerContext, Verdict } from "./trigger.ts";
@@ -53,6 +53,8 @@ export const WAKE_DEBOUNCE_MS = 10;
 export const WAKE_DEBOUNCE_MAX_MS = 50;
 /** Surplus balance reads in flight at once. */
 export const SURPLUS_READS = 8;
+/** (0.3.0) Wallet balance reads in flight at once for one exit tick's sells (one per crossing coin). */
+export const BALANCE_READS = 16;
 
 /** A trigger call still running this many timeouts after it timed out is given up on (its candidate dropped). */
 export const HUNG_DROP_TIMEOUTS = 3;
@@ -161,6 +163,8 @@ export class Engine {
   private wakePending = false;
   private lastWakeAt = 0;
   private wakeWaiter: (() => void) | null = null;
+  /** (0.3.0) Inside run(): order attempts start on their own (pump) instead of inside a sweep under the lock. */
+  private running = false;
   /** Cycles and lanes never run at the same time (one engine, one worker). */
   private lockBusy = false;
   private lockExits: Array<() => void> = [];
@@ -333,8 +337,11 @@ export class Engine {
   }
 
   /**
-   * The money lock: fn runs when no other holder runs. Held by full cycles, exit ticks and each booking (the cap check,
-   * the booking transaction and that order's build and submit). Never held by a trigger call (poll, decide).
+   * The money lock: fn runs when no other holder runs. Under run() (0.3.0) it is held by the exit tick's exits pass
+   * and by the short ledger steps of the full cycle (nag, the surplus verdicts, status.json); never by an order attempt
+   * (build, sign, submit: they run on their own, one per order and per coin, see Executor.startDue), a booking (one
+   * synchronous ledger transaction) or a trigger call. cycle() (for callers that drive the engine) holds it for its
+   * whole cycle, attempts included, as in 0.1.0.
    */
   private async exclusive<T>(fn: () => Promise<T>, prio: "exits" | "normal" = "normal"): Promise<T> {
     if (this.lockBusy) await new Promise<void>((r) => (prio === "exits" ? this.lockExits : this.lockNormal).push(r));
@@ -381,17 +388,23 @@ export class Engine {
   }
 
   /**
-   * The run loop: three loops that share only the money lock.
-   *  - exits: every cfg.exitMs (a stop-aware sleep after each tick), the exit tick under the lock: sells in flight, one
-   *    batched market read for the open coins, the exit strategy, new sells. Skipped (no RPC) with no open position.
-   *  - full cycle: every loopMs after the last one ended, under the lock: sell requests, settle buys, the orders sweep,
-   *    alerts, the surplus check, status.json.
+   * The run loop: three loops, and order attempts that run on their own.
+   *  - exits: every cfg.exitMs (a stop-aware sleep after each tick), the exit tick under the lock: one batched market
+   *    read for the open coins, the exit strategy, the crossing coins' balance reads (in parallel), new sells, each
+   *    started at once. Skipped (no RPC) with no open position.
+   *  - full cycle: every loopMs after the last one ended: sell requests, start due orders, alerts, the surplus check,
+   *    status.json.
    *  - entries: polls on a wake (debounced) or every loopMs, and decides pending candidates, trigger.concurrency at a
-   *    time (default 1), OUTSIDE the lock. A candidate that waits is asked again after loopMs. Each buy verdict takes
-   *    the lock to check the caps again, book (one ledger transaction) and build and submit that order.
-   * A hung or slow trigger call never holds the lock, so it never delays an exit. Returns once STOP is seen.
+   *    time (default 1), OUTSIDE the lock. A candidate that waits is asked again after loopMs. A buy verdict books its
+   *    order (the caps checked again inside one ledger transaction) and starts its attempt if a buy slot is free.
+   *  - attempts (0.3.0): every order attempt (build, sign, submit, settle) runs outside the lock, one per order and at
+   *    most one per coin; buys cfg.buy.concurrency at a time, sells never wait for a buy. When one ends the next due
+   *    order starts. After STOP none starts and no attempt starts a new build; run() waits for those in flight.
+   * A hung or slow trigger call or Candle call never holds the lock, so it never delays an exit. Returns once STOP is
+   * seen and every attempt in flight has ended.
    */
   async run(loopMs: number): Promise<void> {
+    this.running = true;
     const exitMs = Math.max(200, Math.min(this.d.cfg.exitMs ?? loopMs, loopMs));
     const k = Math.max(1, Math.min(16, Math.floor(Number(this.d.trigger.concurrency ?? 1)) || 1));
     const exitsLoop = (async () => {
@@ -431,47 +444,49 @@ export class Engine {
       }
     })();
     await Promise.all([exitsLoop, fullLoop, entriesLoop]);
-    // Drain the money lock: a booking's build and submit, or a sweep, in flight when STOP came finishes before run()
-    // returns (the runtime then closes the ledger). Anything that gets the lock after STOP books nothing.
+    // Drain the money lock and every attempt in flight: a build, sign or submit under way when STOP came finishes
+    // before run() returns (the runtime then closes the ledger). Nothing starts after STOP, and no attempt starts a
+    // new build after it.
     await this.exclusive(async () => undefined);
+    await this.d.executor.drain();
+    this.running = false;
     this.writeStatus();
   }
 
   /**
-   * The run loop's full cycle: sell requests, settle buys, the orders sweep, alerts, the surplus check, status.json.
-   * Each step takes the lock on its own and the orders sweep takes it once per order, so an exit tick waits at most for
-   * one step or one order attempt, never a whole cycle.
+   * (0.3.0, run() only) Start every order attempt that may start now: sells always, buys while a slot is free, one per
+   * order and per coin (Executor.startDue). Never waits for them; when one ends, the next due order starts.
+   */
+  private pump(): void {
+    if (!this.running || this.shouldStop()) return;
+    for (const a of this.d.executor.startDue({ shouldStop: this.shouldStop })) void a.then(() => setImmediate(() => this.pump()));
+  }
+
+  /**
+   * The run loop's full cycle: sell requests, due orders started, alerts, the surplus check, status.json. Only the short
+   * ledger steps take the lock; no step waits for an order attempt.
    */
   private async runCycle(): Promise<boolean> {
     const t0 = this.now();
-    const budget = () => Math.max(1_000, CYCLE_BUDGET_MS - (this.now() - t0));
     const locked = (name: string, fn: () => Promise<void>) => this.exclusive(() => this.guard(name, fn));
     const steps: Array<[string, () => Promise<void>]> = [
-      ["requests", () => locked("requests", () => this.manualRequests())],
-      ["settle-buys", async () => {
-        for (const id of this.dueOrderIds({ side: "buy", reconcileOnly: true })) {
-          if (this.shouldStop()) break;
-          await locked("settle-buys", () => this.d.executor.sweep(1, { onlyIds: [id], side: "buy", reconcileOnly: true, budgetMs: budget(), shouldStop: this.shouldStop }));
-        }
-      }],
-      ["orders", async () => {
-        for (const id of this.dueOrderIds({})) {
-          if (this.shouldStop() || this.overBudget(t0)) break;
-          await locked("orders", () => this.d.executor.sweep(1, { onlyIds: [id], budgetMs: budget(), shouldStop: this.shouldStop }));
-        }
-      }],
+      // Manual sells: each holds its coin (Executor.reserveMint) while it reads the balance and books, not the lock.
+      ["requests", () => this.guard("requests", () => this.manualRequests())],
+      // Every due order (sells first; buys up to cfg.buy.concurrency), settles included: started, not awaited.
+      ["orders", () => this.guard("orders", async () => this.pump())],
       ["nag", () => locked("nag", async () => this.nag())],
       // Surplus: which coins are due and the verdicts under the lock, the balance reads outside it.
       ["surplus", async () => {
         const due = await this.exclusive(async () => this.surplusDue());
         if (!due.length || this.shouldStop()) return;
+        const epochs = new Map(due.map((m) => [m, this.d.executor.mintEpoch(m)]));
         const balances = await this.surplusReads(due);
-        await locked("surplus", async () => this.surplusJudge(due, balances));
+        await locked("surplus", async () => this.surplusJudge(due, balances, epochs));
       }],
     ];
     for (const [name, fn] of steps) {
       if (this.shouldStop()) break;
-      if (this.overBudget(t0) && !["settle-buys", "nag"].includes(name)) continue;
+      if (this.overBudget(t0) && name !== "nag") continue;
       await fn();
     }
     await this.exclusive(async () => {
@@ -485,34 +500,15 @@ export class Engine {
   }
 
   /**
-   * The orders a sweep of 5 would claim now, in its order (sells first, then by next attempt): each is then swept on
-   * its own (its claim checks again that it is due), so every order runs at most once per step, as in sweep(5).
+   * The exit tick (under the lock): due orders started (sells never wait), then, with open positions, one market read,
+   * the exit strategy and the new sells, each started as soon as its coin's balance is read. Waits for no attempt. No
+   * RPC without open positions.
    */
-  private dueOrderIds(opts: { side?: "buy" | "sell"; reconcileOnly?: boolean }): number[] {
-    const now = this.now();
-    const side = opts.side === "buy" ? "and o.side = 'buy'" : opts.side === "sell" ? "and o.side = 'sell'" : "";
-    const rec = opts.reconcileOnly ? "and (o.signature is not null or o.ever_signed = 1)" : "";
-    const rows = this.d.ledger.db
-      .prepare(
-        `select o.id id from orders o join positions p on p.id = o.position_id
-          where ((o.status = 'pending' and o.next_attempt_at <= ?) or (o.status = 'inflight' and o.lease_until <= ?))
-            and (? = 0 or p.dry = 1) ${side} ${rec}
-          order by (o.side = 'sell') desc, o.next_attempt_at limit 5`,
-      )
-      .all(now, now, this.dry ? 1 : 0) as Array<{ id: number }>;
-    return rows.map((r) => Number(r.id));
-  }
-
-  /** The exit tick (under the lock): sells in flight, market reads, exits, new sells. No RPC without open positions. */
   private async exitTick(): Promise<void> {
-    if (this.shouldStop() || !this.mine("open", "exit_stuck").length) return;
-    const t0 = this.now();
-    const sweep = () => this.d.executor.sweep(5, { side: "sell", budgetMs: Math.max(1_000, CYCLE_BUDGET_MS - (this.now() - t0)), shouldStop: this.shouldStop });
-    await this.guard("sells", sweep);
     if (this.shouldStop()) return;
+    this.pump();
+    if (!this.mine("open", "exit_stuck").length) return;
     await this.guard("exits", () => this.exits());
-    if (this.shouldStop()) return;
-    await this.guard("sells2", sweep);
     this.exitTicks++;
   }
 
@@ -550,6 +546,15 @@ export class Engine {
   /** Start decides for due pending candidates, up to k in flight (each runs outside the lock). */
   private startDecides(k: number, reaskMs: number): void {
     this.expireHung();
+    if (this.d.trigger.readsCurves === true && this.inflight.size < k && !this.shouldStop()) {
+      // (0.3.0) Every due candidate's curve in one batched read, before any of them is decided.
+      const due: string[] = [];
+      for (const mint of this.pending.keys()) {
+        if (this.inflight.has(mint) || this.hung.has(`decide:${mint}`) || (this.nextAsk.get(mint) ?? 0) > this.now()) continue;
+        due.push(mint);
+      }
+      this.prefetchCurves(due);
+    }
     for (const [mint, p] of this.pending) {
       if (this.inflight.size >= k || this.shouldStop()) return;
       if (this.inflight.has(mint) || this.hung.has(`decide:${mint}`)) continue;
@@ -595,6 +600,23 @@ export class Engine {
         return;
       }
       const buyV = v;
+      if (this.running) {
+        // (0.3.0) run(): no lock to wait for, so the fill bound's read (expectedOut just above, a read at most exitMs
+        // old) is the one this booking uses, with nothing awaited in between. STOP, the caps (inside the booking
+        // transaction too) and the booking are synchronous; the attempt starts on its own (a free buy slot now, or the
+        // next one to free up).
+        if (this.shouldStop() || this.pending.get(mint) !== p) return;
+        const final = this.capCheck(mint, buyV);
+        this.forget(mint);
+        if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(final), this.ctx, info()));
+        else if (final.verdict === "skip") this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: final.reason });
+        if (final.verdict !== "buy") {
+          this.stats.skips++;
+          return;
+        }
+        if (this.buy(p.candidate, final) !== null) this.pump();
+        return;
+      }
       await this.exclusive(async () => {
         // Under the lock: nothing books after STOP; the caps as they stand now (another booking may have run).
         if (this.shouldStop() || this.pending.get(mint) !== p) return;
@@ -745,12 +767,14 @@ export class Engine {
   }
 
   /** Judge each coin against what the ledger holds now; a coin with an order in flight now waits for its next check. */
-  private surplusJudge(due: string[], balances: Map<string, bigint | null>): void {
+  private surplusJudge(due: string[], balances: Map<string, bigint | null>, epochs?: Map<string, number>): void {
     const held = this.mine("opening", "open", "exit_stuck");
     for (const mint of due) {
       if (this.shouldStop()) return;
       const ps = held.filter((p) => p.mint === mint);
       if (ps.some((p) => p.status === "opening" || this.d.ledger.openOrderFor(p.id))) continue;
+      // (0.3.0) An attempt on the coin started or ended while its balance was read: that reading proves nothing.
+      if (epochs && (this.d.executor.mintBusy(mint) || this.d.executor.mintEpoch(mint) !== epochs.get(mint))) continue;
       const bal = balances.get(mint) ?? null;
       if (bal === null) continue;
       const booked = ps.reduce((t, p) => t + BigInt(p.remaining_raw), 0n);
@@ -901,23 +925,62 @@ export class Engine {
     const maxAge = opts.maxAgeMs ?? this.d.cfg.exitMs;
     let p = hit && this.now() - hit.at <= maxAge ? hit.read : undefined;
     if (!p) {
-      p = (async (): Promise<CurveRead> => {
-        let v: any;
-        try {
-          v = (await this.d.rpc.call<any>("getAccountInfo", [key, { encoding: "base64", commitment: "confirmed" }]))?.value;
-        } catch (e) {
-          return Object.freeze({ status: "failed" as const, error: String((e as Error)?.message ?? e) });
-        }
-        if (!v) return Object.freeze({ status: "missing" as const });
-        try {
-          return Object.freeze({ status: "ok" as const, address: key, curve: deepFreeze(decodeCandleCurve(v)) });
-        } catch (e) {
-          return Object.freeze({ status: "invalid" as const, error: String((e as Error)?.message ?? e) });
-        }
-      })();
+      p = this.readOneCurve(key);
       this.curveCache.set(key, { at: this.now(), read: p });
     }
     return p;
+  }
+
+  /** One curve account read on its own (getAccountInfo). */
+  private async readOneCurve(key: string): Promise<CurveRead> {
+    let v: any;
+    try {
+      v = (await this.d.rpc.call<any>("getAccountInfo", [key, { encoding: "base64", commitment: "confirmed" }]))?.value;
+    } catch (e) {
+      return Object.freeze({ status: "failed" as const, error: String((e as Error)?.message ?? e) });
+    }
+    return this.curveOfAccount(key, v);
+  }
+
+  /** A curve account as read: missing, invalid, or the decoded curve (frozen). */
+  private curveOfAccount(key: string, v: any): CurveRead {
+    if (!v) return Object.freeze({ status: "missing" as const });
+    try {
+      return Object.freeze({ status: "ok" as const, address: key, curve: deepFreeze(decodeCandleCurve(v)) });
+    } catch (e) {
+      return Object.freeze({ status: "invalid" as const, error: String((e as Error)?.message ?? e) });
+    }
+  }
+
+  /**
+   * (0.3.0) The curves of these candidates (their mint's curve PDA) in one batched read (getMultipleAccounts, 100 keys
+   * a call), each cached under its own key with its own time, exactly as a single read would be. Keys read within
+   * exitMs are not read again. A batch that fails falls back to one read per key (logged), so it never answers
+   * "failed" for a key that a single read would have read.
+   */
+  private prefetchCurves(mints: string[]): void {
+    const keys = [...new Set(mints.map((m) => curveOf(m)))].filter((k) => {
+      const hit = this.curveCache.get(k);
+      return !(hit && this.now() - hit.at <= this.d.cfg.exitMs);
+    });
+    if (!keys.length) return;
+    const at = this.now();
+    const batch = getAccounts(this.d.rpc, keys);
+    // One rejection handler for the whole batch (each key's own fallback below handles its read).
+    let logged = false;
+    keys.forEach((key, i) => {
+      const read = batch.then(
+        (vals) => this.curveOfAccount(key, vals[i]),
+        (e) => {
+          if (!logged) {
+            logged = true;
+            this.d.log.warn("curve_batch_failed", { keys: keys.length, error: String((e as Error)?.message ?? e).slice(0, 200) });
+          }
+          return this.readOneCurve(key);
+        },
+      );
+      this.curveCache.set(key, { at, read });
+    });
   }
 
   /** Returns true when it stopped on its time budget with candidates still pending. */
@@ -1104,6 +1167,7 @@ export class Engine {
 
   private async exits(): Promise<void> {
     const open = this.mine("open", "exit_stuck");
+    const toSell: Array<{ p: PositionRow; fraction: number; reason: string }> = [];
     if (!open.length) return;
     this.markets = await readMarkets(this.d.rpc, open.map((p) => ({ mint: p.mint, decimals: p.decimals })), this.now());
     // Every position's last and peak price in one ledger transaction (one commit, not one per position), and only
@@ -1158,13 +1222,50 @@ export class Engine {
         continue;
       }
       if (decision.action !== "sell") continue;
-      await this.placeSell(p, decision.fraction, decision.reason, false);
+      toSell.push({ p, fraction: decision.fraction, reason: decision.reason });
+    }
+    if (!this.running) {
+      // cycle(): one after another, as in 0.1.0 (the sweeps that follow build them).
+      for (const x of toSell) {
+        if (this.shouldStop()) return;
+        await this.placeSell(x.p, x.fraction, x.reason, false);
+      }
+      return;
+    }
+    // run() (0.3.0): every crossing coin's balance read at once (BALANCE_READS at a time), each sell booked and started
+    // as soon as its own read is back: k crossings cost one read's latency, not k.
+    let next = 0;
+    const worker = async () => {
+      while (next < toSell.length && !this.shouldStop()) {
+        const x = toSell[next++];
+        if ((await this.placeSell(x.p, x.fraction, x.reason, false)) !== null) this.pump();
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(BALANCE_READS, toSell.length) }, worker));
+  }
+
+  /**
+   * Create a sell order clamped to the on-chain balance. Returns the order id, or null when refused. (0.3.0) The coin is
+   * held (Executor.reserveMint) from before the balance read until the order is booked, so no attempt on the coin runs
+   * between the two; a coin with an attempt in flight gets no new sell now (null, logged; the next tick tries again).
+   */
+  async placeSell(p: PositionRow, fraction: number, reason: string, manual: boolean): Promise<number | null> {
+    if (!this.d.executor.reserveMint(p.mint)) {
+      this.d.log.info("sell_deferred", { position: p.id, mint: p.mint, why: "an order attempt on this coin is in flight" });
+      return null;
+    }
+    try {
+      return await this.placeSellHeld(p, fraction, reason, manual);
+    } finally {
+      this.d.executor.releaseMint(p.mint);
     }
   }
 
-  /** Create a sell order clamped to the on-chain balance. Returns the order id, or null when refused. */
-  async placeSell(p: PositionRow, fraction: number, reason: string, manual: boolean): Promise<number | null> {
+  /** placeSell with the coin already held. */
+  private async placeSellHeld(p: PositionRow, fraction: number, reason: string, manual: boolean): Promise<number | null> {
     p = this.d.ledger.position(p.id) ?? p;
+    // Under the hold: one exit in flight at a time (a manual sell may have booked one since the exits pass looked).
+    if (!manual && this.d.ledger.openOrderFor(p.id)) return null;
     if (!(fraction > 0 && fraction <= 1)) throw new Error("fraction must be in (0, 1]");
     let remaining = BigInt(p.remaining_raw);
     if (remaining <= 0n) return null;
@@ -1215,6 +1316,15 @@ export class Engine {
     for (const n of names) {
       const path = join(dir, n);
       const text = readControl(path);
+      // (0.3.0) A request for a coin with an order attempt in flight stays for the next cycle (checked and then held
+      // by manualSell in the same synchronous turn, so nothing starts on the coin in between).
+      let peek: unknown;
+      try {
+        peek = text ? JSON.parse(text)?.mint : undefined;
+      } catch {
+        peek = undefined;
+      }
+      if (typeof peek === "string" && this.d.executor.mintBusy(peek)) continue;
       try {
         unlinkSync(path);
       } catch {
@@ -1231,8 +1341,20 @@ export class Engine {
     }
   }
 
-  /** The `sell` command's path: same clamp, same executor. Moves an exit_stuck position back to open. */
+  /**
+   * The `sell` command's path: same clamp, same executor. Moves an exit_stuck position back to open. (0.3.0) Holds the
+   * coin for the whole request (the reopen scan, the balance read, the booking): no attempt on it runs meanwhile.
+   */
   async manualSell(mint: string, fraction: number): Promise<string> {
+    if (!this.d.executor.reserveMint(mint)) return "an order attempt on this coin is in flight; try again";
+    try {
+      return await this.manualSellHeld(mint, fraction);
+    } finally {
+      this.d.executor.releaseMint(mint);
+    }
+  }
+
+  private async manualSellHeld(mint: string, fraction: number): Promise<string> {
     let p = this.mine("open", "exit_stuck").find((x) => x.mint === mint);
     if (!p) {
       const r = await this.reopenFailedBuy(mint);
@@ -1241,7 +1363,7 @@ export class Engine {
     }
     if (this.d.ledger.openOrderFor(p.id)) return "an exit order is already in flight";
     // exit_stuck is cleared only when this manual sell fills (the executor does that), not before.
-    const id = await this.placeSell(p, fraction, "manual", true);
+    const id = await this.placeSellHeld(p, fraction, "manual", true);
     return id === null ? "refused (see alerts)" : `order ${id}`;
   }
 

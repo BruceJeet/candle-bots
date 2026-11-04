@@ -143,6 +143,12 @@ export interface Trigger {
    * outside the money lock; bookings are one at a time.
    */
   readonly concurrency?: number;
+  /**
+   * (0.3.0) decide reads candidates' curves through ctx.readCurve (at the mint's curve PDA). The run loop then reads
+   * the curves of every due candidate in one batched call (getMultipleAccounts, 100 a call) before deciding them,
+   * instead of one read per candidate. Without it nothing is read ahead.
+   */
+  readonly readsCurves?: boolean;
   /** Prefix of buy order ids (clientTradeId `<prefix>-<uuid>`), default "bot". */
   readonly buyIdPrefix?: string;
   /** Prefix of sell order ids, default "bots". */

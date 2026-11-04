@@ -42,6 +42,8 @@ export interface Config {
     lifetimeSol: number;
     maxPerCoin: number;
     maxPriorityFeeLamports?: number;
+    /** (0.3.0) Buy attempts in flight at once under Engine.run (parseConfig default 4; absent: 1). */
+    concurrency?: number;
   };
   sell: { maxSlippageBps: number; maxPriorityFeeLamports?: number };
   exit: { strategy: string; [param: string]: unknown };
@@ -183,7 +185,7 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
 
   if (!isObj(raw.buy)) throw new ConfigError("config.buy: required object");
   const b = raw.buy;
-  only(b, ["sol", "maxSlippageBps", "maxOpen", "lifetimeSol", "maxPerCoin", "maxPriorityFeeLamports"], "config.buy");
+  only(b, ["sol", "maxSlippageBps", "maxOpen", "lifetimeSol", "maxPerCoin", "maxPriorityFeeLamports", "concurrency"], "config.buy");
   const buy = {
     sol: num(b, "sol", "config.buy", { min: 0.000001, max: 1000 }),
     maxSlippageBps: num(b, "maxSlippageBps", "config.buy", { min: 0, max: 10_000, int: true }),
@@ -192,6 +194,8 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
     // One entry per coin: re-entry is not supported (a second position in a coin would share its wallet balance).
     maxPerCoin: num(b, "maxPerCoin", "config.buy", { min: 1, max: 1, int: true, def: 1 }),
     maxPriorityFeeLamports: b.maxPriorityFeeLamports === undefined ? undefined : num(b, "maxPriorityFeeLamports", "config.buy", { min: 0, max: 10_000_000, int: true }),
+    // (0.3.0) Buy attempts (build, sign, submit) in flight at once under Engine.run; 1 is 0.2.0's one at a time.
+    concurrency: num(b, "concurrency", "config.buy", { min: 1, max: 64, int: true, def: 4 }),
   };
 
   const sl = raw.sell === undefined ? {} : raw.sell;
