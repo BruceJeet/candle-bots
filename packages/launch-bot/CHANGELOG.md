@@ -2,12 +2,13 @@
 
 ## 0.3.0
 
-- On candle-bot-core 0.2.0 (pinned exactly): a launch the detector sees wakes the engine, so it is decided and its buy
-  built at once instead of at the next cycle (about 0.1 s instead of up to `loopMs`, 2 s by default); the curve is read
-  once per buy (through the core's `ctx.readCurve`, shared with its expected-fill check).
-- Bursts: buys are built one after another in lanes instead of five per cycle.
-- Same CLI, config, state dir, ledger, `status.json` fields and events; money outcomes unchanged. Events can come
-  earlier and in a different order relative to the exit steps' events.
+- On candle-bot-core 0.2.0 (pinned exactly): a launch the detector sees wakes the engine and is decided at once
+  (about 0.1 s instead of up to `loopMs`), four launches at a time, outside the money lock; exits run on their own
+  tick every `exitMs` (new optional config key, default 500 ms), so a slow Candle or RPC read in a launch's decide
+  never delays a stop-loss.
+- The curve is read once per buy (through the core's `ctx.readCurve`, shared with its expected-fill check).
+- Same CLI, config file (one new optional key, `exitMs`), state dir, ledger, `status.json` fields and events; money
+  outcomes unchanged. Events can come earlier and in a different order relative to the exit steps' events.
 
 ## 0.2.0
 

@@ -31,14 +31,14 @@ each cycle (the engine):
 A bot writes the two middle lines. It never places an order, books a fill or touches a position: a buy verdict is a
 request the engine may still refuse.
 
-**Timing (0.2.0).** A full cycle runs `loopMs` after the last one ended. Between full cycles the engine sleeps until a
-wake: when the trigger's source sees something new it calls `ctx.wake()`, and a **fast entry lane** runs at once
-(debounced: a burst gives one lane). A lane decides the pending candidates and builds and submits each buy as soon as
-it is booked, then builds queued buy orders, for at most `LANE_BUDGET_MS` (1 s) plus the buy in flight. It does no
-exit work. A full cycle that is due always runs before another lane, and every entries step (a lane's or a full
-cycle's) is bounded the same way, so a stop-loss waits at most `loopMs` + one entries step + one lane. Lanes and
-cycles never overlap, and the caps are checked again inside the ledger transaction that books each buy. A trigger
-without `wake` still works: its candidates are decided in the next full cycle, as in 0.1.0.
+**Timing (0.2.0).** `run()` keeps exits and entries apart. An **exit tick** every `exitMs` (default 500 ms) reads the
+open coins' markets in one call and runs the exit strategy and sells. A **full cycle** every `loopMs` handles sell
+requests, settling, queued orders, alerts and status. **Entries** run as soon as the trigger's source calls
+`ctx.wake()` (or every `loopMs`): candidates are decided outside the money lock, `trigger.concurrency` at a time, so a
+slow or hung decide never delays an exit. Each buy takes the lock to re-check the caps, book (one ledger transaction,
+caps checked inside it) and build and submit. A stop-loss is acted on within `exitMs`, plus at most one order attempt
+holding the lock, plus a market read and the sell's build. A trigger without `wake` still works: it is polled every
+`loopMs`.
 
 ## The trigger interface
 

@@ -227,6 +227,7 @@ Every line that leaves the process is redacted first: the values of env vars who
   "signer": { "store": "keychain" },
   "stateDir": "./state",
   "loopMs": 2000,
+  "exitMs": 500,
   "buy": { "sol": 0.05, "maxSlippageBps": 500, "maxOpen": 3, "lifetimeSol": 1, "maxPriorityFeeLamports": 200000 },
   "sell": { "maxSlippageBps": 1000 },
   "filters": {
@@ -258,6 +259,8 @@ Unknown keys are refused at every level, so a typo fails at start instead of bei
 | `payer` | `embedded` (Candle signs; API key only) or `linked` (TEE wallet, local key signer; default) |
 | `wallet` | the wallet that pays: the key's embedded wallet, or the TEE wallet |
 | `linkedWalletId`, `privyWalletId`, `privyAppId` | optional pins; Candle supplies all three, and a pin that disagrees stops the bot |
+| `loopMs` | the full cycle: settling, queued orders, alerts, status.json (default 2000 ms). New launches do not wait for it |
+| `exitMs` | the exit tick: the open coins' markets in one read, then the exit strategy and sells (default 500 ms, 200 ms to `loopMs`; about 2 RPC reads a second while positions are open, none without) |
 | `buy.sol` | SOL per ticket |
 | `buy.maxSlippageBps` | slippage tolerance on buys |
 | `buy.maxOpen` | most positions open at once (open, opening, or stuck) |
