@@ -6,8 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BruceJeet/candle-bots.git",
-    "directory": "packages/launch-bot"
+    "url": "git+https://github.com/BruceJeet/candle-launch-bot.git"
   },
   "homepage": "https://github.com/BruceJeet/candle-launch-bot#readme",
   "bugs": {

@@ -4,11 +4,6 @@
   "description": "The shared core of Candle trading bots: ledger, order executor, exit strategies, controls and the engine loop. A bot adds a trigger and a config section.",
   "type": "module",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/BruceJeet/candle-bots.git",
-    "directory": "packages/core"
-  },
   "engines": {
     "node": ">=22.18"
   },
@@ -30,7 +25,13 @@
     "@types/node": "26.6.6",
     "typescript": "7.0.2"
   },
-  "keywords": ["candle", "solana", "trading-bot", "bot", "agent"],
+  "keywords": [
+    "candle",
+    "solana",
+    "trading-bot",
+    "bot",
+    "agent"
+  ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

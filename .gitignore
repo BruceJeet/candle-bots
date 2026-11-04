@@ -6,3 +6,4 @@ state-*/
 *.sqlite-*
 .env
 *.tgz
+packs/

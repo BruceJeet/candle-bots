@@ -68,14 +68,18 @@ The package also ships an agent skill, `skills/candle-launch-bot/SKILL.md`, that
 
 ### 1. Install
 
-`npx candle-launch-bot ...` needs nothing else. To keep a copy: `npm install -g candle-launch-bot`. From source:
+`npx candle-launch-bot ...` needs nothing else. To keep a copy: `npm install -g candle-launch-bot`. From source, at the root of a
+candle-bots checkout:
 
 ```sh
-git clone https://github.com/BruceJeet/candle-launch-bot && cd candle-launch-bot
-npm ci
+npm ci && npm run build
+node packages/launch-bot/bin/candle-launch-bot --help
 ```
 
-A source checkout runs the TypeScript in `src/` directly (Node strips the types); the package runs the compiled `dist/`.
+The bot lives in the candle-bots repo as `packages/launch-bot`, on the shared core
+[candle-bot-core](https://www.npmjs.com/package/candle-bot-core) (ledger, executor, exits, controls). The installed package runs the compiled
+`dist/`; in a checkout, `NODE_OPTIONS=--conditions=source` runs the TypeScript of both packages directly (Node strips
+the types) without a build.
 
 ### 2. Candle API key
 
@@ -377,7 +381,10 @@ has not moved after a while). Types for TypeScript authors: `import type { ExitS
 
 ## Development
 
-`npm run typecheck` checks types and `npm run build` compiles `dist/` (run on `npm pack`).
+From the repo root: `npm run typecheck` checks every package and `npm run build` compiles the core and this bot
+(`dist/`, also run on `npm pack`). The engine loop, orders and exits are candle-bot-core's; this package is the launch
+trigger (`src/engine.ts`: detector, filters, Candle market gate), its config sections (`filters`, `detect`), `init`
+and `scan`.
 
 ## License
 
