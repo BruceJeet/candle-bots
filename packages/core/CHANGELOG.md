@@ -34,7 +34,8 @@ Speed, with the money rules unchanged. A 0.1.0 trigger works as is.
   reused for at most `exitMs`; the expected-fill bound uses one at most `exitMs` old and not failed, else reads again,
   and checks that age again under the lock (a booking that queued for the lock reads again).
 - **Trigger calls that never return.** One still running `HUNG_DROP_TIMEOUTS` (3) timeouts after it timed out is given
-  up on: a decide's candidate is dropped (`candidate_dropped`), a poll is called again (`poll_abandoned`).
+  up on: a decide's candidate is dropped (`candidate_dropped`), a poll is called again (`poll_abandoned`). The abandoned call may still be running, so a trigger's `poll` and
+  `decide` must tolerate a second call starting while an earlier one has not returned (a late result is ignored).
 - **Callers of `engine.cycle()`** (bots that drive the engine themselves, and tests) keep the 0.1.0 shape, entries and
   exits in one locked cycle, with two changes: an entries step decides for at most 1 s (`LANE_BUDGET_MS`; the next
   step resumes where it stopped, round robin), and wakes are not served (only `run()` serves them). `engine.lane()`
