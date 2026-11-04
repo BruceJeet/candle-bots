@@ -159,7 +159,9 @@ export class Engine {
   private lastWakeAt = 0;
   private wakeWaiter: (() => void) | null = null;
   /** Cycles and lanes never run at the same time (one engine, one worker). */
-  private work: Promise<unknown> = Promise.resolve();
+  private lockBusy = false;
+  private lockExits: Array<() => void> = [];
+  private lockNormal: Array<() => void> = [];
   /** The engine's own curve reads in this entries step, by account (a trigger's ctx.readCurve and expectedOut share it). */
   private curveCache = new Map<string, { at: number; read: Promise<CurveRead> }>();
   /** Drop curve reads too old to be reused by anyone. */
@@ -269,10 +271,17 @@ export class Engine {
    * The money lock: fn runs when no other holder runs. Held by full cycles, exit ticks and each booking (the cap check,
    * the booking transaction and that order's build and submit). Never held by a trigger call (poll, decide).
    */
-  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.work.then(fn, fn);
-    this.work = run.catch(() => undefined);
-    return run;
+  private async exclusive<T>(fn: () => Promise<T>, prio: "exits" | "normal" = "normal"): Promise<T> {
+    if (this.lockBusy) await new Promise<void>((r) => (prio === "exits" ? this.lockExits : this.lockNormal).push(r));
+    else this.lockBusy = true;
+    try {
+      return await fn();
+    } finally {
+      // Exit ticks first: a waiting exit tick runs next, ahead of bookings and cycle steps queued before it.
+      const next = this.lockExits.shift() ?? this.lockNormal.shift();
+      if (next) next();
+      else this.lockBusy = false;
+    }
   }
 
   /**
@@ -322,7 +331,7 @@ export class Engine {
     const k = Math.max(1, Math.min(16, Math.floor(Number(this.d.trigger.concurrency ?? 1)) || 1));
     const exitsLoop = (async () => {
       while (!this.shouldStop()) {
-        await this.exclusive(() => this.exitTick());
+        await this.exclusive(() => this.exitTick(), "exits");
         await this.sleepUnlessStopped(exitMs);
       }
     })();
