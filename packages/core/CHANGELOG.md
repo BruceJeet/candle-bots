@@ -15,13 +15,26 @@ Speed, with the money rules unchanged. A 0.1.0 trigger works as is.
     asked again after `loopMs`. A buy verdict takes the lock: STOP, the caps again, the booking transaction (the caps
     checked once more inside it), then that order's build and submit. A verdict that comes back after STOP books
     nothing.
-- **Stop-loss bound.** A crossing is acted on by the next exit tick: at most `exitMs`, plus the wait for the money lock,
-  plus the tick's market read, plus the sell's build. The lock is held by one thing at a time: an exit tick, one full
-  cycle step (one order attempt in the orders sweep), or one booking with its build and submit. Never by a trigger
-  call. So the wait is at most one order attempt, whose Candle calls are each bounded by the SDK timeout (45 s) and
-  RPC reads by 15 s. A hung Candle build in a sweep, or a slow sell build itself, is the case still left.
+- **Stop-loss timing.** A crossing is acted on by the next exit tick: at most `exitMs` later, the tick starts as soon
+  as it gets the money lock (it goes first among the waiters). Before its sell is built, these can come first:
+  - **the current lock holder**: a booking's whole buy attempt (build, sign, submit), one settle or orders attempt, or
+    the sell-requests step (every manual request file, each with a `tokenBalance` read, and for a failed buy the
+    `reopenFailedBuy` history scan);
+  - **the tick's own leading sell sweep**: up to 5 sell attempts already due, before its market read and exits pass;
+  - **the market read** (one batched `getMultipleAccounts`);
+  - **with k positions crossing at once**: k `tokenBalance` reads one after another (each up to the 15 s RPC timeout)
+    and the sells ahead of the last one.
+
+  One attempt can chain several Candle calls (each up to the 45 s SDK timeout) and, for an uncertain buy, paged
+  `getSignaturesForAddress` reads, so **there is no fixed ceiling in seconds under a Candle or RPC outage**. Typical:
+  under 0.6 s with every decide hung (`exitMs` 500). With a slow buy build holding the lock, the stop-loss waits for
+  that build: 6 s buy builds gave stop-losses up to about 6 s. A trigger call never holds the lock, so a slow or hung
+  decide never delays an exit. Making a sell independent of a slow buy build is executor work for a later release.
 - **One curve read per buy.** `ctx.readCurve(mint, address?)` (new) reads a Candle curve through the engine. A read is
-  reused for at most `exitMs`; the expected-fill bound uses one at most `exitMs` old and not failed, else reads again.
+  reused for at most `exitMs`; the expected-fill bound uses one at most `exitMs` old and not failed, else reads again,
+  and checks that age again under the lock (a booking that queued for the lock reads again).
+- **Trigger calls that never return.** One still running `HUNG_DROP_TIMEOUTS` (3) timeouts after it timed out is given
+  up on: a decide's candidate is dropped (`candidate_dropped`), a poll is called again (`poll_abandoned`).
 - **Callers of `engine.cycle()`** (bots that drive the engine themselves, and tests) keep the 0.1.0 shape, entries and
   exits in one locked cycle, with two changes: an entries step decides for at most 1 s (`LANE_BUDGET_MS`; the next
   step resumes where it stopped, round robin), and wakes are not served (only `run()` serves them). `engine.lane()`

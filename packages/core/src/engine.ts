@@ -54,6 +54,9 @@ export const WAKE_DEBOUNCE_MAX_MS = 50;
 /** Surplus balance reads in flight at once. */
 export const SURPLUS_READS = 8;
 
+/** A trigger call still running this many timeouts after it timed out is given up on (its candidate dropped). */
+export const HUNG_DROP_TIMEOUTS = 3;
+
 /** Default limit on one trigger call. */
 export const TRIGGER_TIMEOUT_MS = 10_000;
 
@@ -169,6 +172,39 @@ export class Engine {
     const keep = this.d.cfg.exitMs * 10;
     for (const [k, v] of this.curveCache) if (this.now() - v.at > keep) this.curveCache.delete(k);
   }
+  /** When each hung trigger call timed out (see expireHung). */
+  private hungSince = new Map<string, number>();
+
+  /** A candidate leaves the pending set: its re-ask time goes with it. */
+  private forget(mint: string): void {
+    this.pending.delete(mint);
+    this.nextAsk.delete(mint);
+  }
+
+  /**
+   * A trigger call still unsettled HUNG_DROP_TIMEOUTS timeouts after it timed out is given up on: a decide's candidate
+   * is dropped (logged candidate_dropped), a poll is called again (logged poll_abandoned). Without this a call that
+   * never returns would keep its candidate pending, and in status, forever.
+   */
+  private expireHung(): void {
+    const limit = HUNG_DROP_TIMEOUTS * (this.d.triggerTimeoutMs ?? TRIGGER_TIMEOUT_MS);
+    for (const [key, at] of [...this.hungSince]) {
+      if (this.now() - at < limit) continue;
+      this.hung.delete(key);
+      this.hungSince.delete(key);
+      if (key === "poll") {
+        this.d.log.warn("poll_abandoned", { why: "the trigger's poll never returned" });
+        continue;
+      }
+      const mint = key.slice("decide:".length);
+      if (this.pending.has(mint)) {
+        this.forget(mint);
+        this.stats.skips++;
+        this.d.log.warn("candidate_dropped", { mint, why: `decide never returned (${HUNG_DROP_TIMEOUTS} timeouts)` });
+      }
+    }
+  }
+
   /** Where the next entries step starts when the last one stopped on its budget (round robin; null: the head). */
   private resumeAt: string | null = null;
   /** Consecutive exit-strategy errors per position. */
@@ -483,6 +519,7 @@ export class Engine {
   /** Poll the trigger (outside the lock) and add its candidates to the pending set. */
   private async pollOnce(): Promise<void> {
     const t = this.d.trigger;
+    this.expireHung();
     if (this.hung.has("poll")) return;
     const got = await this.bounded("poll", this.now(), () => t.poll(this.ctx));
     for (const raw of Array.isArray(got) ? got : []) {
@@ -512,6 +549,7 @@ export class Engine {
 
   /** Start decides for due pending candidates, up to k in flight (each runs outside the lock). */
   private startDecides(k: number, reaskMs: number): void {
+    this.expireHung();
     for (const [mint, p] of this.pending) {
       if (this.inflight.size >= k || this.shouldStop()) return;
       if (this.inflight.has(mint) || this.hung.has(`decide:${mint}`)) continue;
@@ -534,8 +572,11 @@ export class Engine {
       let v = this.checked(await this.bounded(`decide:${mint}`, this.now(), () => t.decide(p.candidate, this.ctx, info())), p.candidate);
       if (this.pending.get(mint) !== p || this.shouldStop()) return;
       if (v.verdict === "buy") v = this.capCheck(mint, v);
+      const triggerExpected = v.verdict === "buy" ? v.expectedOutRaw : null;
+      let expectedAt = 0;
       if (v.verdict === "buy") {
         const expected = await this.expectedOut(mint, v.lamports, v.expectedOutRaw);
+        expectedAt = this.now();
         if (this.pending.get(mint) !== p || this.shouldStop()) return;
         v = Object.freeze({ ...v, expectedOutRaw: expected });
       }
@@ -547,7 +588,7 @@ export class Engine {
         return;
       }
       if (v.verdict === "skip") {
-        this.pending.delete(mint);
+        this.forget(mint);
         if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(v), this.ctx, info()));
         else this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: v.reason });
         this.stats.skips++;
@@ -557,8 +598,15 @@ export class Engine {
       await this.exclusive(async () => {
         // Under the lock: nothing books after STOP; the caps as they stand now (another booking may have run).
         if (this.shouldStop() || this.pending.get(mint) !== p) return;
-        const final = this.capCheck(mint, buyV);
-        this.pending.delete(mint);
+        // The fill bound's read must be at most exitMs old at booking: a booking that queued for the lock reads again.
+        let toBook: Buy | Decided = buyV;
+        if (buyV.verdict === "buy" && this.now() - expectedAt > this.d.cfg.exitMs) {
+          const again = await this.expectedOut(mint, buyV.lamports, triggerExpected);
+          if (this.shouldStop() || this.pending.get(mint) !== p) return;
+          toBook = Object.freeze({ ...buyV, expectedOutRaw: again });
+        }
+        const final = this.capCheck(mint, toBook as Buy);
+        this.forget(mint);
         if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(final), this.ctx, info()));
         else if (final.verdict === "skip") this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: final.reason });
         if (final.verdict !== "buy") {
@@ -571,7 +619,7 @@ export class Engine {
     } catch (e) {
       // A throw or a timeout: logged as a failed entries step; the candidate stays pending and is asked again later.
       this.d.log.error("cycle_step_failed", { step: "entries", mint, error: String((e as Error)?.stack ?? e) });
-      this.nextAsk.set(mint, this.now() + reaskMs);
+      if (this.pending.get(mint) === p) this.nextAsk.set(mint, this.now() + reaskMs);
     }
   }
 
@@ -829,7 +877,12 @@ export class Engine {
     } catch (e) {
       if (/gave no answer/.test(String((e as Error)?.message))) {
         this.hung.add(key);
-        p.then(() => this.hung.delete(key), () => this.hung.delete(key));
+        this.hungSince.set(key, this.now());
+        const settle = () => {
+          this.hung.delete(key);
+          this.hungSince.delete(key);
+        };
+        p.then(settle, settle);
       }
       throw e;
     } finally {
@@ -872,6 +925,7 @@ export class Engine {
   private async entries(t0: number = this.now()): Promise<boolean> {
     const t = this.d.trigger;
     this.pruneCurves();
+    this.expireHung();
     if (!this.hung.has("poll")) {
       const got = await this.bounded("poll", t0, () => t.poll(this.ctx));
       for (const raw of Array.isArray(got) ? got : []) {
@@ -927,7 +981,7 @@ export class Engine {
         p.lastReason = v.reason;
         continue;
       }
-      this.pending.delete(mint);
+      this.forget(mint);
       if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(v), this.ctx, info()));
       else if (v.verdict === "skip") this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: v.reason });
       if (v.verdict === "skip") {

@@ -36,8 +36,11 @@ open coins' markets in one call and runs the exit strategy and sells. A **full c
 requests, settling, queued orders, alerts and status. **Entries** run as soon as the trigger's source calls
 `ctx.wake()` (or every `loopMs`): candidates are decided outside the money lock, `trigger.concurrency` at a time, so a
 slow or hung decide never delays an exit. Each buy takes the lock to re-check the caps, book (one ledger transaction,
-caps checked inside it) and build and submit. A stop-loss is acted on within `exitMs`, plus at most one order attempt
-holding the lock, plus a market read and the sell's build. A trigger without `wake` still works: it is polled every
+caps checked inside it) and build and submit. A stop-loss is acted on by the next exit tick (at most `exitMs` later, and the tick goes first on the lock), after
+whatever holds the lock then (one buy attempt, one settle or orders attempt, or the sell-requests step), the tick's own
+leading sweep of up to 5 due sells, its market read, and one balance read per position crossing at once. Typically
+well under a second; under a Candle or RPC outage there is no fixed ceiling, because one attempt chains several calls,
+each bounded by its own timeout. See the CHANGELOG. A trigger without `wake` still works: it is polled every
 `loopMs`.
 
 ## The trigger interface
