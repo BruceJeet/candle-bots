@@ -6,11 +6,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BruceJeet/candle-launch-bot.git"
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/launch-bot"
   },
-  "homepage": "https://github.com/BruceJeet/candle-launch-bot#readme",
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/launch-bot#readme",
   "bugs": {
-    "url": "https://github.com/BruceJeet/candle-launch-bot/issues"
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
   },
   "bin": {
     "candle-launch-bot": "bin/candle-launch-bot"
