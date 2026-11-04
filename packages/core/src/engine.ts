@@ -38,6 +38,9 @@ export interface EngineDeps {
   triggerTimeoutMs?: number;
 }
 
+/** Consecutive exit-strategy errors on one position before it is alerted. */
+export const STRATEGY_ERROR_ALERT = 3;
+
 /** Default limit on one trigger call. */
 export const TRIGGER_TIMEOUT_MS = 10_000;
 
@@ -130,6 +133,8 @@ export class Engine {
   /** What every trigger call gets. */
   readonly ctx: TriggerContext;
 
+  /** Consecutive exit-strategy errors per position. */
+  private strategyErrors = new Map<number, number>();
   /** Trigger calls that timed out and have not ended yet: no new call while one is still running. */
   private hung = new Set<string>();
 
@@ -440,13 +445,13 @@ export class Engine {
         v = this.capCheck(mint, Object.freeze({ ...v, expectedOutRaw: expected }));
       }
       if (v.verdict === "wait") {
-        if (t.onVerdict) t.onVerdict(p.candidate, publicVerdict(v), this.ctx, info());
+        if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(v), this.ctx, info()));
         else if (v.reason !== p.lastReason) this.d.log.info("candidate_wait", { mint, source: p.candidate.source, reason: v.reason });
         p.lastReason = v.reason;
         continue;
       }
       this.pending.delete(mint);
-      if (t.onVerdict) t.onVerdict(p.candidate, publicVerdict(v), this.ctx, info());
+      if (t.onVerdict) this.hook("onVerdict", () => t.onVerdict!(p.candidate, publicVerdict(v), this.ctx, info()));
       else if (v.verdict === "skip") this.d.log.info("candidate_skip", { mint, source: p.candidate.source, reason: v.reason });
       if (v.verdict === "skip") {
         this.stats.skips++;
@@ -454,7 +459,23 @@ export class Engine {
       }
       this.buy(p.candidate, v);
     }
-    t.afterEntries?.(this.ctx);
+    if (t.afterEntries) this.hook("afterEntries", () => t.afterEntries!(this.ctx));
+  }
+
+  /**
+   * A trigger hook the engine does not wait for (onVerdict, afterEntries). A synchronous throw propagates as before
+   * (it ends the entries step). An async hook that rejects is logged and alerted, never left unhandled (Node would
+   * end the process on it).
+   */
+  private hook(name: string, fn: () => unknown): void {
+    const r = fn() as { then?: unknown } | undefined;
+    if (r && typeof r.then === "function") {
+      Promise.resolve(r).catch((e) => {
+        const why = String((e as Error)?.message ?? e).slice(0, 200);
+        this.d.log.error("trigger_hook_failed", { hook: name, error: why });
+        this.d.alerter.raise(`trigger:${name}:rejected`, `trigger ${this.d.trigger.name}: ${name} failed (${why})`);
+      });
+    }
   }
 
   /**
@@ -470,7 +491,13 @@ export class Engine {
     } catch {
       mine = null;
     }
-    if (mine === null) return null;
+    // No curve read: keep the trigger's value rather than none. With none, an uncertain buy whose transaction is not
+    // found could adopt nothing and `sell` could not reach its tokens (0.1.3 always had a cap). The adoption still
+    // counts only tokens received for SOL since the order, inside its attempt windows. Logged.
+    if (mine === null) {
+      if (fromTrigger !== null) this.d.log.warn("expected_fill_unverified", { mint, expectedOutRaw: fromTrigger, why: "curve not readable at the buy" });
+      return fromTrigger;
+    }
     return fromTrigger !== null && fromTrigger < mine ? fromTrigger : mine;
   }
 
@@ -555,8 +582,14 @@ export class Engine {
       let decision;
       try {
         decision = this.d.strategy.onTick(this.view(p, m), m);
+        this.strategyErrors.delete(p.id);
       } catch (e) {
-        this.d.log.error("strategy_error", { position: p.id, error: String((e as Error)?.message ?? e) });
+        const why = String((e as Error)?.message ?? e);
+        this.d.log.error("strategy_error", { position: p.id, error: why });
+        // Repeated: this position may never exit by itself. Alerted (renotified while it lasts).
+        const n = (this.strategyErrors.get(p.id) ?? 0) + 1;
+        this.strategyErrors.set(p.id, n);
+        if (n >= STRATEGY_ERROR_ALERT) this.d.alerter.raise(`position:${p.id}:strategy_error`, `position ${p.id} ${p.mint}: the exit strategy ${this.d.strategy.name} failed ${n} times in a row (${why.slice(0, 160)}); this position does not exit until it is fixed, or run \`sell\` by hand`);
         continue;
       }
       if (decision.action !== "sell") continue;

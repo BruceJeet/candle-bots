@@ -46,8 +46,8 @@ export interface BuyVerdict {
   deadlineAtMs?: number | null;
   /**
    * Tokens the trigger expects for the ticket (raw), for the cap on adopting tokens of an uncertain buy. The engine
-   * reads the Candle curve itself at the buy and keeps the smaller of the two; with no readable curve the order has
-   * no expected fill (nothing is adopted). Candle's build replaces it once one answers.
+   * reads the Candle curve itself at the buy and keeps the smaller of the two; with no readable curve it keeps the
+   * trigger's value (logged expected_fill_unverified). Candle's build replaces it once one answers.
    */
   expectedOutRaw?: bigint | null;
   /** The coin's decimals when known (default 6). */
@@ -133,7 +133,7 @@ export interface Trigger {
   decide(c: Candidate, ctx: TriggerContext, pending: PendingInfo): Promise<Verdict> | Verdict;
   /**
    * Every verdict, after the engine's own cap check (so a buy the caps refuse arrives here as a skip). Called before
-   * the buy order is placed. Optional: without it the engine logs candidate_wait / candidate_skip itself.
+   * the buy order is placed and not awaited: an async hook that rejects is logged (trigger_hook_failed) and alerted. Optional: without it the engine logs candidate_wait / candidate_skip itself.
    */
   onVerdict?(c: Candidate, v: Verdict, ctx: TriggerContext, pending: PendingInfo): void;
   /** After each entries step (bookkeeping that is not about one candidate). */

@@ -23,7 +23,9 @@ export async function loadStrategy(exit: { strategy: string; [k: string]: unknow
   }
   const mod = (await import(pathToFileURL(file).href)) as { create?: StrategyFactory };
   if (typeof mod.create !== "function") throw new StrategyConfigError(`exit strategy ${file} exports no create(params)`);
-  const s = mod.create(params);
+  // The strategy gets its own copy of its params: the config is frozen, and a strategy that keeps state in them must
+  // not throw on every tick.
+  const s = mod.create(structuredClone(params));
   if (!s || typeof s.onTick !== "function") throw new StrategyConfigError(`exit strategy ${file}: create() returned no onTick`);
   return s;
 }

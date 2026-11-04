@@ -83,7 +83,8 @@ The engine never trusts the trigger's objects:
   and `onVerdict` (which gets a copy) all work from that copy, so changing the trigger's object afterwards changes
   nothing;
 - the expected fill of a buy (the cap on adopting tokens of an uncertain buy) is the smaller of the trigger's and the
-  engine's own read of the Candle curve; with no readable curve there is none, and nothing is adopted;
+  engine's own read of the Candle curve; with no readable curve, the trigger's (logged `expected_fill_unverified`);
+- `onVerdict` and `afterEntries` are not awaited; one that returns a promise that rejects is logged and alerted;
 - `ctx.rpc`, `ctx.log` and `ctx.alerter` are frozen wrappers: a trigger cannot replace what the engine and the
   executor use; after the engine's curve read, the caps are checked once more (PAUSE_BUYS may have arrived);
 - each `poll` and `decide` call has a time limit (`triggerTimeoutMs`, default 10 s, within the cycle budget left but
@@ -91,6 +92,7 @@ The engine never trusts the trigger's objects:
   that throws or does not answer costs that cycle's entries step (logged `cycle_step_failed`); the candidate stays
   pending and is not asked again until the hung call ends; exits, sells and STOP run as usual.
 
+The trigger boundary protects against buggy triggers, not against malicious code in the same process.
 These guards hold against mistakes and against ordinary trigger code doing odd things through what it is handed. They
 are not a sandbox: code running in the same process can still import `fs`, open the ledger file or read the keys
 store, so run only bot code you trust with your wallet.
@@ -180,7 +182,9 @@ export function create(params) {
 `mint, openedAtMs, qtyRaw, remainingRaw, decimals, entryPriceSol, peakPriceSol, soldFraction`. `market`: `priceSol`
 (null if unreadable), `progress` (0..1), `migrated`, `venue` (`curve` / `damm`), `nowMs`. Return `{ action: "hold" }`
 or `{ action: "sell", fraction, reason }`, `fraction` a share of what remains. Types: `ExitStrategy`, `PositionView`,
-`MarketView`, `Decision`.
+`MarketView`, `Decision`. A strategy gets its own copy of its params (it may keep state in them). A strategy that
+throws on a position three ticks in a row raises an alert (`position:<id>:strategy_error`): that position does not
+exit by itself until it is fixed.
 
 ## How money is handled
 
