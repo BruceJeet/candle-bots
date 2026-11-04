@@ -1,0 +1,9 @@
+{
+  "mode": "dry",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "wallet": "<your Solana wallet address>",
+  "stateDir": "./state-dry",
+  "buy": { "sol": 0.01, "maxSlippageBps": 500, "maxOpen": 2, "lifetimeSol": 0.05 },
+  "manual": { "maxImpactBps": 300, "maxWaitSec": 60 },
+  "exit": { "strategy": "ladder", "rungs": [{ "at": 2, "sell": 0.5 }], "stopLoss": 0.5 }
+}

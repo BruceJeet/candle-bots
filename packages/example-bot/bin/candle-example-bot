@@ -1,0 +1,4 @@
+#!/usr/bin/env node
+// A source checkout: run with `node --conditions=source` (or build candle-bot-core first).
+const { main } = await import(new URL("../src/bot.ts", import.meta.url).href);
+process.exit(await main(process.argv.slice(2)));
