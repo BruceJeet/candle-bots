@@ -147,9 +147,10 @@ export async function run<L extends Ledger>(ctx: Ctx, openLedger: () => L, make:
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
   ctx.log.info("start", { mode: ctx.cfg.mode, payer: ctx.cfg.payer, wallet: ctx.cfg.wallet, strategy: ctx.cfg.exit.strategy, stateDir: ctx.cfg.stateDir, ticketSol: ctx.cfg.buy.sol, maxOpen: ctx.cfg.buy.maxOpen, lifetimeSol: ctx.cfg.buy.lifetimeSol, ...startFields });
-  await trigger.start?.();
+  await trigger.start?.(engine.ctx);
   try {
-    while (await engine.cycle()) await new Promise((r) => setTimeout(r, ctx.cfg.loopMs));
+    // Full cycles every loopMs, fast entry lanes on a wake in between (Engine.run).
+    await engine.run(ctx.cfg.loopMs);
   } finally {
     trigger.stop?.();
     engine.writeStatus();

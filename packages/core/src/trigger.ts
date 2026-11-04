@@ -13,6 +13,7 @@
 import type { Alerter } from "./alerts.ts";
 import type { Config } from "./config.ts";
 import type { OrderRow, PositionRow, PositionStatus } from "./ledger.ts";
+import type { CandleCurve } from "./market/curve.ts";
 import type { Logger } from "./log.ts";
 import type { Rpc } from "./solana/rpc.ts";
 
@@ -96,6 +97,16 @@ export interface LedgerView {
 }
 
 /**
+ * The engine's read of a Candle curve account (ctx.readCurve): `ok` with the decoded, frozen curve; `missing` (no such
+ * account yet); `failed` (the RPC call failed); `invalid` (an account that is not a Candle curve: wrong owner, layout).
+ */
+export type CurveRead =
+  | { readonly status: "ok"; readonly address: string; readonly curve: Readonly<CandleCurve> }
+  | { readonly status: "missing" }
+  | { readonly status: "failed"; readonly error: string }
+  | { readonly status: "invalid"; readonly error: string };
+
+/**
  * Handed to every trigger call. Frozen; `cfg` is deep-frozen; `rpc`, `log` and `alerter` are frozen wrappers around the
  * engine's own (a trigger cannot replace what the engine and the executor use). `alerter` offers `raise` and `sent`.
  */
@@ -111,6 +122,16 @@ export interface TriggerContext {
   caps(mint: string): EntryCaps;
   /** STOP or a signal was seen: return soon. */
   shouldStop(): boolean;
+  /**
+   * (0.2.0) Read the mint's Candle curve (or the account at `address`) through the engine: one RPC call per account per
+   * entries step, shared with the engine's own expected-fill check, so a buy costs one curve read.
+   */
+  readCurve(mint: string, address?: string): Promise<CurveRead>;
+  /**
+   * (0.2.0) The trigger's source has something new: the run loop runs a fast entry lane now instead of at the next
+   * cycle. Debounced; cheap to call often; a no-op after STOP.
+   */
+  wake(): void;
 }
 
 export interface Trigger {
@@ -121,8 +142,11 @@ export interface Trigger {
   readonly buyIdPrefix?: string;
   /** Prefix of sell order ids, default "bots". */
   readonly sellIdPrefix?: string;
-  /** Start any sources (sockets, timers). The engine never calls it; the runner does, before the first cycle. */
-  start?(): Promise<void>;
+  /**
+   * Start any sources (sockets, timers). The engine never calls it; the runner does, before the first cycle, with the
+   * engine's context (0.2.0: keep it to call ctx.wake() from the source; a 0.1.0 trigger ignores it).
+   */
+  start?(ctx: TriggerContext): Promise<void>;
   stop?(): void;
   /** Candidates new since the last call (same timeout rule as decide). One already pending is replaced (its wait state starts over). */
   poll(ctx: TriggerContext): Candidate[] | Promise<Candidate[]>;

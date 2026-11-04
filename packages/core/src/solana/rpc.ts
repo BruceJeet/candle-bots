@@ -44,13 +44,15 @@ export function httpRpc(url: string, opts: { timeoutMs?: number; fetch?: typeof 
 }
 
 export async function getAccounts(rpc: Rpc, keys: string[]): Promise<Array<AccountValue | null>> {
-  const out: Array<AccountValue | null> = [];
-  for (let i = 0; i < keys.length; i += 100) {
-    const r = await rpc.call<{ value: Array<AccountValue | null> }>("getMultipleAccounts", [keys.slice(i, i + 100), { encoding: "base64", commitment: "confirmed" }]);
-    if (!r || !Array.isArray(r.value) || r.value.length !== Math.min(100, keys.length - i)) throw new RpcError("getMultipleAccounts: bad response length", "BAD_RESPONSE");
-    out.push(...r.value);
-  }
-  return out;
+  // Chunks of 100 keys (the RPC's limit), sent together; any failed or short chunk fails the whole read.
+  const chunks: string[][] = [];
+  for (let i = 0; i < keys.length; i += 100) chunks.push(keys.slice(i, i + 100));
+  const got = await Promise.all(chunks.map(async (part) => {
+    const r = await rpc.call<{ value: Array<AccountValue | null> }>("getMultipleAccounts", [part, { encoding: "base64", commitment: "confirmed" }]);
+    if (!r || !Array.isArray(r.value) || r.value.length !== part.length) throw new RpcError("getMultipleAccounts: bad response length", "BAD_RESPONSE");
+    return r.value;
+  }));
+  return got.flat();
 }
 
 export async function getTransaction(rpc: Rpc, signature: string): Promise<any | null> {

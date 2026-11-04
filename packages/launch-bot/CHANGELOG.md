@@ -1,5 +1,14 @@
 # Changelog: candle-launch-bot
 
+## 0.3.0
+
+- On candle-bot-core 0.2.0 (pinned exactly): a launch the detector sees wakes the engine, so it is decided and its buy
+  built at once instead of at the next cycle (about 0.1 s instead of up to `loopMs`, 2 s by default); the curve is read
+  once per buy (through the core's `ctx.readCurve`, shared with its expected-fill check).
+- Bursts: buys are built one after another in lanes instead of five per cycle.
+- Same CLI, config, state dir, ledger, `status.json` fields and events; money outcomes unchanged. Events can come
+  earlier and in a different order relative to the exit steps' events.
+
 ## 0.2.0
 
 - Runs on [candle-bot-core](https://www.npmjs.com/package/candle-bot-core) 0.1.0 (pinned exactly): the ledger, executor, exit

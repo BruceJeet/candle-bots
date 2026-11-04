@@ -31,6 +31,15 @@ each cycle (the engine):
 A bot writes the two middle lines. It never places an order, books a fill or touches a position: a buy verdict is a
 request the engine may still refuse.
 
+**Timing (0.2.0).** A full cycle runs `loopMs` after the last one ended. Between full cycles the engine sleeps until a
+wake: when the trigger's source sees something new it calls `ctx.wake()`, and a **fast entry lane** runs at once
+(debounced: a burst gives one lane). A lane decides the pending candidates and builds and submits each buy as soon as
+it is booked, then builds queued buy orders, for at most `LANE_BUDGET_MS` (1 s) plus the buy in flight. It does no
+exit work. A full cycle that is due always runs before another lane, and every entries step (a lane's or a full
+cycle's) is bounded the same way, so a stop-loss waits at most `loopMs` + one entries step + one lane. Lanes and
+cycles never overlap, and the caps are checked again inside the ledger transaction that books each buy. A trigger
+without `wake` still works: its candidates are decided in the next full cycle, as in 0.1.0.
+
 ## The trigger interface
 
 ```ts
@@ -60,7 +69,7 @@ interface Trigger {
   readonly candidateLabel?: string;   // status.json stats key, default "candidates"
   readonly buyIdPrefix?: string;      // clientTradeId prefixes, default "bot" / "bots"
   readonly sellIdPrefix?: string;
-  start?(): Promise<void>;            // sources (sockets, timers); run() calls it before the first cycle
+  start?(ctx: TriggerContext): Promise<void>;   // sources; run() calls it before the first cycle (keep ctx for ctx.wake())
   stop?(): void;
   poll(ctx: TriggerContext): Candidate[] | Promise<Candidate[]>;
   decide(c: Candidate, ctx: TriggerContext, pending: PendingInfo): Verdict | Promise<Verdict>;
@@ -70,7 +79,7 @@ interface Trigger {
 }
 ```
 
-`TriggerContext` gives the config (deep-frozen), a read-only view of the ledger (this run's mode only), the RPC, the
+`TriggerContext` (0.2.0 adds `readCurve(mint, address?)` and `wake()`) gives the config (deep-frozen), a read-only view of the ledger (this run's mode only), the RPC, the
 logger, the alerter, `dry`, `now()`, `caps(mint)` and `shouldStop()`; the context itself is frozen. `PendingInfo` is when
 the candidate joined and its last wait reason.
 
@@ -82,6 +91,9 @@ The engine never trusts the trigger's objects:
   well-typed `"buy"` (non-empty `reason`, bigint `lamports`, ...) counts, anything else is a skip; the caps, the order
   and `onVerdict` (which gets a copy) all work from that copy, so changing the trigger's object afterwards changes
   nothing;
+- `ctx.readCurve(mint)` reads the Candle curve through the engine, once per account per entries step, and returns a
+  frozen `CurveRead` (`ok` with the curve, `missing`, `failed`, `invalid`); a trigger that uses it makes a buy cost one
+  curve read, because the engine's own expected-fill check reuses that read;
 - the expected fill of a buy (the cap on adopting tokens of an uncertain buy) is the smaller of the trigger's and the
   engine's own read of the Candle curve; with no readable curve, the trigger's (logged `expected_fill_unverified`);
 - `onVerdict` and `afterEntries` are not awaited; one that returns a promise that rejects is logged and alerted;

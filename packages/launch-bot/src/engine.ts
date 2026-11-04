@@ -7,7 +7,7 @@ import { Engine as CoreEngine, lamportsOf } from "candle-bot-core/engine";
 import type { Candidate, PendingInfo, Trigger, TriggerContext, Verdict } from "candle-bot-core/trigger";
 import type { Alerter } from "candle-bot-core/alerts";
 import type { Logger } from "candle-bot-core/log";
-import { decodeCandleCurve, type CandleCurve } from "candle-bot-core/market/curve";
+import type { CandleCurve } from "candle-bot-core/market/curve";
 import { candleCurve } from "candle-bot-core/solana/pda";
 import type { Rpc } from "candle-bot-core/solana/rpc";
 import type { ExitStrategy } from "candle-bot-core/strategies/types";
@@ -91,7 +91,9 @@ export class LaunchTrigger implements Trigger {
     this.now = d.now ?? Date.now;
   }
 
-  async start(): Promise<void> {
+  /** Start the detector; a new launch wakes the engine at once (a fast entry lane) instead of at the next cycle. */
+  async start(ctx?: TriggerContext): Promise<void> {
+    if (ctx?.wake) this.d.detector.onNew = () => ctx.wake();
     await this.d.detector.start();
   }
 
@@ -248,13 +250,11 @@ export class LaunchTrigger implements Trigger {
       v = evaluate(this.d.cfg, l, null, caps, this.now());
     }
     if (v.verdict !== "wait" || v.reason !== "curve not readable yet") return v;
-    let curve: CandleCurve | "unreadable" | null = null;
-    try {
-      const r = await this.d.rpc.call<any>("getAccountInfo", [l.curve ?? candleCurve(l.mint), { encoding: "base64", commitment: "confirmed" }]);
-      curve = r?.value ? decodeCandleCurve(r.value) : null;
-    } catch (e) {
-      curve = /owner|layout/.test(String((e as Error).message)) ? "unreadable" : null;
-    }
+    // The engine reads the curve (one read per buy: its expected-fill check reuses it). Same outcomes as 0.1.3's own
+    // read: no account or a failed call waits, an account that is not a Candle curve (owner, layout) is unreadable.
+    const r = await ctx.readCurve(l.mint, l.curve ?? candleCurve(l.mint));
+    const unreadable = (why: string) => (/owner|layout/.test(why) ? ("unreadable" as const) : null);
+    const curve: CandleCurve | "unreadable" | null = r.status === "ok" ? r.curve : r.status === "missing" ? null : unreadable(r.error);
     return evaluate(this.d.cfg, l, curve, caps, this.now());
   }
 }

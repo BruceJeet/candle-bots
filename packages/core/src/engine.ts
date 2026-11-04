@@ -18,7 +18,7 @@ import { redactDeep } from "./redact.ts";
 import { tokenBalance, type Rpc } from "./solana/rpc.ts";
 import type { ExitStrategy, PositionView } from "./strategies/types.ts";
 import type { Alerter } from "./alerts.ts";
-import type { BuyVerdict, Candidate, EntryCaps, LedgerView, PendingInfo, Trigger, TriggerContext, Verdict } from "./trigger.ts";
+import type { BuyVerdict, Candidate, CurveRead, EntryCaps, LedgerView, PendingInfo, Trigger, TriggerContext, Verdict } from "./trigger.ts";
 import { deepFreeze } from "./config.ts";
 import { asAddress } from "./solana/base58.ts";
 import { buyImpact, decodeCandleCurve } from "./market/curve.ts";
@@ -40,6 +40,20 @@ export interface EngineDeps {
 
 /** Consecutive exit-strategy errors on one position before it is alerted. */
 export const STRATEGY_ERROR_ALERT = 3;
+
+/**
+ * Longest one entries step (a fast lane, or the entries step of a full cycle) keeps deciding before the scheduler
+ * looks at the exits again; what is left goes on in the next lane.
+ */
+export const LANE_BUDGET_MS = 1_000;
+/** Most queued buy orders one lane builds (its time budget usually ends it first). */
+export const LANE_SWEEP_MAX = 50;
+/** A wake waits until no new wake came for this long before its lane runs: a burst gives one lane, not a storm. */
+export const WAKE_DEBOUNCE_MS = 10;
+/** ... but never longer than this after the first wake. */
+export const WAKE_DEBOUNCE_MAX_MS = 50;
+/** Surplus balance reads in flight at once. */
+export const SURPLUS_READS = 8;
 
 /** Default limit on one trigger call. */
 export const TRIGGER_TIMEOUT_MS = 10_000;
@@ -133,6 +147,16 @@ export class Engine {
   /** What every trigger call gets. */
   readonly ctx: TriggerContext;
 
+  /** Fast entry lanes run (see run()). */
+  lanes = 0;
+  /** A wake arrived and its lane has not run yet. */
+  private wakePending = false;
+  private lastWakeAt = 0;
+  private wakeWaiter: (() => void) | null = null;
+  /** Cycles and lanes never run at the same time (one engine, one worker). */
+  private work: Promise<unknown> = Promise.resolve();
+  /** The engine's own curve reads in this entries step, by account (a trigger's ctx.readCurve and expectedOut share it). */
+  private curveCache = new Map<string, Promise<CurveRead>>();
   /** Consecutive exit-strategy errors per position. */
   private strategyErrors = new Map<number, number>();
   /** Trigger calls that timed out and have not ended yet: no new call while one is still running. */
@@ -174,6 +198,8 @@ export class Engine {
       now: () => self.now(),
       caps: (mint: string) => Object.freeze(self.caps(mint)),
       shouldStop: () => self.shouldStop(),
+      readCurve: (mint: string, address?: string) => self.readCurve(mint, address),
+      wake: () => self.wake(),
     });
   }
 
@@ -191,6 +217,9 @@ export class Engine {
 
   requestStop(): void {
     this.stopRequested = true;
+    const w = this.wakeWaiter;
+    this.wakeWaiter = null;
+    w?.();
   }
 
   paused(): boolean {
@@ -211,8 +240,106 @@ export class Engine {
     return this.now() - t0 > CYCLE_BUDGET_MS;
   }
 
+  /** Run fn when no other cycle or lane is running. */
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.work.then(fn, fn);
+    this.work = run.catch(() => undefined);
+    return run;
+  }
+
+  /**
+   * A trigger's source saw something new: run a fast entry lane soon. Wakes are debounced (WAKE_DEBOUNCE_MS) and
+   * coalesced: any number of wakes before the lane starts give one lane.
+   */
+  wake(): void {
+    if (this.stopRequested) return;
+    this.wakePending = true;
+    this.lastWakeAt = Date.now();
+    const w = this.wakeWaiter;
+    this.wakeWaiter = null;
+    w?.();
+  }
+
+  /** Wait up to ms, or until a wake or a stop request. */
+  private idle(ms: number): Promise<void> {
+    if (this.wakePending || this.stopRequested || ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.wakeWaiter = null;
+        resolve();
+      }, ms);
+      this.wakeWaiter = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+  }
+
+  /**
+   * The run loop. A full cycle (exits first, then entries and orders) runs loopMs after the last one ended, as in 0.1.0.
+   * Between full cycles the loop sleeps, and a wake (ctx.wake, from the trigger's source) runs a fast entry lane: new
+   * candidates are decided and their buys built and submitted at once, without waiting for the next full cycle. A full
+   * cycle that is due always runs before another lane, so a stop-loss waits for at most one lane. Returns on STOP.
+   */
+  async run(loopMs: number): Promise<void> {
+    let nextFull = 0;
+    for (;;) {
+      if (this.now() >= nextFull) {
+        const ok = await this.cycle();
+        nextFull = this.now() + loopMs;
+        if (!ok) return;
+        continue;
+      }
+      if (this.wakePending) {
+        // Debounce: wait for WAKE_DEBOUNCE_MS without a new wake (at most WAKE_DEBOUNCE_MAX_MS), so a burst gives one lane.
+        const first = Date.now();
+        while (Date.now() - this.lastWakeAt < WAKE_DEBOUNCE_MS && Date.now() - first < WAKE_DEBOUNCE_MAX_MS) await new Promise((r) => setTimeout(r, WAKE_DEBOUNCE_MS));
+        this.wakePending = false;
+        // The lane yields at the next full cycle's due time (or its own budget), whichever comes first.
+        if (!(await this.lane(nextFull))) return;
+        continue;
+      }
+      if (this.stopRequested) {
+        this.writeStatus();
+        return;
+      }
+      await this.idle(nextFull - this.now());
+    }
+  }
+
+  /**
+   * A fast entry lane: STOP, then the entries step, where each buy is built and submitted as soon as it is booked, for
+   * at most LANE_BUDGET_MS of deciding (the buy in flight finishes). No exit work: the next full cycle does that.
+   * Returns false when STOP was seen.
+   */
+  lane(dueAt = Number.POSITIVE_INFINITY): Promise<boolean> {
+    return this.exclusive(async () => {
+      const t0 = this.now();
+      const until = Math.min(t0 + LANE_BUDGET_MS, dueAt);
+      this.lanes++;
+      if (this.shouldStop()) {
+        this.writeStatus();
+        return false;
+      }
+      let more = false;
+      await this.guard("lane", async () => void (more = await this.entries(t0, true, until)));
+      // Then buy orders already queued (a full cycle builds 5 per cycle), within what is left of the lane's time.
+      const left = until - this.now();
+      if (left > 0 && !this.shouldStop()) await this.d.executor.sweep(LANE_SWEEP_MAX, { side: "buy", budgetMs: left, shouldStop: this.shouldStop });
+      // Candidates or due buys left when the lane's budget ran out: another lane, after any full cycle that is due.
+      if (more || this.d.ledger.dueOrders(this.now(), "buy", this.dry) > 0) this.wakePending = true;
+      const stop = this.shouldStop();
+      this.writeStatus();
+      return !stop;
+    });
+  }
+
   /** One full cycle. Returns false when STOP was seen (the caller exits cleanly). */
-  async cycle(): Promise<boolean> {
+  cycle(): Promise<boolean> {
+    return this.exclusive(() => this.fullCycle());
+  }
+
+  private async fullCycle(): Promise<boolean> {
     const t0 = this.now();
     const sweep = (side?: "buy" | "sell", reconcileOnly = false) => this.d.executor.sweep(5, { side, reconcileOnly, budgetMs: Math.max(1_000, CYCLE_BUDGET_MS - (this.now() - t0)), shouldStop: this.shouldStop });
     // Exits first: a stop-loss never waits behind new entries.
@@ -223,7 +350,9 @@ export class Engine {
       ["sells2", () => sweep("sell")],
       // Buys that may already have executed get their own slot: settling them never waits behind a slow sell side.
       ["settle-buys", () => sweep("buy", true)],
-      ["entries", () => this.entries(t0)],
+      ["entries", async () => {
+        if (await this.entries(t0)) this.wakePending = true;
+      }],
       ["orders", () => sweep()],
       ["nag", async () => this.nag()],
       ["surplus", () => this.surplus()],
@@ -276,13 +405,26 @@ export class Engine {
     // Also coins whose position ended within the last hour: a late second execution can outlive the position.
     const recent = this.mine("closed", "failed").filter((p) => p.closed_at !== null && this.now() - p.closed_at < SURPLUS_TAIL_MS);
     const mints = [...new Set([...held, ...recent].map((p) => p.mint))];
+    // The coins due a check, then their balances read SURPLUS_READS at a time (reads only), then judged in order.
+    const due: string[] = [];
     for (const mint of mints) {
-      if (this.shouldStop()) return;
       if ((this.surplusAt.get(mint) ?? 0) > this.now()) continue;
       const ps = held.filter((p) => p.mint === mint);
       if (ps.some((p) => p.status === "opening" || this.d.ledger.openOrderFor(p.id))) continue;
       this.surplusAt.set(mint, this.now() + SURPLUS_CHECK_MS);
-      const bal = await tokenBalance(this.d.rpc, this.d.cfg.wallet, mint);
+      due.push(mint);
+    }
+    const balances = new Map<string, bigint | null>();
+    for (let i = 0; i < due.length; i += SURPLUS_READS) {
+      if (this.shouldStop()) return;
+      const part = due.slice(i, i + SURPLUS_READS);
+      const got = await Promise.all(part.map((m) => tokenBalance(this.d.rpc, this.d.cfg.wallet, m)));
+      part.forEach((m, j) => balances.set(m, got[j]));
+    }
+    for (const mint of due) {
+      if (this.shouldStop()) return;
+      const ps = held.filter((p) => p.mint === mint);
+      const bal = balances.get(mint) ?? null;
       if (bal === null) continue;
       const booked = ps.reduce((t, p) => t + BigInt(p.remaining_raw), 0n);
       if (bal <= booked) {
@@ -416,8 +558,37 @@ export class Engine {
     }
   }
 
-  private async entries(t0: number = this.now()): Promise<void> {
+  /**
+   * The engine's own read of a Candle curve account (default the mint's curve PDA): once per entries step and account,
+   * shared by the trigger (ctx.readCurve) and the expected-fill bound. Frozen.
+   */
+  private readCurve(mint: string, address?: string): Promise<CurveRead> {
+    const key = typeof address === "string" && address ? address : curveOf(mint);
+    let p = this.curveCache.get(key);
+    if (!p) {
+      p = (async (): Promise<CurveRead> => {
+        let v: any;
+        try {
+          v = (await this.d.rpc.call<any>("getAccountInfo", [key, { encoding: "base64", commitment: "confirmed" }]))?.value;
+        } catch (e) {
+          return Object.freeze({ status: "failed" as const, error: String((e as Error)?.message ?? e) });
+        }
+        if (!v) return Object.freeze({ status: "missing" as const });
+        try {
+          return Object.freeze({ status: "ok" as const, address: key, curve: deepFreeze(decodeCandleCurve(v)) });
+        } catch (e) {
+          return Object.freeze({ status: "invalid" as const, error: String((e as Error)?.message ?? e) });
+        }
+      })();
+      this.curveCache.set(key, p);
+    }
+    return p;
+  }
+
+  /** Returns true when it stopped on its time budget with candidates still pending. */
+  private async entries(t0: number = this.now(), lane = false, until = Number.POSITIVE_INFINITY): Promise<boolean> {
     const t = this.d.trigger;
+    this.curveCache = new Map();
     if (!this.hung.has("poll")) {
       const got = await this.bounded("poll", t0, () => t.poll(this.ctx));
       for (const raw of Array.isArray(got) ? got : []) {
@@ -431,9 +602,20 @@ export class Engine {
         this.pending.set(c.mint, { candidate: c, firstSeenMs: this.now(), lastReason: "" });
       }
     }
+    let more = false;
+    // Every entries step, in a lane or a full cycle, decides for at most LANE_BUDGET_MS; the rest goes on in lanes, so
+    // the next exit pass never waits behind a long backlog.
+    const tEntries = this.now();
+    let decided = 0;
     for (const [mint, p] of [...this.pending]) {
-      if (this.shouldStop() || this.overBudget(t0)) break;
+      if (this.shouldStop()) break;
+      // A lane decides at least one candidate, then yields at its deadline (a full cycle due).
+      if (this.overBudget(t0) || this.now() - tEntries > LANE_BUDGET_MS || (decided > 0 && this.now() >= until)) {
+        more = true;
+        break;
+      }
       if (this.hung.has(`decide:${mint}`)) continue;
+      decided++;
       const info = (): PendingInfo => Object.freeze({ firstSeenMs: p.firstSeenMs, lastReason: p.lastReason });
       let v = this.checked(await this.bounded(`decide:${mint}`, t0, () => t.decide(p.candidate, this.ctx, info())), p.candidate);
       if (v.verdict === "buy") v = this.capCheck(mint, v);
@@ -457,9 +639,13 @@ export class Engine {
         this.stats.skips++;
         continue;
       }
-      this.buy(p.candidate, v);
+      const order = this.buy(p.candidate, v);
+      // A fast lane builds and submits each buy at once (the full cycle's orders step does it otherwise).
+      if (lane && order !== null) await this.d.executor.sweep(1, { onlyIds: [order], side: "buy", budgetMs: CYCLE_BUDGET_MS, shouldStop: this.shouldStop });
     }
+    this.curveCache = new Map();
     if (t.afterEntries) this.hook("afterEntries", () => t.afterEntries!(this.ctx));
+    return more;
   }
 
   /**
@@ -483,13 +669,16 @@ export class Engine {
    * of that and the trigger's. With no readable curve, none (an uncertain buy then adopts nothing; it alerts).
    */
   private async expectedOut(mint: string, lamports: bigint, fromTrigger: bigint | null): Promise<bigint | null> {
+    // The engine's own read of the mint's curve PDA (shared with the trigger's ctx.readCurve in this step, never one
+    // the trigger supplied).
     let mine: bigint | null = null;
-    try {
-      const r = await this.d.rpc.call<any>("getAccountInfo", [curveOf(mint), { encoding: "base64", commitment: "confirmed" }]);
-      const c = r?.value ? decodeCandleCurve(r.value) : null;
-      if (c && c.baseMint === mint && !c.migrated) mine = buyImpact(c, lamports).expectedOutRaw;
-    } catch {
-      mine = null;
+    const r = await this.readCurve(mint);
+    if (r.status === "ok" && r.curve.baseMint === mint && !r.curve.migrated) {
+      try {
+        mine = buyImpact(r.curve, lamports).expectedOutRaw;
+      } catch {
+        mine = null;
+      }
     }
     // No curve read: keep the trigger's value rather than none. With none, an uncertain buy whose transaction is not
     // found could adopt nothing and `sell` could not reach its tokens (0.1.3 always had a cap). The adoption still
@@ -501,18 +690,32 @@ export class Engine {
     return fromTrigger !== null && fromTrigger < mine ? fromTrigger : mine;
   }
 
-  /** Book the buy: a position in `opening` and its order, from the engine's checked copy only (expectedOutRaw final). */
-  private buy(c: Readonly<Candidate>, v: Buy): void {
+  /**
+   * Book the buy: a position in `opening` and its order, from the engine's checked copy only (expectedOutRaw final).
+   * The caps are checked again inside the same ledger transaction that books it. Returns the order id, or null when
+   * the caps refused it there.
+   */
+  private buy(c: Readonly<Candidate>, v: Buy): number | null {
     const expected = v.expectedOutRaw;
     const now = this.now();
     const dry = this.d.cfg.mode === "dry";
     const t = this.d.trigger;
+    let orderId: number | null = null;
     const id = this.d.ledger.tx(() => {
+      const again = this.capCheck(c.mint, v);
+      if (again.verdict !== "buy") {
+        this.d.log.warn("buy_refused_at_booking", { mint: c.mint, reason: again.reason });
+        return null;
+      }
       const pid = this.d.ledger.createPosition({ mint: c.mint, chain: c.chain, dry, now, decimals: v.decimals, strategy: this.d.strategy.name, entryJson: v.entryJson });
       // The buy is only good while the trigger's decision is: no attempt is built past its deadline.
-      this.d.ledger.createOrder({ positionId: pid, side: "buy", clientTradeId: `${t.buyIdPrefix ?? "bot"}-${randomUUID()}`, amountRaw: v.lamports, slippageBps: this.d.cfg.buy.maxSlippageBps, maxAttempts: this.d.cfg.retry.maxAttempts, now, reason: v.reason, deadlineAt: v.deadlineAtMs, expectedOutRaw: expected });
+      orderId = this.d.ledger.createOrder({ positionId: pid, side: "buy", clientTradeId: `${t.buyIdPrefix ?? "bot"}-${randomUUID()}`, amountRaw: v.lamports, slippageBps: this.d.cfg.buy.maxSlippageBps, maxAttempts: this.d.cfg.retry.maxAttempts, now, reason: v.reason, deadlineAt: v.deadlineAtMs, expectedOutRaw: expected });
       return pid;
     });
+    if (id === null) {
+      this.stats.skips++;
+      return null;
+    }
     this.stats.buys++;
     // The trigger's fields never overwrite the engine's (key order stays position, mint, then the trigger's). The order
     // is booked: nothing the trigger's log fields do can undo it or end the entries step.
@@ -525,6 +728,7 @@ export class Engine {
       fields.logError = true;
     }
     this.d.log.info(dry ? "dry_buy" : "buy_order", fields);
+    return orderId;
   }
 
   // ---------------------------------------------------------------- exits
@@ -550,10 +754,19 @@ export class Engine {
     const open = this.mine("open", "exit_stuck");
     if (!open.length) return;
     this.markets = await readMarkets(this.d.rpc, open.map((p) => ({ mint: p.mint, decimals: p.decimals })), this.now());
+    // Every position's last and peak price in one ledger transaction (one commit, not one per position), and only
+    // where they changed. The strategy's view reads the peak from the row and the market, as before.
+    this.d.ledger.tx(() => {
+      for (const p of open) {
+        const m = this.markets.get(p.mint);
+        if (!m || m.priceSol === null) continue;
+        const peak = Math.max(p.peak_price, m.priceSol);
+        if (p.last_price !== m.priceSol || p.peak_price !== peak) this.d.ledger.updatePosition(p.id, { last_price: m.priceSol, peak_price: peak });
+      }
+    });
     for (const p of open) {
       const m = this.markets.get(p.mint);
       if (!m) continue;
-      if (m.priceSol !== null) this.d.ledger.updatePosition(p.id, { last_price: m.priceSol, peak_price: Math.max(p.peak_price, m.priceSol) });
       if (this.shouldStop()) return;
       // exit_stuck: refused repeatedly. Not permanent: one more try on the slow clock (the alert keeps nagging).
       if (p.status === "exit_stuck") {

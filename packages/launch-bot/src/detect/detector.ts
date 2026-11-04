@@ -170,6 +170,8 @@ export class Detector {
   // chain.lastOkMs: the last launch found on chain (still on quiet days). chain.lastPollOkMs: the last signature poll
   // that answered; chain.lastEventMs: the last event the logs socket delivered. Those two say the watcher is healthy.
   readonly stats = { api: { polls: 0, errors: 0, lastOkMs: 0 }, chain: { events: 0, polls: 0, errors: 0, wsUp: false, lastOkMs: 0, lastPollOkMs: 0, lastEventMs: 0 } };
+  /** Called when a new launch is queued (the launch trigger wakes the engine with it). Never throws into a source. */
+  onNew: (() => void) | null = null;
   private deps: DetectorDeps;
   private opts: DetectorOptions;
   private now: () => number;
@@ -253,6 +255,11 @@ export class Detector {
     this.seen.set(l.mint, l);
     if (opts.prime) return null;
     this.queue.push(l);
+    try {
+      this.onNew?.();
+    } catch {
+      /* a wake that fails waits for the next cycle */
+    }
     return l;
   }
 
