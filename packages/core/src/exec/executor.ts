@@ -170,9 +170,12 @@ export class Executor {
   /** Bumped whenever an attempt on the coin starts or ends (the engine's surplus check skips a coin that moved). */
   private epochs = new Map<string, number>();
 
-  /** Buy attempts allowed at once (cfg.buy.concurrency, default 4; 1 is 0.2.0's one-at-a-time). Sells have no limit. */
+  /**
+   * Buy attempts allowed at once: cfg.buy.concurrency (parseConfig's default 4; a config object without it: 1, which is
+   * 0.2.0's one at a time). Sells have no limit (one per position at most).
+   */
   private get buySlots(): number {
-    const n = Number((this.d.cfg.buy as { concurrency?: number }).concurrency ?? 1);
+    const n = Number(this.d.cfg.buy.concurrency ?? 1);
     return Number.isInteger(n) && n >= 1 ? n : 1;
   }
 
@@ -223,18 +226,23 @@ export class Executor {
     return due[0] ?? null;
   }
 
-  /** Register a claimed order as live (synchronously, before anything awaits), run it, then free it. */
+  /**
+   * Register a claimed order as live (synchronously, before anything awaits), run it, then free it. Never rejects:
+   * runOne's own last-resort handler can still throw (a ledger write that fails), and nobody awaits a started attempt.
+   */
   private track(o: OrderRow, run: () => Promise<void>): Promise<void> {
     const mint = this.d.ledger.position(o.position_id)!.mint;
     this.busy.set(mint, "attempt");
     this.epochs.set(mint, this.mintEpoch(mint) + 1);
-    let done!: Promise<void>;
-    const entry = { mint, side: o.side, done: (done = Promise.resolve().then(run).finally(() => {
-      this.live.delete(o.id);
-      if (this.busy.get(mint) === "attempt") this.busy.delete(mint);
-      this.epochs.set(mint, this.mintEpoch(mint) + 1);
-    })) };
-    this.live.set(o.id, entry);
+    const done = Promise.resolve()
+      .then(run)
+      .catch((e) => this.d.log.error("order_attempt_crashed", { order: o.id, error: errorJson(e) }))
+      .finally(() => {
+        this.live.delete(o.id);
+        if (this.busy.get(mint) === "attempt") this.busy.delete(mint);
+        this.epochs.set(mint, this.mintEpoch(mint) + 1);
+      });
+    this.live.set(o.id, { mint, side: o.side, done });
     return done;
   }
 
