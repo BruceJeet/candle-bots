@@ -80,12 +80,14 @@ export class Watchlist {
     // Score: 5 m volume, an incumbent's raised by the stickiness (no volume known: last).
     const score = (m: string) => (vol(m) < 0 ? -1 : vol(m) * (this.feedIn.has(m) ? this.o.feedStickiness : 1));
     const feedCoins = eligible.sort((a, b) => score(b) - score(a) || (this.feedIn.has(b) ? 1 : 0) - (this.feedIn.has(a) ? 1 : 0)).slice(0, this.o.maxFeedCoins);
-    const nextIn = new Map<string, number>();
-    for (const m of feedCoins) nextIn.set(m, this.feedIn.get(m) ?? now);
-    this.feedIn = nextIn;
     const pushed = [...this.pushed].sort((a, b) => b[1].at - a[1].at).map(([m]) => m).filter((m) => !this.o.mints.includes(m));
     const ordered = [...this.o.mints, ...pushed, ...feedCoins];
     const want = ordered.slice(0, this.o.maxCoins);
+    // Stickiness only for feed coins actually watched (one the cap left out is not an incumbent).
+    const inWant = new Set(want);
+    const nextIn = new Map<string, number>();
+    for (const m of feedCoins) if (inWant.has(m)) nextIn.set(m, this.feedIn.get(m) ?? now);
+    this.feedIn = nextIn;
     this.left = ordered.slice(this.o.maxCoins);
     if (this.left.length && this.left.length !== this.lastLeftCount) this.d.alerter.raise(`watchlist:cap:${this.left.length}`, `watchlist: the cap of ${this.o.maxCoins} coins leaves ${this.left.length} coins unwatched (list first, then pushed coins, then the feed by 5 m volume)`);
     this.lastLeftCount = this.left.length;

@@ -96,6 +96,12 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
   let ping: ReturnType<typeof setInterval> | null = null;
   let queue: string[] = [];
   let pumping = false;
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  const clearConnectTimer = () => {
+    if (connectTimer) clearTimeout(connectTimer);
+    connectTimer = null;
+  };
 
   const setUp = (v: boolean, why?: string) => {
     if (v !== up) {
@@ -148,15 +154,22 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       schedule(`connect: ${(e as Error).name}`);
       return;
     }
-    // A socket that never opens (and never closes) would leave no ping and no stall check: give up on it.
+    // A socket that never opens (and never closes) would leave no ping and no stall check: give up on it. Only while
+    // it is still connecting (readyState 0): a socket that opened or closed has its own handlers, and the timer is
+    // cleared by both (one live loop: a closed socket's reconnect is already scheduled by its onclose).
     const mine = ws;
-    setTimeout(() => {
-      if (!closed && ws === mine && mine.readyState !== 1) {
+    clearConnectTimer();
+    connectTimer = setTimeout(() => {
+      connectTimer = null;
+      if (!closed && ws === mine && mine.readyState === 0) {
         for (const a of want) openGap(a, "reconnect", lastMsg);
         teardown("connect timeout");
       }
     }, o.connectTimeoutMs ?? 15_000);
+    connectTimer.unref?.();
     ws.onopen = () => {
+      if (ws !== mine) return;
+      clearConnectTimer();
       failures = 0;
       setUp(true);
       lastMsg = now();
@@ -194,6 +207,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       }, o.pingMs ?? 15_000);
     };
     ws.onmessage = (m: MessageEvent) => {
+      if (ws !== mine) return;
       lastMsg = now();
       let msg: any;
       try {
@@ -204,7 +218,10 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       if (typeof msg.id === "number" && pendingReq.has(msg.id)) {
         const p = pendingReq.get(msg.id)!;
         pendingReq.delete(msg.id);
-        if (typeof msg.result === "number" && want.includes(p.address)) {
+        if (typeof msg.result === "number" && want.includes(p.address) && subId.has(p.address)) {
+          // Already subscribed (a late answer to an earlier request was taken): release this second one.
+          release(msg.result);
+        } else if (typeof msg.result === "number" && want.includes(p.address)) {
           subId.set(p.address, msg.result);
           bySub.set(msg.result, p.address);
           tries.delete(p.address);
@@ -222,13 +239,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
             bySub.set(msg.result, a);
             tries.delete(a);
             closeGap(a);
-          } else {
-            try {
-              ws?.send(JSON.stringify({ jsonrpc: "2.0", id: ++reqId, method: "logsUnsubscribe", params: [msg.result] }));
-            } catch {
-              /* closing */
-            }
-          }
+          } else release(msg.result);
         }
         return;
       }
@@ -244,6 +255,8 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       /* onclose follows */
     };
     ws.onclose = () => {
+      if (ws !== mine) return; // a socket we already left: its close must not touch the live one
+      clearConnectTimer();
       if (ping) clearInterval(ping);
       ping = null;
       setUp(false, "closed");
@@ -253,8 +266,17 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
     };
   };
 
+  const release = (id: number) => {
+    try {
+      ws?.send(JSON.stringify({ jsonrpc: "2.0", id: ++reqId, method: "logsUnsubscribe", params: [id] }));
+    } catch {
+      /* closing */
+    }
+  };
+
   /** Drop this socket without waiting for its onclose (detached), then reconnect. */
   const teardown = (why: string) => {
+    clearConnectTimer();
     if (ping) clearInterval(ping);
     ping = null;
     const old = ws;
@@ -279,7 +301,13 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
     failures++;
     const delay = Math.min(o.maxBackoffMs ?? 30_000, 500 * 2 ** Math.min(failures, 8)) * (0.5 + Math.random() / 2);
     setUp(false, why);
-    setTimeout(connect, delay);
+    // One reconnect pending at most: a second schedule replaces the first (never two loops).
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+    reconnectTimer.unref?.();
   };
 
   connect();
@@ -330,6 +358,9 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
     isUp: () => up,
     close() {
       closed = true;
+      clearConnectTimer();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
       if (ping) clearInterval(ping);
       try {
         ws?.close();

@@ -315,8 +315,15 @@ export class LogsSeries implements SeriesSource {
     for (const t of read.trades) {
       if (t.kind === "pump-curve") {
         if (t.mint !== mint) continue;
+        if (t.quoteMint === "") {
+          // One event this reader could not read to its quote: that minute is unknown (a closed gap, as a partial log).
+          const m0 = at - (at % this.store.barMs);
+          this.store.gap(mint, m0, m0 + this.store.barMs, "trade quote unreadable");
+          continue;
+        }
         if (t.quoteMint !== WSOL_MINT) {
-          this.store.gapStart(mint, t.quoteMint === "" ? "trade quote unreadable" : "not quoted in SOL");
+          // The coin trades against another quote: its SOL volume is never known while watched (an open gap by design).
+          this.store.gapStart(mint, "not quoted in SOL");
           continue;
         }
         this.store.trade(mint, { at, volume: Number(t.quoteAmount) / 1e9, side: t.side, price: curveTradePrice(t, this.d.decimalsOf?.(mint) ?? 6) });

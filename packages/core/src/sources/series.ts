@@ -85,7 +85,7 @@ export interface SeriesStoreOptions {
   barMs?: number;
   maxBars?: number;
   maxCoins?: number;
-  /** Gaps kept per coin at most (oldest dropped; a dropped gap's bars are older than maxBars anyway). */
+  /** Gaps kept per coin at most (past it the oldest closed gaps merge into one span; none inside the bars is dropped). */
   maxGaps?: number;
   now?: () => number;
 }
@@ -203,15 +203,34 @@ export class SeriesStore {
     }
   }
 
-  /** Past maxGaps: drop the oldest CLOSED gaps (an open gap is never dropped), and any gap older than the bars. */
+  /**
+   * Keep the gaps bounded without losing one: gaps older than the bars go; closed gaps with the same reason that share
+   * a bar (overlap, touch, or fall in the same minute) merge, which marks exactly the same bars. Past maxGaps the two
+   * oldest closed gaps merge into one span over both (reasons joined): the bars between them read incomplete too, which
+   * fails safe. A gap whose span is still inside the bars is never dropped; an open gap is never touched.
+   */
   private trimGaps(c: Coin): void {
     const oldest = this.slot(this.now()) - (this.maxBars - 1) * this.barMs;
-    c.gaps = c.gaps.filter((g) => g.to === null || g.to > oldest);
-    while (c.gaps.length > this.maxGaps) {
-      const i = c.gaps.findIndex((g) => g.to !== null);
-      if (i < 0) break;
-      c.gaps.splice(i, 1);
+    const open = c.gaps.filter((g) => g.to === null);
+    const shut = c.gaps.filter((g) => g.to !== null && g.to > oldest).sort((a, b) => a.from - b.from);
+    const merged: Gap[] = [];
+    const lastOf = new Map<string, Gap>();
+    for (const g of shut) {
+      const l = lastOf.get(g.reason);
+      if (l && this.slot(g.from) <= this.slot(l.to!)) {
+        l.to = Math.max(l.to!, g.to!);
+        continue;
+      }
+      const n = { ...g };
+      merged.push(n);
+      lastOf.set(g.reason, n);
     }
+    while (merged.length + open.length > this.maxGaps && merged.length >= 2) {
+      const [a, b] = merged.splice(0, 2);
+      const reasons = [...new Set([...a.reason.split(" + "), ...b.reason.split(" + ")])].join(" + ");
+      merged.unshift({ from: Math.min(a.from, b.from), to: Math.max(a.to!, b.to!), reason: reasons });
+    }
+    c.gaps = [...merged, ...open];
   }
 
   series(mint: string): SeriesView | null {
