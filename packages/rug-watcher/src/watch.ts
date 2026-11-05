@@ -250,7 +250,7 @@ export class RugWatch {
     const paused = !a.alertOnly && this.d.sellsPaused();
     const act = a.alertOnly ? "alert only" : `selling ${Math.round(a.sell * 10_000) / 100} % of what remains${paused ? " (held while PAUSE_SELLS is set)" : ""}`;
     const msg = `rug watcher, ${rule} on ${p.mint} (position ${p.id}): ${trip.text}. ${act}`;
-    this.d.log.warn("rug_rule", { position: p.id, mint: p.mint, rule, key, event: Number(res.lastInsertRowid), alertOnly: a.alertOnly, sell: a.sell, ...trip.numbers });
+    this.d.log.warn("rug_rule", { position: p.id, mint: p.mint, rule, key, eventId: Number(res.lastInsertRowid), alertOnly: a.alertOnly, sell: a.sell, ...trip.numbers });
     this.d.alerter.raise(`rug:${p.id}:${key}`, msg, { mint: p.mint, rule, ...trip.numbers });
     return true;
   }
