@@ -1,0 +1,16 @@
+{
+  "comment": "Watch-only: no wallet, no API key, never trades. Watches the Candle feed's onfire bucket and alerts. Add an alerts sink (Telegram, Discord, a webhook or a command) to get the alerts somewhere; without one they go to events.jsonl only.",
+  "mode": "watch",
+  "stateDir": "./state-scan",
+  "loopMs": 5000,
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "watchlist": { "mints": [], "feed": { "buckets": ["onfire"], "maxCoins": 20, "everySec": 30 }, "maxCoins": 25, "dropAfterMin": 15 },
+  "series": { "maxSubscriptions": 25 },
+  "rules": {
+    "volumeSpike": { "recentBars": 1, "baselineBars": 15, "minRatio": 5, "minVolumeSol": 2, "cooldownMin": 30 },
+    "dip": { "windowBars": 30, "minFallPct": 40, "cooldownMin": 60 },
+    "breakout": { "windowBars": 30, "minRisePct": 100, "cooldownMin": 60 },
+    "feedVolume": { "minVolume5mUsd": 100000, "cooldownMin": 30 }
+  },
+  "alerts": {}
+}

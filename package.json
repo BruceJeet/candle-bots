@@ -13,10 +13,11 @@
     "packages/exit-manager",
     "packages/rug-watcher",
     "packages/profit-sweeper",
+    "packages/scanner-bot",
     "packages/example-bot"
   ],
   "scripts": {
-    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot && npm run build -w candle-graduation-bot && npm run build -w candle-creator-bot && npm run build -w candle-launch-helper && npm run build -w candle-exit-manager && npm run build -w candle-rug-watcher && npm run build -w candle-profit-sweeper",
+    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot && npm run build -w candle-graduation-bot && npm run build -w candle-creator-bot && npm run build -w candle-launch-helper && npm run build -w candle-exit-manager && npm run build -w candle-rug-watcher && npm run build -w candle-profit-sweeper && npm run build -w candle-scanner-bot",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "check": "sh scripts/check-neutral.sh .",
     "pack:all": "sh scripts/release.sh pack"
