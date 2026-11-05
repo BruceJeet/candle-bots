@@ -54,7 +54,13 @@ When the dry run looks right, use a new `stateDir` for live, set your API key an
      "createdAt": "2026-11-05T18:00:00.000Z", "status": "pending" }
    ```
 
-   It sends the same through your alerts: Telegram, a webhook, or a command.
+   It sends the same through your alerts: Telegram, a webhook, or a command. The ledger is the authority; each file is
+  rewritten whenever it differs from its row (a file left by a crash is corrected on the next look).
+   - While the request is open, it is checked again on every look. If the unswept profit has fallen under the amount
+     asked (a later loss), or the balance less the reserve has (the wallet spent it), or `sweep.home` has changed,
+     the request turns **STALE**. The file says `"stale": true` with a `doNotSend` line, and the alert says do not
+     send it. Cancel it, and a new request with the right amount follows. If the balance recovers, it is announced
+     again as it stands.
 2. You send that amount from the wallet to your home address, however you move funds from it.
 3. You close the request:
 
@@ -62,9 +68,13 @@ When the dry run looks right, use a new `stateDir` for live, set your API key an
    candle-profit-sweeper swept sweep-mhx3k2a1-9f02c4 --config bot.json --signature <the transfer's signature>
    ```
 
-   The sweeper reads that transaction from chain. It must have succeeded, been paid from the bot's wallet, and paid
-   your home address. What home received is recorded as swept. A signature not on chain yet is kept and checked again;
-   one that pays elsewhere is refused.
+   The sweeper reads that transaction from chain (finalized). It must have succeeded, be no older than the request,
+   be paid by the bot's wallet (at least what home received), and pay your home address. What home received is
+   recorded as swept.
+   - A signature that is not a signature, or one that pays elsewhere, is refused.
+   - One not on chain yet is kept and looked at again every `everyMs`, at most 20 times, then dropped and alerted.
+   - Sent in parts: run `swept` once per transfer. The first closes the request; each later one adds to it.
+   - A signature counts once, across all requests.
 4. `--unverified` closes it at the requested amount without a signature. `cancel <requestId>` closes it without
    counting it, so the same profit is asked for again.
 
@@ -86,7 +96,9 @@ candle-exit-manager's), a `buy` section is refused.
 | `sweep.home` | required: the one address profit is asked to go to, written out in full (base58). Never taken from anywhere else; never the bot's own wallet; logged in full at start |
 | `sweep.reserveSol` | SOL the wallet keeps: a request never asks for more than the balance less this (default 0.05) |
 | `sweep.minSweepSol` | the smallest sweep asked for (default 0.05) |
-| `sweep.everyMs` | how often profit is looked at (default 60000) |
+| `sweep.everyMs` | how often profit is looked at, and `swept`/`cancel` requests are read (default 60000) |
+| `sweep.countMarkBasis` | count bags adopted at the market price (`basis: "mark"`) as profit (default false: the mark is not what was paid, and a sale above it may be principal coming back) |
+| `sweep.denyHomes` | addresses never accepted as home (look-alikes you have seen, an old address). The system program, wrapped SOL and the token programs are always refused |
 | `targets.exits` | a coin's own exit, instead of `exit` |
 | `targets.checkPrograms`, `extraPrograms`, `sellFloorMarginBps` | TEE wallet signing checks, as candle-exit-manager's `manager.*` |
 
@@ -102,8 +114,12 @@ candle-exit-manager's), a `buy` section is refused.
 ## Known limits
 
 - **It never sends.** Someone has to move the funds and close the request.
-- **Cost basis** comes from adoption: given buy signatures, a cost by hand, or the wallet's own buys found on chain. A
-  bag with no basis is not counted as profit. With `noBasis: "mark"` the price at adoption is the basis.
+- **Cost basis** comes from adoption: given buy signatures, a cost by hand, or the wallet's own buys found on chain
+  (the last `historyPages` pages only, so an old bag's basis may be partial). A bag with no basis is not counted as
+  profit, and neither is one adopted at the mark unless `sweep.countMarkBasis` is set.
+- **A wallet shared with another bot:** the cap is the whole wallet's balance less the reserve. If the other bot has
+  spent this bot's profit, the request turns stale rather than drawing on the other bot's capital. Even so, a wallet
+  of its own is simpler.
 - **Profit is the ledger's.** SOL that arrives in the wallet any other way (a deposit, an airdrop) is not profit and is
   never asked for.
 - **Solana only.**

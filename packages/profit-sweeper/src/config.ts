@@ -31,6 +31,10 @@ export interface Sweep {
   minSweepSol: number;
   /** How often profit is looked at (ms). */
   everyMs: number;
+  /** Count bags adopted at the market price (`basis: "mark"`) as profit (default false: their cost is not known). */
+  countMarkBasis: boolean;
+  /** Addresses never accepted as home (look-alikes you know of, an old address). */
+  denyHomes: string[];
 }
 
 export type Config = CoreConfig & { adoption: AdoptionConfig; targets: Targets; sweep: Sweep };
@@ -60,18 +64,31 @@ const parseTargets: SectionParser<Targets> = (raw) => {
 
 const adoptionSection: SectionParser<AdoptionConfig> = (raw, core) => parseAdoption(raw, core.baseDir);
 
+/** Never a home: the system program, wrapped SOL, the token programs (a transfer there is lost or refused). */
+const NEVER_HOME = new Set([
+  "11111111111111111111111111111111",
+  "So11111111111111111111111111111111111111112",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+]);
+
 const parseSweep: SectionParser<Sweep> = (raw, core) => {
   const w = "config.sweep";
   if (!isObj(raw)) throw new ConfigError(`${w}: required, with "home" (the full address profit is asked to go to)`);
-  only(raw, ["home", "reserveSol", "minSweepSol", "everyMs"], w);
+  only(raw, ["home", "reserveSol", "minSweepSol", "everyMs", "countMarkBasis", "denyHomes"], w);
   const home = raw.home;
   if (typeof home !== "string" || asAddress(home) !== home) throw new ConfigError(`${w}.home: a full Solana address (base58, 32 bytes), written out in full`);
   if (home === core.wallet) throw new ConfigError(`${w}.home: is the bot's own wallet`);
+  if (NEVER_HOME.has(home)) throw new ConfigError(`${w}.home: ${home} is a program or token address, not a wallet`);
+  const denyHomes = strList(raw, "denyHomes", w, { def: [], address: true })!;
+  if (denyHomes.includes(home)) throw new ConfigError(`${w}.home: ${home} is in sweep.denyHomes`);
   return {
     home,
     reserveSol: num(raw, "reserveSol", w, { min: 0, max: 1_000, def: 0.05 }),
     minSweepSol: num(raw, "minSweepSol", w, { min: 0.000001, max: 1_000_000, def: 0.05 }),
     everyMs: num(raw, "everyMs", w, { min: 1_000, max: 86_400_000, int: true, def: 60_000 }),
+    countMarkBasis: bool(raw, "countMarkBasis", w, false),
+    denyHomes,
   };
 };
 

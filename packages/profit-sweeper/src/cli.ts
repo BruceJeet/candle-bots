@@ -5,6 +5,7 @@ import { Ledger, acquireLock, asAddress } from "candle-bot-core";
 import { args, context as coreContext, die, guardMain, run, sell, status, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { loadConfig, ConfigError, type Config } from "./config.ts";
 import { checkExcludeDirs, ledgerPath, makeSweeper } from "./bot.ts";
+import { validSignature } from "./sweep.ts";
 
 export const HELP = `candle-profit-sweeper: sells the bags in a wallet at your targets (a list of coins, or the whole wallet) and asks
 for the realized profit to be sent to your home address. It never moves funds: each sweep is a request (wallet,
@@ -94,6 +95,7 @@ async function sweepCommand(ctx: Ctx, kind: "swept" | "cancel", requestId: strin
   const body: Record<string, unknown> = { requestId };
   if (kind === "swept") {
     if (opt.signature && opt.unverified) die("give one of --signature, --unverified");
+    if (opt.signature && !validSignature(opt.signature)) die(`${opt.signature} is not a transaction signature`);
     if (opt.signature) body.signature = opt.signature;
     else if (opt.unverified) body.unverified = true;
     else die("swept: give --signature <sig> (checked on chain) or --unverified");
@@ -113,7 +115,7 @@ async function sweepCommand(ctx: Ctx, kind: "swept" | "cancel", requestId: strin
     const { sweeper } = await makeSweeper(ctx, ledger);
     const r = kind === "swept" ? await sweeper.markDone(requestId, (body.signature as string) ?? null, body.unverified === true) : sweeper.cancel(requestId);
     process.stdout.write(r + "\n");
-    return r.startsWith("done") || r === "cancelled" ? 0 : 1;
+    return r.startsWith("done") || r.startsWith("added") || r === "cancelled" ? 0 : 1;
   } finally {
     ledger.close();
     lock.release();

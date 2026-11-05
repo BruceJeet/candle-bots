@@ -3,6 +3,6 @@ export { parseConfig, loadConfig, SECTIONS, NO_BUYS, ConfigError } from "./confi
 export type { Config, Targets, Sweep } from "./config.ts";
 export { ByMint, SweeperTrigger, loadExits, makeSweeper, assemble, knownProgramsFor, checkExcludeDirs, nextExit, ledgerPath } from "./bot.ts";
 export type { Built } from "./bot.ts";
-export { Sweeper, realizedOf, sol } from "./sweep.ts";
+export { Sweeper, realizedOf, sol, validSignature, SWEPT_MAX_TRIES, BLOCK_TIME_SKEW_SEC } from "./sweep.ts";
 export type { SweepRow, SweeperDeps } from "./sweep.ts";
 export { main, HELP } from "./cli.ts";
