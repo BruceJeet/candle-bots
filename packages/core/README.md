@@ -386,6 +386,19 @@ signed, the coin's venue is read again and its own expected out computed (pump.f
 next exit is a new order. A read that fails, or a venue without the math (Candle's curve, DAMM v2), means no check:
 Candle's own floor still applies. The embedded wallet executes inside the build, so this cannot run there.
 
+## Holders of a coin (polled)
+
+`sources/holders` (0.5.0): `HolderPoller(rpc).snapshot(mint)` gives the wallets among the 20 largest token accounts
+(one `getTokenLargestAccounts`, owners resolved once each with `getMultipleAccounts`, one `getTokenSupply`), summed
+per owner, largest first. Accounts owned by programs (addresses off the ed25519 curve: curves, pools, vaults) are left
+out. A malformed answer throws: unknown, never "nobody holds it". `balanceOf(owner, mint)` reads one wallet's holding.
+`holderDiff(prev, cur)` gives each owner's change (an owner gone from the list is left out, not counted as zero).
+`creatorOf(rpc, mint)` names a coin's creator: the pump.fun curve's `creator`, else the fee payer of the mint's oldest
+transaction (paged, capped; on Candle often a payer wallet).
+
+It is a poll: lag is the interval plus about a second. A streamed source can replace it behind the same two calls
+(`HolderSource`: `snapshot`, `balanceOf`), keeping its own state.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;
@@ -415,7 +428,7 @@ Candle's own floor still applies. The embedded wallet executes inside the build,
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/alerts`, `/log`, `/redact`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/alerts`, `/log`, `/redact`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.

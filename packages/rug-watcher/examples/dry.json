@@ -1,0 +1,19 @@
+{
+  "comment": "Dry run: adopts the wallet's coins into its own ledger, runs the rules and logs every alert and sell it would make, never trades. No API key needed. Set your wallet before running.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "sell": { "maxSlippageBps": 2000 },
+  "adoption": { "mode": "wallet", "exclude": [], "excludeStateDirs": [], "minValueSol": 0.01 },
+  "rules": {
+    "liquidityPull": { "dropPct": 40, "windowSec": 120 },
+    "priceCrash": { "dropPct": 50, "windowSec": 300, "sell": 0.5 },
+    "devDump": { "soldPct": 50, "floorPct": 1 },
+    "holderExit": { "topN": 10, "soldPctOfSupply": 3, "windowSec": 600, "alertOnly": true }
+  },
+  "watch": { "holdersPollMs": 15000, "maxCoinsPerPoll": 10 },
+  "exit": { "strategy": "hold" }
+}
