@@ -87,7 +87,7 @@ export async function buildRail(ctx: Ctx): Promise<{ rail: TradeRail | null; lin
     return { rail: new EmbeddedRail(new CandleClient({ apiUrl: ctx.cfg.apiUrl, apiKey, fetch: timedFetch(SDK_TIMEOUT_MS) })) };
   }
   const w = await resolveWallet(ctx.cfg, apiKey, timedFetch(SDK_TIMEOUT_MS));
-  const store = await makeSecretStore(ctx.cfg, w);
+  const store = await makeSecretStore(ctx.cfg, w, process.env, (message) => ctx.log.warn("signer_store_permissions", { message }));
   const client = new CandleClient({ apiUrl: ctx.cfg.apiUrl, apiKey, privyAppId: w.privyAppId, secretStore: store, fetch: timedFetch(SDK_TIMEOUT_MS) });
   if (!(await store.get(w.linkedWalletId))) die(`no signer key for TEE wallet ${ctx.cfg.wallet} in the ${ctx.cfg.signer!.store} store (key ${w.keyPrefix})`);
   ctx.log.info("wallet_resolved", { wallet: ctx.cfg.wallet, linkedWalletId: w.linkedWalletId, keyPrefix: w.keyPrefix, signer: ctx.cfg.signer!.store });

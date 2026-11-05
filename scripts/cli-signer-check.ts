@@ -6,10 +6,9 @@
  *
  * Run from a candle-bots checkout, with the keyring passphrase in the named environment variable (for example under a
  * wrapper that loads it into this one process). It:
- *   1. reads the Candle CLI's signer index (config.json keySigners.entries) for the key prefix and picks one signer
- *      (by --quorum, or the only one);
- *   2. loads that signer from the CLI's encrypted file store through the core's candle-cli store (the same code a bot
- *      runs), which checks its public key against the index;
+ *   1-2. selects and loads the signer exactly as a bot would: the core's makeSecretStore with a candle-cli signer
+ *      config (--expect as its fingerprint pin, --quorum as the wallet's signer quorum; with neither it refuses, as the
+ *      bot does), which checks the public key against the CLI's index;
  *   3. prints its CNDL fingerprint (and compares it with the index and --expect);
  *   4. signs a fixed test payload (ECDSA P-256 / SHA-256, the primitive the SDK's authorization signature uses) and
  *      verifies the signature with the public key.
@@ -18,7 +17,8 @@
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CandleCliSignerStore, cliConfigDir } from "candle-bot-core/exec/trader";
+import { cliConfigDir, makeSecretStore } from "candle-bot-core/exec/trader";
+import type { Config } from "candle-bot-core/config";
 import { cliFingerprint } from "candle-bot-core/exec/cliStore";
 import { addSecret, redact } from "candle-bot-core/redact";
 
@@ -50,35 +50,41 @@ function args(argv: string[]): Record<string, string | true> {
   return o;
 }
 
-export async function check(opts: { keyPrefix: string; quorum?: string; configDir?: string; passphraseEnv: string; expect?: string }, env: NodeJS.ProcessEnv = process.env): Promise<CheckResult> {
+export async function check(opts: { keyPrefix: string; quorum?: string; configDir?: string; passphraseEnv: string; expect?: string }, env: NodeJS.ProcessEnv = process.env): Promise<CheckResult & { warnings: string[] }> {
   const dir = cliConfigDir(opts.configDir ? { configDir: opts.configDir } : {}, env);
-  const out: CheckResult = { ok: false, keyPrefix: opts.keyPrefix, configDir: dir, indexEntries: 0 };
-  let entries: any[];
+  const warnings: string[] = [];
+  const out: CheckResult & { warnings: string[] } = { ok: false, keyPrefix: opts.keyPrefix, configDir: dir, indexEntries: 0, warnings };
+  let entries: any[] = [];
   try {
     entries = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"))?.keySigners?.entries ?? [];
   } catch (e) {
     return { ...out, failure: `cannot read the CLI's signer index in ${join(dir, "config.json")} (${(e as NodeJS.ErrnoException).code ?? "not JSON"})` };
   }
-  const mine = entries.filter((e) => e && e.keyPrefix === opts.keyPrefix && (!opts.quorum || e.signerQuorumId === opts.quorum));
-  out.indexEntries = mine.length;
-  if (mine.length !== 1) return { ...out, failure: mine.length ? `${mine.length} signers for key ${opts.keyPrefix} in the index; give --quorum` : `no signer for key ${opts.keyPrefix}${opts.quorum ? ` with quorum ${opts.quorum}` : ""} in the index` };
-  const entry = mine[0];
-  out.indexFingerprint = typeof entry.fingerprint === "string" ? entry.fingerprint : null;
+  out.indexEntries = entries.filter((e) => e && e.keyPrefix === opts.keyPrefix).length;
   const pass = env[opts.passphraseEnv];
-  if (!pass) return { ...out, failure: `${opts.passphraseEnv} is not set` };
-  addSecret(pass);
-  const store = new CandleCliSignerStore({ configPath: join(dir, "config.json"), file: { credentialsPath: join(dir, "credentials.enc"), passphrase: pass } }).forTeeWallet("signer-check", opts.keyPrefix, entry.signerQuorumId ?? null);
+  if (pass) addSecret(pass);
+  // The bot's own selection, not a copy of it: makeSecretStore with the same signer config a bot would carry (--expect
+  // is the fingerprint pin, --quorum stands for the signer quorum Candle gives the wallet). So an OK here proves the
+  // bot would load this signer, and every refusal is the bot's (no quorum and no pin, a passphrase under 8 characters,
+  // an ambiguous index, a mismatch).
+  const cfg = { signer: { store: "candle-cli", passphraseEnv: opts.passphraseEnv, configDir: dir, ...(opts.expect ? { fingerprint: opts.expect } : {}) } } as unknown as Config;
+  const ref = "signer-check";
   let pem: string | null;
   try {
-    pem = await store.get("signer-check");
+    const store = await makeSecretStore(cfg, { linkedWalletId: ref, privyWalletId: "", keyPrefix: opts.keyPrefix, privyAppId: "", signerQuorumId: opts.quorum ?? null }, env, (m) => warnings.push(m));
+    pem = await store.get(ref);
   } catch (e) {
-    return { ...out, failure: redact(String((e as Error).message)).split(pass).join("***") };
+    const msg = redact(String((e as Error).message));
+    // A passphrase under 8 characters is refused (never used), and masking it could garble ordinary words.
+    return { ...out, failure: pass && pass.length >= 8 ? msg.split(pass).join("***") : msg };
   }
-  if (!pem) return { ...out, failure: `no signer entry for key ${opts.keyPrefix} in ${join(dir, "credentials.enc")}` };
+  if (!pem) return { ...out, failure: `no signer for key ${opts.keyPrefix}` };
   const pub = createPublicKey(createPrivateKey(pem));
   const spki = createHash("sha256").update(pub.export({ type: "spki", format: "der" })).digest("hex");
   out.fingerprint = cliFingerprint(spki);
   out.expected = opts.expect ?? null;
+  const entry = entries.find((e) => e && e.keyPrefix === opts.keyPrefix && e.spkiSha256 === spki);
+  out.indexFingerprint = entry && typeof entry.fingerprint === "string" ? entry.fingerprint : null;
   if (out.indexFingerprint && out.indexFingerprint !== out.fingerprint) return { ...out, failure: `fingerprint ${out.fingerprint} is not the index's ${out.indexFingerprint}` };
   if (opts.expect && opts.expect !== out.fingerprint) return { ...out, failure: `fingerprint ${out.fingerprint} is not the expected ${opts.expect}` };
   const payload = Buffer.from(JSON.stringify({ check: "candle-cli signer", keyPrefix: opts.keyPrefix, nonce: createHash("sha256").update(String(Date.now())).digest("hex") }));
@@ -106,6 +112,7 @@ export async function main(argv = process.argv.slice(2), env: NodeJS.ProcessEnv 
     write(`key ${r.keyPrefix}, CLI config ${r.configDir}, index entries ${r.indexEntries}\n`);
     if (r.fingerprint) write(`signer fingerprint ${r.fingerprint}${r.indexFingerprint ? ` (index: ${r.indexFingerprint})` : ""}${r.expected ? ` (expected: ${r.expected})` : ""}\n`);
     if (r.signatureVerifies !== undefined) write(`test signature verifies: ${r.signatureVerifies ? "yes" : "NO"}\n`);
+    for (const w of r.warnings) write(`warning: ${w}\n`);
     write(r.ok ? "OK\n" : `FAILED: ${r.failure}\n`);
   }
   return r.ok ? 0 : 1;

@@ -10,7 +10,7 @@
  * count out of range) or one that does not decrypt (a wrong passphrase: AES-GCM's tag check) is an error, never a
  * guess. Nothing here writes the file. No error or log names the passphrase.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 
 export class CliStoreError extends Error {
   constructor(message: string) {
@@ -99,4 +99,22 @@ export function cliFingerprint(spkiSha256: string): string {
   let out = "";
   for (let i = 0; i < 60; i += 5) out += FP_ALPHABET[Number.parseInt(bits.slice(i, i + 5), 2)];
   return `CNDL-${out.slice(0, 4)}-${out.slice(4, 8)}-${out.slice(8, 12)}`;
+}
+
+/**
+ * Warnings about the store file's permissions (not refusals): readable by the group or others, or owned by another
+ * user. The CLI writes it 0600 in a 0700 folder; anything wider lets another account copy the ciphertext and attack
+ * the passphrase offline.
+ */
+export function cliStoreWarnings(path: string, uid: number | null = typeof process.getuid === "function" ? process.getuid() : null): string[] {
+  const out: string[] = [];
+  let st: ReturnType<typeof statSync>;
+  try {
+    st = statSync(path);
+  } catch {
+    return out;
+  }
+  if ((Number(st.mode) & 0o077) !== 0) out.push(`${path} is readable or writable by the group or others (mode ${(Number(st.mode) & 0o777).toString(8)}); the CLI writes it 0600`);
+  if (uid !== null && Number(st.uid) !== uid) out.push(`${path} is owned by uid ${st.uid}, not this process's uid ${uid}`);
+  return out;
 }

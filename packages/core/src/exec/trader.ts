@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { b58encode } from "../solana/base58.ts";
 import { addSecret } from "../redact.ts";
-import { CliStoreError, cliFingerprint, readCliEntry } from "./cliStore.ts";
+import { CliStoreError, cliFingerprint, cliStoreWarnings, readCliEntry } from "./cliStore.ts";
 import type { Config } from "../config.ts";
 
 export interface TradeRail {
@@ -279,7 +279,7 @@ export function cliConfigDir(s: { configDir?: string }, env: NodeJS.ProcessEnv =
   return s.configDir ?? resolve(env.CANDLE_CONFIG_DIR?.trim() || join(homedir(), ".config", "candle"));
 }
 
-export async function makeSecretStore(cfg: Config, w: ResolvedWallet, env: NodeJS.ProcessEnv = process.env): Promise<SecretStore> {
+export async function makeSecretStore(cfg: Config, w: ResolvedWallet, env: NodeJS.ProcessEnv = process.env, warn: (message: string) => void = () => {}): Promise<SecretStore> {
   const s = cfg.signer;
   if (!s) throw new Error("config.signer is required to trade");
   if (s.store === "keychain") return new CandleCliSignerStore().forTeeWallet(w.linkedWalletId, w.keyPrefix, w.signerQuorumId);
@@ -290,6 +290,7 @@ export async function makeSecretStore(cfg: Config, w: ResolvedWallet, env: NodeJ
     if (pass.length < 8) throw new Error(`signer.passphraseEnv: ${s.passphraseEnv} is shorter than 8 characters`);
     addSecret(pass);
     const dir = cliConfigDir(s, env);
+    for (const m of cliStoreWarnings(join(dir, "credentials.enc"))) warn(m);
     // Loaded and checked ONCE, at start: the SDK asks the store on every signature, and a CLI command mid-run (a new
     // signer, a rewrite of config.json) must never make a stop-loss fail. The checked key is kept in memory.
     const pem = await new CandleCliSignerStore({ configPath: join(dir, "config.json"), file: { credentialsPath: join(dir, "credentials.enc"), passphrase: pass, ...(s.fingerprint ? { fingerprint: s.fingerprint } : {}) } }).forTeeWallet(w.linkedWalletId, w.keyPrefix, w.signerQuorumId).get(w.linkedWalletId);

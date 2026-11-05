@@ -70,11 +70,13 @@ export class Alerter {
 
   /** Record an alert; announce it (log + sinks) when it is new or its renotify time has come. */
   raise(key: string, message: string, fields: Record<string, unknown> = {}): boolean {
-    const due = this.ledger.alert(key, message, this.now(), this.renotifyMs);
-    if (!due) return false;
+    // Redacted before anything keeps it: the ledger's alert table too, not only the log and the sinks.
     const msg = redact(message);
-    this.log.warn("alert", { key, message: msg, ...fields });
-    const a = { key: redact(key), message: msg, at: new Date(this.now()).toISOString() };
+    const rkey = redact(key);
+    const due = this.ledger.alert(rkey, msg, this.now(), this.renotifyMs);
+    if (!due) return false;
+    this.log.warn("alert", { key: rkey, message: msg, ...fields });
+    const a = { key: rkey, message: msg, at: new Date(this.now()).toISOString() };
     this.sent++;
     for (const s of this.sinks) void s(a).catch(() => undefined);
     return true;
