@@ -4,7 +4,7 @@ import { getAccounts, type Rpc } from "../solana/rpc.ts";
 import { b58encode } from "../solana/base58.ts";
 import { buyImpact, curveProgress, dammBuy, dammPrice, dammRoomAboveFloor, decodeCandleCurve, decodeDamm, priceFromSqrt, type CandleCurve, type DammPool } from "./curve.ts";
 import type { MarketView } from "../strategies/types.ts";
-import { decodeFeeConfig, decodePumpCurve, decodePumpPool, decodeTokenAccount, pumpCurvePrice, pumpCurveProgress, pumpCurveSell, pumpCurveUnsupported, pumpPoolPrice, pumpPoolSell, pumpPoolState, pumpPoolUnsupported, type FeeConfig, type PumpCurve, type PumpPoolState } from "./pump.ts";
+import { decodeFeeConfig, decodePumpCurve, decodePumpPool, decodeTokenAccount, pumpCurveBuy, pumpPoolBuy, pumpCurvePrice, pumpCurveProgress, pumpCurveSell, pumpCurveUnsupported, pumpPoolPrice, pumpPoolSell, pumpPoolState, pumpPoolUnsupported, type FeeConfig, type PumpCurve, type PumpPoolState } from "./pump.ts";
 import { decodeMint } from "./mint.ts";
 import type { DryPricer } from "../exec/executor.ts";
 
@@ -280,6 +280,39 @@ export function expectedSellOut(m: MarketRead, raw: bigint): bigint | null {
   }
   return null;
 }
+
+/** (0.6.0) A buy's expected fill and impact on the venue a read found (buyQuote). */
+export interface BuyQuote {
+  venue: "curve" | "damm" | "pump-curve" | "pumpswap";
+  expectedOutRaw: bigint;
+  impactBps: number;
+  feeBps: number;
+}
+
+/**
+ * (0.6.0) Spending `lamports` on the coin's venue as `m` read it, from the venue's own math: the Candle curve, its DAMM
+ * v2 pool, the pump curve or the canonical PumpSwap pool (the pump venues need a read with `pump: true`). `{ why }` when the
+ * venue is unknown or migrating, a pump fee config or the supply is unread, or the math refuses the buy (`why` says).
+ */
+export function buyQuote(m: MarketRead, lamports: bigint): BuyQuote | { why: string } {
+  try {
+    if (m.venue === "curve" && m.curve) return { venue: "curve", ...pick(buyImpact(m.curve, lamports)) };
+    if (m.venue === "damm" && m.pool) return { venue: "damm", ...pick(dammBuy(m.pool, m.mint, lamports)) };
+    if (m.venue === "pump-curve" || m.venue === "pumpswap") {
+      if (!m.pumpFees) return { why: "pump_fees_unread" };
+      if (m.venue === "pump-curve" && m.pumpCurve) return { venue: "pump-curve", ...pick(pumpCurveBuy(m.pumpCurve, lamports, m.pumpFees)) };
+      if (m.venue === "pumpswap" && m.pumpPool) {
+        if (!m.supply) return { why: "supply_unread" };
+        return { venue: "pumpswap", ...pick(pumpPoolBuy(m.pumpPool, m.mint, lamports, m.supply, m.pumpFees)) };
+      }
+    }
+    return { why: m.problem ?? `no_venue:${m.venue}` };
+  } catch (e) {
+    return { why: String((e as Error).message) };
+  }
+}
+
+const pick = (r: { expectedOutRaw: bigint; impactBps: number; feeBps: number }) => ({ expectedOutRaw: r.expectedOutRaw, impactBps: r.impactBps, feeBps: r.feeBps });
 
 /**
  * (0.5.0) For ExecutorDeps.sellFloor: a fresh wide read of the coin and its venue's expected out for the sell, less

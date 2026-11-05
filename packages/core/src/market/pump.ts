@@ -25,6 +25,17 @@
  *  - PumpSwap: quote_out = floor(n * Q / (B + n)) with B the base vault and Q = quote vault + virtual_quote_reserves;
  *    fees ceil(quote_out * bps / 10_000) each for lp, protocol and coin creator. The wallet gets quote_out - fees.
  *  - fee tier: the last tier whose threshold <= market cap (lamports): curve vq * supply / vt; pool Q * supply / B.
+ *
+ * (0.6.0) Buy math (spend S lamports, fees on the input: pump's buy_exact_quote_in and PumpSwap's
+ * buy_exact_quote_in), reproduced to the raw unit on real buys (fixtures in the tests):
+ *  - net: PumpSwap: the most lamports n with n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator /
+ *    1e4) <= S; the curve: floor(S * 1e4 / (1e4 + fees)) - 1 (the same n on every real buy; where they would differ,
+ *    the smaller, by one lamport);
+ *  - curve: tokens = floor(vt * (n - 1) / (vq + n - 1)); PumpSwap: base = floor(B * (n - 1) / (Q + n - 1)) with Q the
+ *    quote vault + virtual_quote_reserves before the trade (the programs swap one lamport less than the net);
+ *  - fee tier: the market cap before the trade.
+ * The buy side refuses (never guesses) what was not reproduced on a real buy: a mayhem-mode or cashback curve or pool,
+ * a buy past the curve's real tokens (the program then caps it), a quote other than SOL.
  * Not modelled (refused, never guessed): a quote other than SOL, a mayhem-mode PumpSwap pool, a pool whose base is not
  * the coin (the canonical pool always has the coin as base). A mayhem-mode curve's ordinary sell follows the same math.
  * Cashback coins: the price is the same; the expected out leaves the cashback fee out (it overstates by its bps).
@@ -266,6 +277,102 @@ export function pumpPoolSell(s: PumpPoolState, mint: string, raw: bigint, supply
   const fees = s.pool.coinCreator === SYSTEM ? { ...tier, creatorBps: 0n } : tier;
   const fee = ceilBps(gross, fees.lpBps) + ceilBps(gross, fees.protocolBps) + ceilBps(gross, fees.creatorBps);
   return { outLamports: gross > fee ? gross - fee : 0n, grossLamports: gross, feeLamports: fee, fees };
+}
+
+export interface PumpBuy {
+  /** Raw coin the buy should bring (the venue's own math, fees on the input). */
+  expectedOutRaw: bigint;
+  /** Lamports that reach the venue (S less the fees and the program's rounding). */
+  netLamports: bigint;
+  feeLamports: bigint;
+  fees: PumpFees;
+  /** The ticket's average price over spot, less 1 (fees apart), as buyImpact and dammBuy report it. */
+  impact: number;
+  impactBps: number;
+  /** Total fee bps on the input (lp + protocol + creator). */
+  feeBps: number;
+}
+
+const feeOn = (n: bigint, f: PumpFees) => ceilBps(n, f.lpBps) + ceilBps(n, f.protocolBps) + ceilBps(n, f.creatorBps);
+
+/**
+ * The most lamports n (the swap's input) with n plus its fees (each ceil(n * bps / 1e4)) within `lamports`: what a
+ * buy_exact_quote_in of `lamports` puts into the venue. 0 when even 1 lamport does not fit.
+ */
+export function pumpBuyNet(lamports: bigint, f: PumpFees): bigint {
+  if (lamports <= 0n) return 0n;
+  const tot = f.lpBps + f.protocolBps + f.creatorBps;
+  let n = (lamports * 10_000n) / (10_000n + tot);
+  // floor(S * 1e4 / (1e4 + tot)) is at most 3 above the answer (one ceil per fee); step down to the fit, then up.
+  while (n > 0n && n + feeOn(n, f) > lamports) n--;
+  while (n + 1n + feeOn(n + 1n, f) <= lamports) n++;
+  return n;
+}
+
+function impactOf(inLamports: bigint, outRaw: bigint, quoteReserve: bigint, baseReserve: bigint): number {
+  // Average price (in / out) over spot (quoteReserve / baseReserve), less 1.
+  return (Number(inLamports) * Number(baseReserve)) / (Number(outRaw) * Number(quoteReserve)) - 1;
+}
+
+/** Why this curve's buy cannot be modelled, or null (the sell checks, plus what no real buy reproduced). */
+export function pumpCurveBuyUnsupported(c: PumpCurve): string | null {
+  if (c.complete) return "curve_complete";
+  const why = pumpCurveUnsupported(c);
+  if (why) return why;
+  if (c.mayhem) return "pump_mayhem";
+  if (c.cashback) return "pump_cashback";
+  return null;
+}
+
+/**
+ * (0.6.0) Spending `lamports` on the curve now (buy_exact_quote_in; pure). Throws curve_complete, pump_* (unsupported:
+ * pump_mayhem, pump_cashback, pump_quote_not_sol), pump_amount (too small to buy a raw unit), buy_past_graduation (more
+ * than the curve's real tokens: the program would cap the buy).
+ */
+export function pumpCurveBuy(c: PumpCurve, lamports: bigint, cfg: FeeConfig): PumpBuy {
+  const why = pumpCurveBuyUnsupported(c);
+  if (why) throw new DecodeError(why);
+  const fees = feesAt(cfg, pumpCurveMcap(c));
+  // The curve's net on every real buy was floor(S * 1e4 / (1e4 + fees)) - 1, which there was also the most that fits.
+  // Where the floor itself fits exactly (no real buy showed one) the two differ by a lamport: take the smaller.
+  const fit = pumpBuyNet(lamports, fees);
+  const closed = (lamports * 10_000n) / (10_000n + fees.lpBps + fees.protocolBps + fees.creatorBps) - 1n;
+  const net = closed < fit ? closed : fit;
+  if (net <= 1n) throw new DecodeError("pump_amount");
+  const swapIn = net - 1n;
+  const out = (c.virtualToken * swapIn) / (c.virtualQuote + swapIn);
+  if (out <= 0n) throw new DecodeError("pump_amount");
+  if (out > c.realToken) throw new DecodeError("buy_past_graduation");
+  const impact = impactOf(swapIn, out, c.virtualQuote, c.virtualToken);
+  return { expectedOutRaw: out, netLamports: net, feeLamports: feeOn(net, fees), fees, impact, impactBps: Math.round(impact * 10_000), feeBps: Number(fees.lpBps + fees.protocolBps + fees.creatorBps) };
+}
+
+/** Why this pool's buy of `mint` cannot be modelled, or null. */
+export function pumpPoolBuyUnsupported(p: PumpPool, mint: string): string | null {
+  const why = pumpPoolUnsupported(p, mint);
+  if (why) return why;
+  if (p.cashback) return "pump_cashback";
+  return null;
+}
+
+/**
+ * (0.6.0) Spending `lamports` on the pool's base coin now (buy_exact_quote_in; pure). `supply` is the coin's supply (the
+ * fee tier). Throws pump_* (unsupported), pump_amount, pump_reserves.
+ */
+export function pumpPoolBuy(s: PumpPoolState, mint: string, lamports: bigint, supply: bigint, cfg: FeeConfig): PumpBuy {
+  const why = pumpPoolBuyUnsupported(s.pool, mint);
+  if (why) throw new DecodeError(why);
+  const tier = feesAt(cfg, pumpPoolMcap(s, supply));
+  // As the sell: a pool with no coin creator set pays no creator fee (no real buy checked it).
+  const fees = s.pool.coinCreator === SYSTEM ? { ...tier, creatorBps: 0n } : tier;
+  const net = pumpBuyNet(lamports, fees);
+  if (net <= 1n) throw new DecodeError("pump_amount");
+  const swapIn = net - 1n;
+  const out = (s.baseReserve * swapIn) / (s.quoteReserve + swapIn);
+  if (out <= 0n) throw new DecodeError("pump_amount");
+  if (out >= s.baseReserve) throw new DecodeError("pump_reserves");
+  const impact = impactOf(swapIn, out, s.quoteReserve, s.baseReserve);
+  return { expectedOutRaw: out, netLamports: net, feeLamports: feeOn(net, fees), fees, impact, impactBps: Math.round(impact * 10_000), feeBps: Number(fees.lpBps + fees.protocolBps + fees.creatorBps) };
 }
 
 export { TOKEN_PROGRAM, TOKEN_2022 };
