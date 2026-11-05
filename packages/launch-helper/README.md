@@ -50,8 +50,10 @@ Candle's atomic launch (`buildAtomicLaunch`, then `submitAtomicLaunch`) from the
   - the dev buy fits `buy.lifetimeSol` and `buy.maxOpen`;
   - `wallet` is the key's embedded (main) wallet, where the dev bag lands (Candle's portfolio);
   - the account has not launched a token with the same name and symbol (Candle's list of the account's launched
-    tokens, case and spaces ignored). Another state dir with the same spec is refused. `launch.newLaunch: true`
-    launches the same name and symbol again on purpose.
+    tokens, case and spaces ignored). Another state dir with the same spec is refused. A listed token without a name
+    or symbol, or a list that ends without saying it is done, is refused too (it cannot be judged).
+    `launch.newLaunch: true` launches the same name and symbol again on purpose. The check relies on Candle's list
+    showing a launch from minutes ago; that was not verified live.
 - The `clientLaunchId` is written to the ledger **before** the first build and is never replaced. A state dir holds
   one launch; a config for another coin in the same state dir is refused (alert), nothing is sent.
 - The build is checked before the submit: the dev buy's leg carries `minAmountOut: 0` inside the bundle, so Candle's
@@ -67,6 +69,7 @@ Candle's atomic launch (`buildAtomicLaunch`, then `submitAtomicLaunch`) from the
   why. A job that says `confirmed` is taken as landed. A 409 on the rebuild (Candle still resolving the first attempt)
   goes back to reading the job. A new `clientLaunchId` is never sent while a launch may land.
 - `PAUSE_BUYS`: no launch fires (and none is submitted after a build). Dry mode makes no call at all.
+- STOP, a signal and PAUSE_BUYS are read again right before every build.
 - On `STOP` or SIGTERM the run waits for a launch call in flight (a submit can take about 160 s) before it closes the
   ledger. Under systemd give the unit `TimeoutStopSec=200` or more; a kill in the middle is still safe (the state was
   saved before the call, and the restart reads the job).
@@ -75,16 +78,19 @@ Candle's atomic launch (`buildAtomicLaunch`, then `submitAtomicLaunch`) from the
 
 Once the launch lands, the dev buy's transaction (the submit's buy-leg signature, else Candle's job) is booked from
 the chain by the core (`openFromFill`: this wallet's tokens and SOL spent, never an API's number). When Candle names no
-dev-buy transaction, or one that gave the wallet no tokens, the wallet's token-account history for the mint is read,
-oldest first, and the first transaction that bought the coin with SOL is booked. If that finds nothing, an alert asks
-for a hand booking:
+dev-buy transaction, or one that gave the wallet no tokens, the wallet's token-account history for the mint is read
+whole (paged), oldest first. The first transaction that gave the wallet this coin is the dev buy (the bundle bought
+first and opened the account): it is booked if it passes the core's checks. The scan never walks past it to a later
+buy. If it cannot be read yet, the scan tries again later; if it fails the checks (no SOL spent, already booked), or
+the history runs past 10,000 signatures, an alert asks for a hand booking:
 
 ```sh
-candle-launch-helper adopt <signature> --config launch.json [--mint <mint>]    # with the bot stopped
+candle-launch-helper adopt <signature> --config launch.json [--mint <mint>] [--force]    # with the bot stopped
 ```
 
 `adopt` books the bag from that transaction through the same checks (this wallet, this mint, SOL spent, tokens
-received, not booked already) and marks the launch open.
+received, not booked already) and marks the launch open. On a launch whose bag is already open it refuses (a second
+position would count twice in the caps and the exits); `--force` books it anyway.
 
 ## Config
 

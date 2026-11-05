@@ -66,7 +66,11 @@ export const RETRY_FILE = "RETRY_LAUNCH";
 /** Pages of the account's launched tokens read for the same-spec check (50 a page). More than that: refused. */
 export const LAUNCH_LIST_PAGES = 20;
 /** Signatures of the wallet's token account read when looking for the dev buy on chain. */
-export const DEV_BUY_SCAN = 50;
+export const DEV_BUY_PAGE = 1000;
+/** Pages of that history read at most (the dev buy is its oldest transaction); more: not found, alerted. */
+export const DEV_BUY_PAGES = 10;
+/** openFromFill refusals that may pass on a later read: the scan stops there and tries again later. */
+const TRANSIENT = /^(tx_not_found|tx_read_failed|tx_unreadable|mint_busy|book_failed)/;
 
 /** The launch body Candle gets (without the id): from the spec only. */
 export function launchBody(spec: LaunchSpec): Record<string, unknown> {
@@ -99,8 +103,12 @@ export interface LauncherDeps {
   alerter: Alerter;
   /** Opens the dev bag (the engine's openFromFill). */
   openFromFill: CoreEngine["openFromFill"];
+  /** A stop asked by signal (the engine's), read again right before a build. */
+  shouldStop?: () => boolean;
   now?: () => number;
 }
+
+type Preflight = "go" | "refused" | "wait";
 
 type StepCtx = { dry: boolean; paused: boolean; stopping: boolean };
 
@@ -151,7 +159,7 @@ export class Launcher {
   }
 
   private stopping(): boolean {
-    return existsSync(this.file("STOP"));
+    return existsSync(this.file("STOP")) || !!this.d.shouldStop?.();
   }
 
   row(): LaunchRow | undefined {
@@ -179,7 +187,7 @@ export class Launcher {
         return;
       }
       if (ctx.paused || ctx.stopping) return;
-      if (!(await this.preflight(true))) return;
+      if ((await this.preflight(true)) !== "go") return;
       // The id is saved before anything is sent: a restart finds it and never makes another.
       row = this.d.ledger.createLaunch({ clientLaunchId: `clh-${randomUUID()}`, specHash: hash, specJson: JSON.stringify(launchBody(spec)), now: this.now() });
       this.d.log.info("launch_id_saved", { clientLaunchId: row.client_launch_id });
@@ -193,9 +201,14 @@ export class Launcher {
     if (ctx.dry) return;
     switch (row.state) {
       case "new": {
+        // An id saved after a build was asked for, never built: a build may have been sent. Read the job.
+        if (row.attempts > 0) {
+          this.unresolved(row, "state new after a build attempt");
+          return;
+        }
         // An id saved, never built (the process stopped in between): the pre-flight again, then the build.
         if (ctx.paused || ctx.stopping) return;
-        if (row.attempts === 0 && !(await this.preflight(true))) return;
+        if ((await this.preflight(true)) !== "go") return;
         return this.buildThenSubmit(row, ctx);
       }
       case "building":
@@ -231,6 +244,11 @@ export class Launcher {
   }
 
   private async buildThenSubmit(row: LaunchRow, ctx: StepCtx): Promise<void> {
+    // Read again right before the build: a STOP, a signal or PAUSE_BUYS may have come during the pre-flight reads.
+    if (this.paused() || this.stopping()) {
+      this.d.log.info("launch_build_held", { clientLaunchId: row.client_launch_id, why: this.paused() ? "PAUSE_BUYS" : "STOP" });
+      return;
+    }
     await this.build(row);
     const after = this.row()!;
     // Straight on to the submit while the bundle's blockhash is fresh, unless PAUSE_BUYS or STOP arrived meanwhile.
@@ -241,13 +259,14 @@ export class Launcher {
    * The checks before the first build. True: go. False: nothing is sent now (alerted with why; a check that could
    * not be read is tried again after JOB_READ_MS).
    */
-  private async preflight(sameSpec: boolean): Promise<boolean> {
+  private async preflight(sameSpec: boolean): Promise<Preflight> {
     const cfg = this.d.cfg;
     const spec = cfg.launch;
-    const refuse = (key: string, why: string): false => {
+    const refuse = (key: string, why: string): Preflight => {
+      this.preflightAt = 0;
       this.d.log.warn("launch_preflight_refused", { check: key, why });
       this.d.alerter.raise(`launch:preflight:${key}`, `launch not sent: ${why}`);
-      return false;
+      return "refused";
     };
     if (spec.minDevBuyOutRaw === undefined) return refuse("floor", "launch.minDevBuyOutRaw is required in live mode (the dev buy's on-chain minimum is 0 inside the bundle; run `plan` for Candle's preview fill)");
     const ticket = lamportsOf(spec.devBuySol);
@@ -256,15 +275,15 @@ export class Launcher {
     const open = this.d.ledger.positionsByStatus("opening", "open", "exit_stuck").filter((p) => !p.dry).length;
     if (open >= cfg.buy.maxOpen) return refuse("caps", `${open} live positions open, buy.maxOpen is ${cfg.buy.maxOpen}`);
     const client = this.d.client;
-    if (!client) return false;
-    if (this.now() - this.preflightAt < JOB_READ_MS && this.preflightAt !== 0) return false;
+    if (!client) return "wait";
+    if (this.now() - this.preflightAt < JOB_READ_MS && this.preflightAt !== 0) return "wait";
     this.preflightAt = this.now();
     let embedded: string[];
     try {
       embedded = ((await client.getPortfolio()).embedded ?? []).map((w) => w.address);
     } catch (e) {
       this.d.log.warn("launch_preflight_read_failed", { check: "wallet", code: errorInfo(e).code });
-      return false;
+      return "wait";
     }
     if (!embedded.includes(cfg.wallet)) return refuse("wallet", `config wallet ${cfg.wallet} is not the key's embedded (main) wallet (${embedded.join(", ") || "none listed"}): the dev bag would land where this bot does not look`);
     if (sameSpec && !spec.newLaunch) {
@@ -276,17 +295,21 @@ export class Launcher {
           page = await client.fees.list({ limit: 50, ...(cursor ? { cursor } : {}) });
         } catch (e) {
           this.d.log.warn("launch_preflight_read_failed", { check: "launched", code: errorInfo(e).code });
-          return false;
+          return "wait";
         }
+        // A row without a name or symbol cannot be judged: refused rather than passed (fail closed).
+        const blank = page.page.find((t) => !norm(t.name) || !norm(t.symbol));
+        if (blank) return refuse("launched", `the account's launched token ${blank.mint} is listed without a name or symbol, so the same-spec check cannot judge it; set launch.newLaunch: true if ${spec.name} (${spec.symbol}) is known not to be launched`);
         const same = page.page.find((t) => norm(t.name) === norm(spec.name) && norm(t.symbol) === norm(spec.symbol));
         if (same) return refuse("launched", `the account already launched ${spec.name} (${spec.symbol}) as ${same.mint}; set launch.newLaunch: true to launch the same name and symbol again`);
-        done = page.isDone || !page.continueCursor;
+        if (!page.isDone && !page.continueCursor) return refuse("launched", "Candle's list of the account's launched tokens says it is not done but gives no next page; the same-spec check could not finish");
+        done = page.isDone;
         cursor = page.continueCursor ?? undefined;
       }
       if (!done) return refuse("launched", `the account's launched tokens run past ${LAUNCH_LIST_PAGES} pages; the same-spec check could not finish (set launch.newLaunch: true to skip it)`);
     }
     this.preflightAt = 0;
-    return true;
+    return "go";
   }
 
   /** RETRY_LAUNCH: one build under the same id, only after a job read says failed or JOB_NOT_FOUND. */
@@ -319,7 +342,12 @@ export class Launcher {
       verdict = "not_found";
     }
     // Pre-flight again (the floor, the caps, the wallet); the same-spec check would find nothing new for this id.
-    if (!(await this.preflight(false))) return ignore("a pre-flight check refused (see the alert)");
+    const pf = await this.preflight(false);
+    if (pf === "wait") return;   // a read did not answer (or too soon): the file stays, the next step tries again
+    if (pf === "refused") return ignore("a pre-flight check refused (see the alert)");
+    // Read again after the awaits above, before the state changes.
+    if (this.paused()) return ignore("PAUSE_BUYS is set");
+    if (this.stopping()) return;   // a stop: the file stays for the next run
     this.useRetryFile("done");
     this.d.log.info("launch_retry", { clientLaunchId: row.client_launch_id, from: row.state, job: verdict });
     this.d.ledger.updateLaunch(row.id, { state: "new", error: null, updated_at: this.now() });
@@ -493,35 +521,63 @@ export class Launcher {
     this.d.alerter.raise("launch:dev_bag", `launch ${row.client_launch_id} landed (${row.mint}) but its dev buy is not booked (${reason}${sig ? `, signature ${sig}` : ""}); the chain scan found none yet. Book it by hand: candle-launch-helper adopt <signature>`);
   }
 
-  /** Read the wallet's token-account history for the mint, oldest first; book the first buy openFromFill accepts. */
+  /**
+   * Find the dev buy in the wallet's token-account history for the mint: the whole history (paged), walked oldest
+   * first. Transactions that gave the wallet none of this coin are passed over. The first one that did is the dev buy
+   * (the launch's own bundle bought first, and opened the account): it is booked if openFromFill accepts it. Anything
+   * else ends the scan without a booking: a refusal that may pass later (unreadable yet, coin busy) is tried again
+   * next time; a definite one (no SOL spent, already booked) is alerted for `adopt`. A later buy is never taken.
+   */
   private async scanForDevBuy(row: LaunchRow, mint: string): Promise<boolean> {
     if (this.scanAt !== 0 && this.now() - this.scanAt < JOB_READ_MS) return false;
     this.scanAt = this.now();
+    const fail = (step: string, e: unknown) => {
+      this.d.log.warn("dev_buy_scan_failed", { clientLaunchId: row.client_launch_id, step, error: String((e as Error)?.message ?? e).slice(0, 200) });
+      return false;
+    };
     let accts: string[];
     try {
       const r = await this.d.rpc.call<any>("getTokenAccountsByOwner", [this.d.cfg.wallet, { mint }, { encoding: "jsonParsed", commitment: "confirmed" }]);
       accts = (r?.value ?? []).map((a: any) => a?.pubkey).filter((k: unknown) => typeof k === "string");
     } catch (e) {
-      this.d.log.warn("dev_buy_scan_failed", { clientLaunchId: row.client_launch_id, step: "token accounts", error: String((e as Error)?.message ?? e).slice(0, 200) });
+      return fail("token accounts", e);
+    }
+    if (accts.length !== 1) {
+      this.d.log.warn("dev_buy_scan_skipped", { clientLaunchId: row.client_launch_id, tokenAccounts: accts.length, note: "one token account expected" });
       return false;
     }
-    for (const acct of accts) {
-      let sigs: Array<{ signature: string; err: unknown }>;
+    const all: Array<{ signature: string; err: unknown }> = [];
+    let before: string | undefined;
+    let complete = false;
+    for (let i = 0; i < DEV_BUY_PAGES; i++) {
+      let page: Array<{ signature: string; err: unknown }>;
       try {
-        sigs = (await this.d.rpc.call<any>("getSignaturesForAddress", [acct, { limit: DEV_BUY_SCAN, commitment: "confirmed" }])) ?? [];
+        page = (await this.d.rpc.call<any>("getSignaturesForAddress", [accts[0], { limit: DEV_BUY_PAGE, commitment: "confirmed", ...(before ? { before } : {}) }])) ?? [];
       } catch (e) {
-        this.d.log.warn("dev_buy_scan_failed", { clientLaunchId: row.client_launch_id, step: "history", error: String((e as Error)?.message ?? e).slice(0, 200) });
-        return false;
+        return fail("history", e);
       }
-      for (const s of [...sigs].reverse()) {
-        if (s.err) continue;
-        const r = await this.book(row, mint, s.signature);
-        if (r.ok) {
-          this.d.log.warn("dev_buy_found_on_chain", { clientLaunchId: row.client_launch_id, signature: s.signature });
-          this.bagOpen(row, r, s.signature, "chain scan");
-          return true;
-        }
+      all.push(...page);
+      if (page.length < DEV_BUY_PAGE) {
+        complete = true;
+        break;
       }
+      before = page[page.length - 1].signature;
+    }
+    if (!complete) {
+      this.d.log.warn("dev_buy_scan_skipped", { clientLaunchId: row.client_launch_id, note: `history longer than ${DEV_BUY_PAGES * DEV_BUY_PAGE} signatures` });
+      return false;
+    }
+    for (const s of all.reverse()) {
+      if (s.err) continue;
+      const r = await this.book(row, mint, s.signature);
+      if (r.ok) {
+        this.d.log.warn("dev_buy_found_on_chain", { clientLaunchId: row.client_launch_id, signature: s.signature });
+        this.bagOpen(row, r, s.signature, "chain scan");
+        return true;
+      }
+      if (r.reason === "no_tokens") continue;
+      this.d.log.warn("dev_buy_scan_stopped", { clientLaunchId: row.client_launch_id, signature: s.signature, reason: r.reason, transient: TRANSIENT.test(r.reason) });
+      return false;
     }
     return false;
   }
@@ -530,8 +586,9 @@ export class Launcher {
    * The operator's `adopt <signature>`: book the dev bag from that transaction (openFromFill checks it: this wallet,
    * this mint, SOL spent, tokens received, not booked already). The launch row, if any, is marked open.
    */
-  async adopt(signature: string, mintArg?: string): Promise<string> {
+  async adopt(signature: string, mintArg?: string, force = false): Promise<string> {
     const row = this.row();
+    if (row?.state === "open" && !force) return `the launch's bag is already open (position ${row.position_id}, from ${row.dev_buy_signature}); a second booking would count twice. --force books it anyway`;
     const mint = mintArg ?? row?.mint ?? null;
     if (!mint) return "no mint: the launch row names none; pass --mint <mint>";
     if (row?.mint && mintArg && row.mint !== mintArg) return `the launch row's mint is ${row.mint}, not ${mintArg}`;
@@ -591,7 +648,7 @@ export class Engine extends CoreEngine {
   constructor(d: EngineDeps) {
     const trigger = new LaunchTrigger();
     super({ cfg: d.cfg, ledger: d.ledger, trigger, executor: d.executor, strategy: d.strategy, rpc: d.rpc, log: d.log, alerter: d.alerter, now: d.now });
-    this.launcher = new Launcher({ cfg: d.cfg, ledger: d.ledger, client: d.client, rpc: d.rpc, log: d.log, alerter: d.alerter, openFromFill: (p) => this.openFromFill(p), now: d.now });
+    this.launcher = new Launcher({ cfg: d.cfg, ledger: d.ledger, client: d.client, rpc: d.rpc, log: d.log, alerter: d.alerter, openFromFill: (p) => this.openFromFill(p), shouldStop: () => this.stopping, now: d.now });
     trigger.launcher = this.launcher;
   }
 }

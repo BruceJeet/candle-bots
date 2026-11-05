@@ -19,7 +19,7 @@ dev bag with the core's exits and controls.
   candle-launch-helper run    --config launch.json [--mode dry|live] launch (live), then manage the bag
   candle-launch-helper status --config launch.json                   print status.json
   candle-launch-helper sell   <mint> --config launch.json [--fraction 1]
-  candle-launch-helper adopt  <signature> --config launch.json [--mint <mint>]
+  candle-launch-helper adopt  <signature> --config launch.json [--mint <mint>] [--force]
                                                                      book the dev bag from its transaction (bot stopped)
 
 One launch per spec: a live run refuses when the account already launched the same name and symbol (launch.newLaunch
@@ -125,7 +125,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         const ledger = openLedger(ctx)();
         try {
           const { engine } = await makeEngine(ctx, ledger);
-          const r = await engine.launcher.adopt(pos[1], opt.mint);
+          const r = await engine.launcher.adopt(pos[1], opt.mint, opt.force === "true");
           process.stdout.write(r + "\n");
           return /^position \d+/.test(r) ? 0 : 1;
         } finally {
