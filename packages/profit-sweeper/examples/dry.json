@@ -1,0 +1,14 @@
+{
+  "comment": "Dry run: adopts the wallet's bags into its own ledger, logs every sale it would make at the targets, and writes the sweep requests it would make (marked dry). Never trades or moves funds. No API key needed. Set your wallet and sweep.home (the full address profit should go to) before running: the bot refuses to start until home is a real address.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "sell": { "maxSlippageBps": 1500 },
+  "adoption": { "mode": "wallet", "exclude": [], "excludeStateDirs": [], "minValueSol": 0.01, "noBasis": "skip" },
+  "targets": { "exits": {} },
+  "exit": { "strategy": "ladder", "rungs": [{ "at": 2, "sell": 0.5 }, { "at": 4, "sell": 0.5 }] },
+  "sweep": { "home": "SET_YOUR_HOME_ADDRESS", "reserveSol": 0.05, "minSweepSol": 0.05, "everyMs": 60000 }
+}

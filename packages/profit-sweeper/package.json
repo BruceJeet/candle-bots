@@ -1,0 +1,65 @@
+{
+  "name": "candle-profit-sweeper",
+  "version": "0.1.0",
+  "description": "Sells the bags in a Solana wallet at your targets and asks for the profit to be swept to your home address: a sweep request with the wallet, the amount, the full home address and a request id, alerted once and kept until you mark it done. It never moves funds itself. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/profit-sweeper"
+  },
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/profit-sweeper#readme",
+  "bugs": {
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
+  },
+  "bin": {
+    "candle-profit-sweeper": "bin/candle-profit-sweeper"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "candle-bot-core": "0.5.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "candle",
+    "solana",
+    "trading-bot",
+    "take-profit",
+    "profit",
+    "sweep",
+    "exit",
+    "pump.fun",
+    "pumpswap",
+    "memecoin",
+    "bot",
+    "agent"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
