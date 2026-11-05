@@ -39,6 +39,7 @@ export function evaluate(cfg: Config, g: Graduation, m: MarketRead | null, caps:
   const l = g.launch;
   if (g.graduatedAtMs === null) return { verdict: "skip", reason: "graduation time unknown" };
   const since = (nowMs - g.graduatedAtMs) / 1000;
+  if (since < -5) return { verdict: "wait", reason: "pool not open yet" };
   if (since > f.maxSecondsSinceGraduation) return { verdict: "skip", reason: `graduated ${Math.round(since)}s ago > ${f.maxSecondsSinceGraduation}s` };
   if (f.minLaunchToGraduationSec !== undefined || f.maxLaunchToGraduationSec !== undefined) {
     if (l.launchedAtMs === null) return { verdict: "skip", reason: "launch time unknown" };

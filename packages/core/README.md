@@ -229,7 +229,7 @@ so the fill is exact on a flat-fee pool and an upper bound otherwise). It throws
 The engine uses it on its own: a buy verdict on a coin whose curve is migrated gets the smaller of the trigger's
 expected fill and the engine's read of the pool. A bot whose buys fill on pools passes `dammBuys: true` to its executor
 (`parts(ctx, ledger, { maxBuyImpactBps, executor: (d) => new Executor({ ...d, dammBuys: true }) })`) so a retry
-rechecks the impact on the pool rather than ending as `CURVE`. `readMarkets` returns the pool as `MarketRead.pool`.
+rechecks the pool (the ticket's impact, and the price move since the decision) rather than ending as `CURVE`. `readMarkets` returns the pool as `MarketRead.pool`.
 
 ## How money is handled
 

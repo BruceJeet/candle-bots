@@ -13,9 +13,11 @@ New API for bots that buy graduated coins or watch Candle launches. A 0.3.x bot 
   pool (the keeper's PDA, its creator checked against the curve's authority) and the expected fill is the smaller of
   the trigger's and `dammBuy`'s, as on the curve. An unreadable pool keeps the trigger's (logged
   `expected_fill_unverified`, why `pool not readable at the buy`). Before, a graduated coin always kept the trigger's.
-- **`ExecutorDeps.dammBuys`** (default false): a graduated coin's buy retry rechecks its impact on the pool against
-  `maxBuyImpactBps` (`IMPACT` past it, `POOL` for a pool that does not match, a read failure waits). Without it, as
-  before, such a retry ends `CURVE`.
+- **`ExecutorDeps.dammBuys`** (default false): a graduated coin's buy retry rechecks the pool against
+  `maxBuyImpactBps` twice: the ticket's impact there, and the price move since the decision (the ticket must still buy
+  the order's expected fill less that many bps; the impact alone falls as the price rises). `IMPACT` past either,
+  `POOL` for a pool that does not match, a read failure waits. Without it, as before, such a retry ends `CURVE`.
+- `dammBuy` refuses (`pool_layout`) a fee mode or scheduler mode it does not know, rather than guess the fee.
 - **`MarketRead.pool`**: the decoded pool for a graduated coin. Dry fills price a graduated coin's buy on its pool.
 - **`sources/candleLaunches`** (root export `CandleLaunches`): candle-launch-bot's launch detector (Candle's token
   list and the curve program on chain, deduped by mint, latency from block time), moved into the core unchanged so

@@ -18,7 +18,8 @@ Built by [Bruce Jeet](https://github.com/BruceJeet).
   positions, lifetime spend, entries per coin). A coin launched by your own wallet is never bought.
 - **Execution** through Candle's trade API, from your account's embedded wallet or a TEE wallet signed on your
   machine. Fills are booked from the transaction, sells are clamped to the wallet balance, retries are capped with
-  backoff, and a retry re-reads the pool so it never chases a pump past `graduation.maxImpactBps`.
+  backoff, and a retry re-reads the pool: it is not rebuilt when the ticket's impact, or the price move since the
+  decision, is past `graduation.maxImpactBps`.
 - **Exits:** `hold`, `tpsl`, `time`, `ladder`, or your own file. `preGrad` is refused (these coins have graduated).
 - **Dry mode** runs everything except the trade.
 
@@ -58,9 +59,10 @@ candle-graduation-bot run --config bot.json
 2. Every `detect.curvePollMs` the bot reads all watched curves in one call. A coin read on its curve is marked seen.
 3. When a curve says migrated, the bot reads the coin's DAMM v2 pool (the address Candle's keeper creates). If the pool
    is not there yet, the coin stays watched; if its creator is not the curve's authority, the coin is dropped.
-4. The graduation time is the block time of the pool's activation slot. If that cannot be read, and the bot saw the
-   coin on its curve earlier, the time it first saw it migrated counts. Otherwise the time is unknown and the coin is
-   not bought: a coin that was already graduated when the bot started is never mistaken for a fresh one.
+4. The graduation time is the block time of the pool's activation slot. If that cannot be read, and a recent read
+   (a few polls back) still found the coin on its curve, the time it first saw it migrated counts. Otherwise the time
+   is unknown and the coin is not bought: a coin that was already graduated when the bot started, or that graduated
+   during a long gap in the reads, is never mistaken for a fresh one. A pool whose activation is still ahead waits.
 5. The trigger reads the curve and pool again, checks the filters and the caps, and asks for a buy. The engine bounds
    the expected fill with its own read of the pool.
 
@@ -125,8 +127,10 @@ per order, refusals read from their structure, uncertain orders recovered from c
 - **The expected fill is the pool's.** The engine reads the coin's DAMM v2 pool and computes what the ticket buys
   there (concentrated-liquidity math, the pool's fee on the side it collects it). The smaller of that and the trigger's
   number caps the tokens an uncertain buy may adopt.
-- **A retry re-reads the pool.** Before a failed buy is rebuilt, its impact on the pool is checked again against
-  `graduation.maxImpactBps`; an unreadable pool waits, a pool that moved past the limit ends the buy (`IMPACT`).
+- **A retry re-reads the pool.** Before a failed buy is rebuilt, the pool is read again and two things are checked
+  against `graduation.maxImpactBps`: the ticket's impact on the pool, and the price move since the decision (the ticket
+  must still buy the order's expected fill less that many bps). Past either, the buy ends (`IMPACT`); an unreadable
+  pool waits; a pool that is not the coin's ends it (`POOL`).
 - **Routing is Candle's.** A graduated coin's trade goes through Candle's trade API, which routes it (through Jupiter,
   usually via the coin's pool). The pool math is the bound, not the route: a fill routed elsewhere that beats it is
   still booked from the transaction.

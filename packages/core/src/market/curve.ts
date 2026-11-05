@@ -219,6 +219,9 @@ const MAX_FEE_NUMERATOR = 990_000_000n;
  */
 export function dammMinFeeNumerator(p: DammPool): bigint {
   const f = p.baseFee;
+  // Modes this decoder knows: 0 linear, 1 exponential, 2 rate limiter (its cliff is its lowest fee). Another value
+  // means a layout this decoder does not read: refused, never guessed.
+  if (f.schedulerMode > 2) throw new DecodeError("pool_layout");
   let n = f.cliffNumerator;
   if (f.periods > 0 && f.schedulerMode === 0) {
     n = f.cliffNumerator - BigInt(f.periods) * f.reductionFactor;
@@ -246,6 +249,7 @@ export function dammMinFeeNumerator(p: DammPool): bigint {
  */
 export function dammBuy(p: DammPool, mint: string, lamports: bigint, quoteMint = WSOL_MINT): BuyImpact {
   if (p.status !== 0) throw new DecodeError("pool_disabled");
+  if (p.collectFeeMode !== 0 && p.collectFeeMode !== 1) throw new DecodeError("pool_layout");
   const coinIsA = p.tokenA === mint;
   if (!coinIsA && p.tokenB !== mint) throw new DecodeError("pool_mismatch");
   if ((coinIsA ? p.tokenB : p.tokenA) !== quoteMint) throw new DecodeError("pool_not_quote");

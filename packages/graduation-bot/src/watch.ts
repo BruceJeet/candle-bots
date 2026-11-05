@@ -38,6 +38,8 @@ interface Watched {
   addedAtMs: number;
   /** The bot read this coin's curve before it migrated. */
   seenOnCurve: boolean;
+  /** When a curve read last found it still on its curve. */
+  lastOnCurveMs: number;
   /** Reads that found no curve account yet (a launch just seen may not be served yet). */
   missing: number;
 }
@@ -111,7 +113,7 @@ export class GraduationWatch {
 
   private add(l: Launch): void {
     if (this.reported.has(l.mint) || this.watched.has(l.mint)) return;
-    this.watched.set(l.mint, { launch: l, addedAtMs: this.now(), seenOnCurve: false, missing: 0 });
+    this.watched.set(l.mint, { launch: l, addedAtMs: this.now(), seenOnCurve: false, lastOnCurveMs: 0, missing: 0 });
     // Bounded: the oldest watched coins go first.
     while (this.watched.size > this.o.maxWatched) {
       const first = this.watched.keys().next().value as string;
@@ -158,7 +160,10 @@ export class GraduationWatch {
         this.watched.delete(mint);
         return;
       }
-      if (!c.migrated) w.seenOnCurve = true;
+      if (!c.migrated) {
+        w.seenOnCurve = true;
+        w.lastOnCurveMs = this.now();
+      }
       else migrated.push({ mint, curve: c });
     });
     if (!migrated.length) return;
@@ -213,6 +218,9 @@ export class GraduationWatch {
     } catch (e) {
       this.d.log.info("graduation_time_unread", { mint, error: String((e as Error)?.message ?? e).slice(0, 120) });
     }
-    return w.seenOnCurve ? { atMs: this.now(), source: "first_seen" } : { atMs: null, source: null };
+    // First seen migrated counts only if a recent read (a few polls back) still found it on its curve: after a long gap
+    // in the reads (an RPC outage) the graduation may be old, and its time is unknown.
+    const recent = Math.max(10_000, 3 * this.o.curvePollMs);
+    return w.seenOnCurve && this.now() - w.lastOnCurveMs <= recent ? { atMs: this.now(), source: "first_seen" } : { atMs: null, source: null };
   }
 }

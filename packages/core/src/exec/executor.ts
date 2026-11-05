@@ -75,8 +75,10 @@ export interface ExecutorDeps {
    */
   maxBuyImpactBps: number;
   /**
-   * (0.4.0) Buys of graduated coins (their DAMM v2 pool): the retry recheck reads the pool and applies maxBuyImpactBps to
-   * the pool buy. Default false: a buy whose coin has graduated is refused on retry (CURVE), as before.
+   * (0.4.0) Buys of graduated coins (their DAMM v2 pool): the retry recheck reads the pool and applies maxBuyImpactBps
+   * twice: to the ticket's impact on the pool, and to the price drift since the decision (the ticket must still buy the
+   * order's expected fill less maxBuyImpactBps). Default false: a buy whose coin has graduated is refused on retry
+   * (CURVE), as before.
    */
   dammBuys?: boolean;
 }
@@ -607,8 +609,14 @@ export class Executor {
     try {
       const p = decodeDamm(v);
       if (p.creator !== authority) return { kind: "rejected", code: "POOL", detail: "pool_mismatch" };
-      const bps = dammBuy(p, pos.mint, BigInt(o.amount_raw)).impactBps;
-      if (bps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${bps} bps on retry (pool)` };
+      const r = dammBuy(p, pos.mint, BigInt(o.amount_raw));
+      if (r.impactBps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${r.impactBps} bps on retry (pool)` };
+      // The ticket's own impact falls as the price rises, so it alone does not stop a rebuild into a pump: the ticket
+      // must still buy at least the expected fill on the order (the decision's, or Candle's build quote) less
+      // maxBuyImpactBps.
+      const booked = o.expected_out_raw && /^\d+$/.test(o.expected_out_raw) ? BigInt(o.expected_out_raw) : null;
+      if (booked !== null && booked > 0n && r.expectedOutRaw < (booked * BigInt(10_000 - Math.min(10_000, Math.round(this.d.maxBuyImpactBps)))) / 10_000n)
+        return { kind: "rejected", code: "IMPACT", detail: `price moved up on retry (pool): ${r.expectedOutRaw} < ${booked} less ${this.d.maxBuyImpactBps} bps` };
       return null;
     } catch (e) {
       return { kind: "rejected", code: "POOL", detail: String((e as Error).message) };
