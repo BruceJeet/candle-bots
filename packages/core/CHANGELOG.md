@@ -31,6 +31,10 @@ is, its reads, ledger and orders unchanged.
   and `signatureOfSigned` / `blockhashOfSigned` refuse such bytes instead of reading a wrong signature. Legacy and v0
   transactions, which Candle builds today, read as before.
 - `Engine.market(mint)`: the last exit tick's read of a coin.
+- **Transactions are read up to version 1** (`getTransaction`, `openFromFill`, the launch source):
+  `maxSupportedTransactionVersion` 1, where 0.4.0 asked for 0 and the RPC refused a v1 transaction (-32015). Fills of
+  v1 transactions book from their JSON as before (checked on two real v1 sells). Signing a v1 build stays refused
+  (`TX_VERSION`).
 - PDAs: `pumpCurve`, `pumpPoolAuthority`, `pumpSwapPool`, `pumpFeeConfig`; program ids `PUMP_PROGRAM`,
   `PUMP_AMM_PROGRAM`, `PUMP_FEE_PROGRAM`.
 

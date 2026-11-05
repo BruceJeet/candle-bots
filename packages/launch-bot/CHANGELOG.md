@@ -6,6 +6,7 @@
   order handling: every 0.5.0 core addition is opt-in and this bot turns none on. One core fix reaches it (TEE wallet
   only): a build of transaction version 1 or later is never signed (the order ends `TX_VERSION`, alerted) instead of
   having a wrong signature read from it. Legacy and v0 transactions, which Candle builds today, go as before.
+- Transactions of version 1 are now read (fills, launch transactions); before, the RPC refused them.
 
 ## 0.4.2
 

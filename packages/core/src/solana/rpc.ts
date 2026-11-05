@@ -56,7 +56,7 @@ export async function getAccounts(rpc: Rpc, keys: string[]): Promise<Array<Accou
 }
 
 export async function getTransaction(rpc: Rpc, signature: string): Promise<any | null> {
-  return rpc.call("getTransaction", [signature, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
+  return rpc.call("getTransaction", [signature, { encoding: "json", maxSupportedTransactionVersion: 1, commitment: "confirmed" }]);
 }
 
 /** Sum of every token account the owner holds for the mint (raw units), or null when the read fails. */

@@ -1531,7 +1531,7 @@ export class Engine {
     if (first) return first;
     let tx: any;
     try {
-      tx = await this.d.rpc.call<any>("getTransaction", [p.signature, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
+      tx = await this.d.rpc.call<any>("getTransaction", [p.signature, { encoding: "json", maxSupportedTransactionVersion: 1, commitment: "confirmed" }]);
     } catch (e) {
       return { ok: false, reason: `tx_read_failed: ${String((e as Error)?.message ?? e).slice(0, 120)}` };
     }
