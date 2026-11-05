@@ -22,14 +22,18 @@ Order attempts run outside the money lock. The money rules are unchanged. A 0.1.
   With every slot taken, buys that may already have executed (a saved signature, a main-payer build) still settle
   beside them, settle-only, at most once per `loopMs`, so a landed buy is booked (and its exits run) while other buys
   hang. **An existing config gets 4 on upgrade**: set `buy.concurrency: 1` to keep 0.2.0's one buy at a time.
-- **SOL with several buys in flight.** No reserve: Candle can build each buy against the same balance. The chain cannot
-  overdraw: at most `buy.concurrency - 1` of them fail at submit, and the executor ends them as any failed submit
-  (signature checked on chain, its blockhash expired, then a rebuild Candle refuses). Such an order counts toward
-  `lifetimeSol` (it was signed), as before. Fund the wallet for what the caps allow, or set `buy.concurrency` 1.
+- **SOL with several buys in flight.** No reserve; the chain never overdraws. What happens to a buy the balance
+  cannot cover, by payer (the `lifetimeSol` rule itself is unchanged: a rejection counts unless nothing was signed):
+  - **embedded** (payer main): Candle executes inside the build and checks the balance there, so the buy is refused
+    before execution: `rejected`, unspent, **not** counted toward `lifetimeSol`;
+  - **linked**: Candle can build several buys against the same balance; each is signed and its submit is refused (at
+    most `buy.concurrency - 1` of them). The executor ends it as any failed submit (signature checked on chain, its
+    blockhash expired, then a rebuild Candle refuses): `rejected` after signing, **counted** toward `lifetimeSol`.
+  Fund the wallet for what the caps allow, or set `buy.concurrency` 1.
 - **STOP:** no attempt starts after STOP, no attempt starts a new build after it (one claimed before STOP settles what
   it has and hands the order back), and nothing is signed or submitted after it: a linked-payer build under way at
-  STOP finishes, its unsigned transaction is dropped (it can never land) and the order goes back as it was, its
-  attempt counted. A submit already under way, or a main-payer build (Candle sends it inside the build), is followed
+  STOP finishes, its unsigned transaction is dropped (it can never land) and the order goes back as it was. Known:
+  that attempt still counts toward `retry.maxAttempts`. A submit already under way, or a main-payer build (Candle sends it inside the build), is followed
   to its end. `run()` returns after every attempt in flight has ended. **PAUSE_BUYS** is read again right before each
   buy build, with nothing awaited in between, and after the recheck read of a long-built job's probe and of a failed
   job's final check.

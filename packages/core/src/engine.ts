@@ -459,7 +459,16 @@ export class Engine {
    */
   private pump(): void {
     if (!this.running || this.shouldStop()) return;
-    for (const a of this.d.executor.startDue({ shouldStop: this.shouldStop, settleEveryMs: this.d.cfg.loopMs })) void a.then(() => setImmediate(() => this.pump()));
+    // Never throws: it is called outside any guard (the exit tick, a booking, a setImmediate after an attempt). A
+    // ledger error in a claim (SQLITE_BUSY, a full disk) is logged and alerted; what was due stays due for the next
+    // pump, and an order whose claim went through but whose attempt could not start is handed back (startDue).
+    try {
+      for (const a of this.d.executor.startDue({ shouldStop: this.shouldStop, settleEveryMs: this.d.cfg.loopMs })) void a.then(() => setImmediate(() => this.pump()));
+    } catch (e) {
+      const why = String((e as Error)?.message ?? e).slice(0, 200);
+      this.d.log.error("pump_failed", { error: String((e as Error)?.stack ?? e) });
+      this.d.alerter.raise("engine:pump_failed", `order attempts could not be started (${why}); retried on the next tick`);
+    }
   }
 
   /**

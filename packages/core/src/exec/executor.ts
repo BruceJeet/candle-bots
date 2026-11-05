@@ -237,7 +237,19 @@ export class Executor {
    * runOne's own last-resort handler can still throw (a ledger write that fails), and nobody awaits a started attempt.
    */
   private track(o: OrderRow, run: () => Promise<void>, kind: "buy" | "sell" | "settle" = o.side): Promise<void> {
-    const mint = this.d.ledger.position(o.position_id)!.mint;
+    let mint: string;
+    try {
+      mint = this.d.ledger.position(o.position_id)!.mint;
+    } catch (e) {
+      // The claim went through but the attempt cannot start: hand the order back now (best effort; if the ledger is
+      // down too, its lease runs out and the next claim takes it, as after a crash), then let the caller see the error.
+      try {
+        this.d.ledger.updateOrder(o.id, { status: "pending", lease_until: 0 });
+      } catch {
+        /* the lease covers it */
+      }
+      throw e;
+    }
     this.busy.set(mint, "attempt");
     this.epochs.set(mint, this.mintEpoch(mint) + 1);
     const done = Promise.resolve()
