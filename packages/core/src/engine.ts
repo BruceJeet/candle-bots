@@ -1384,10 +1384,6 @@ export class Engine {
   }
 
   /**
-   * The `sell` command's path: same clamp, same executor. Moves an exit_stuck position back to open. (0.3.0) Holds the
-   * coin for the whole request (the reopen scan, the balance read, the booking): no attempt on it runs meanwhile.
-   */
-  /**
    * (0.4.0) Open a position from a buy this engine did not place (a launch's dev buy; later, an adopted bag): the
    * quantity and cost are read from the transaction on chain (the wallet's token and SOL deltas, network fee and rent
    * apart), never from an API's number. The position is booked with a filled buy order (`fill-<signature>`) so the
@@ -1439,6 +1435,10 @@ export class Engine {
     return { ok: true, positionId: pid, qtyRaw: fill.tokenDeltaRaw, costLamports: cost };
   }
 
+  /**
+   * The `sell` command's path: same clamp, same executor. Moves an exit_stuck position back to open. (0.3.0) Holds the
+   * coin for the whole request (the reopen scan, the balance read, the booking): no attempt on it runs meanwhile.
+   */
   async manualSell(mint: string, fraction: number): Promise<string> {
     if (!this.d.executor.reserveMint(mint)) return "an order attempt on this coin is in flight; try again";
     try {

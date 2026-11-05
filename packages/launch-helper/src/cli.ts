@@ -1,6 +1,8 @@
 /** The command line: plan, run, status, sell. */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { CandleClient } from "@candledottv/agent-sdk";
+import { timedFetch } from "candle-bot-core/exec/trader";
 import { args, context as coreContext, die, guardMain, parts, run, sell, status, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { loadConfig, ConfigError, type Config } from "./config.ts";
 import { Ledger } from "./ledger.ts";
@@ -33,11 +35,17 @@ function context(configPath: string, modeOverride?: string): Ctx {
 
 async function makeEngine(ctx: Ctx, ledger: Ledger) {
   const { strategy, alerter, executor } = await parts(ctx, ledger, { maxBuyImpactBps: 10_000 });
-  // Live: Candle's client (the API key's). Dry: none, so nothing can be built or sent.
-  const client = ctx.cfg.mode === "live" ? (ctx.client as unknown as LaunchClient) : null;
+  // Live: Candle's client for the launch calls, with a longer timeout than trades (a submit can take ~160 s and a
+  // same-id rebuild ~95 s, per the SDK). Dry: none, so nothing can be built or sent.
+  const apiKey = process.env[ctx.cfg.apiKeyEnv];
+  if (ctx.cfg.mode === "live" && !apiKey) die(`${ctx.cfg.apiKeyEnv} is not set (the Candle API key)`);
+  const client = ctx.cfg.mode === "live" ? (new CandleClient({ apiUrl: ctx.cfg.apiUrl, apiKey, fetch: timedFetch(LAUNCH_TIMEOUT_MS) }) as unknown as LaunchClient) : null;
   const engine = new Engine({ cfg: ctx.cfg, ledger, client, executor, strategy, rpc: ctx.rpc, log: ctx.log, alerter });
   return { engine, trigger: engine.trigger };
 }
+
+/** Longest a launch call may take (the SDK: a submit up to ~160 s). */
+export const LAUNCH_TIMEOUT_MS = 180_000;
 
 const openLedger = (ctx: Ctx) => () => new Ledger(join(ctx.cfg.stateDir, "ledger.sqlite"));
 

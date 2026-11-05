@@ -201,7 +201,9 @@ export class Launcher {
     } catch (e) {
       const i = errorInfo(e);
       // Candle's own non-retryable 4xx with nothing staged: refused, nothing built. Anything else may have begun.
-      if (i.candle && !i.retryable && (i.status ?? 0) >= 400 && (i.status ?? 0) < 500 && !i.stage && i.code !== "IDEMPOTENCY_CONFLICT") {
+      // Only on the first build of this id: after a retry an earlier attempt may have been sent (and landed), and a
+      // 409 may be Candle still resolving one. Those read the job instead.
+      if (row.attempts === 0 && i.candle && !i.retryable && (i.status ?? 0) >= 400 && (i.status ?? 0) < 500 && i.status !== 409 && !i.stage && i.code !== "IDEMPOTENCY_CONFLICT") {
         this.d.ledger.updateLaunch(row.id, { state: "refused", error: `build refused: ${i.code}`, updated_at: this.now() });
         this.d.log.warn("launch_refused", { clientLaunchId: row.client_launch_id, code: i.code, status: i.status });
         return;
@@ -259,7 +261,15 @@ export class Launcher {
 
   private async reconcile(row: LaunchRow): Promise<void> {
     const client = this.d.client;
-    if (!client || this.now() - this.jobReadAt < JOB_READ_MS) return;
+    if (!client) return;
+    // The operator may ask for a build under the SAME id while unresolved: Candle resolves the first attempt before
+    // anything new (it answers 409 while that is open, which comes back here).
+    if (this.retryAsked()) {
+      this.d.log.info("launch_retry", { clientLaunchId: row.client_launch_id, from: "unresolved" });
+      this.d.ledger.updateLaunch(row.id, { state: "new", error: null, updated_at: this.now() });
+      return this.build(this.row()!).then(() => undefined);
+    }
+    if (this.now() - this.jobReadAt < JOB_READ_MS) return;
     this.jobReadAt = this.now();
     if (this.now() - row.updated_at > this.d.cfg.launch.unresolvedAlertMin * 60_000)
       this.d.alerter.raise("launch:unresolved", `launch ${row.client_launch_id} (bundle ${row.bundle_id ?? "none"}) unresolved since ${new Date(row.updated_at).toISOString()} (${row.error ?? ""}); no new launch is sent. Report the clientLaunchId to whoever operates the key.`);
@@ -270,11 +280,8 @@ export class Launcher {
       const i = errorInfo(e);
       if (i.code === "JOB_NOT_FOUND") {
         // The build never began on Candle's side. Rebuilding under the same id is safe, but this bot never builds on its
-        // own after an error: it waits for RETRY_LAUNCH.
-        if (this.retryAsked()) {
-          this.d.log.info("launch_retry", { clientLaunchId: row.client_launch_id, from: "unresolved (job not found)" });
-          this.d.ledger.updateLaunch(row.id, { state: "new", error: null, updated_at: this.now() });
-        } else this.d.log.info("launch_job_not_found", { clientLaunchId: row.client_launch_id });
+        // own after an error: it waits for RETRY_LAUNCH (read at the top of the next reconcile).
+        this.d.log.info("launch_job_not_found", { clientLaunchId: row.client_launch_id });
         return;
       }
       this.d.log.warn("launch_job_read_failed", { clientLaunchId: row.client_launch_id, code: i.code });
@@ -308,11 +315,24 @@ export class Launcher {
       this.d.alerter.raise("launch:dev_buy_unknown", `launch ${row.client_launch_id} landed (${row.mint}) but its dev-buy transaction is not known yet; the bag is not managed until it is`);
       return;
     }
-    const r = await this.d.openFromFill({ mint: row.mint, signature: sig, decimals: DECIMALS, reason: "dev buy", entry: { launch: row.client_launch_id, mint: row.mint, from: "dev buy" }, expectedQtyRaw: row.expected_out_raw ? BigInt(row.expected_out_raw) : null });
+    const r = await this.d.openFromFill({ mint: row.mint, signature: sig, decimals: DECIMALS, reason: "dev buy", entry: { launch: row.client_launch_id, mint: row.mint, from: "dev buy" }, expectedQtyRaw: row.expected_out_raw && /^\d+$/.test(row.expected_out_raw) ? BigInt(row.expected_out_raw) : null });
     if (r.ok) {
       this.d.ledger.updateLaunch(row.id, { state: "open", position_id: r.positionId, updated_at: this.now() });
       this.d.log.info("dev_bag_open", { clientLaunchId: row.client_launch_id, mint: row.mint, position: r.positionId, qtyRaw: r.qtyRaw, costLamports: r.costLamports });
       return;
+    }
+    if (r.reason === "no_tokens" && this.d.client) {
+      // The stored signature gave the wallet no tokens (maybe the launch leg): take the job's dev-buy signature.
+      try {
+        const js = (await this.d.client.getLaunchJob(row.client_launch_id)).devBuy?.signature ?? null;
+        if (js && js !== sig) {
+          this.d.ledger.updateLaunch(row.id, { dev_buy_signature: js, updated_at: this.now() });
+          this.d.log.warn("dev_buy_signature_replaced", { clientLaunchId: row.client_launch_id, was: sig, now: js });
+          return;
+        }
+      } catch {
+        /* the next cycle reads again */
+      }
     }
     this.bagTries++;
     if (this.bagTries % 10 === 0 || r.reason !== "tx_not_found") this.d.alerter.raise("launch:dev_bag", `launch ${row.client_launch_id}: the dev buy ${sig} could not be booked (${r.reason}); read again next cycle`);
