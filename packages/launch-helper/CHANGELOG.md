@@ -1,5 +1,9 @@
 # Changelog: candle-launch-helper
 
+## Unreleased
+
+- Pins candle-bot-core 0.6.0 (batch 3: opt-in additions only; no change in this package).
+
 ## 0.1.1
 
 - On candle-bot-core 0.5.0 (pinned exactly). Same CLI, config, state dir, ledger, `status.json` fields, events and

@@ -1,8 +1,8 @@
 # Changelog: candle-bot-core
 
-## 0.5.0 (batch 3 additions, unreleased)
+## 0.6.0 (unreleased)
 
-Opt-in; nothing changes for an existing bot.
+Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 state.)
 
 - **A price and volume series per coin**, in `sources/series`: 1 min bars, with gaps as unknown and bounded memory.
   - `sources/logsSeries` reads volume from pump.fun and PumpSwap trade logs, one subscription per coin on one

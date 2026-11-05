@@ -1,5 +1,9 @@
 # Changelog: candle-profit-sweeper
 
+## Unreleased
+
+- Pins candle-bot-core 0.6.0 (batch 3: opt-in additions only; no change in this package).
+
 ## 0.1.0
 
 First release, on candle-bot-core 0.5.0 (pinned exactly).

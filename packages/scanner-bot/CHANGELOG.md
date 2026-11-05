@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-First release, on candle-bot-core 0.5.0 (pinned exactly).
+First release, on candle-bot-core 0.6.0 (pinned exactly).
 
 - Watch-only: no wallet, no API key, no executor. A config with a wallet, a key or a trading section is refused.
 - **Watchlist:** a list of coins and/or a Candle feed bucket (`new`, `graduated`, `onfire`, `bluechip`,
