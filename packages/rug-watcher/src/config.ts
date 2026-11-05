@@ -5,7 +5,7 @@
  */
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { parseConfig as parseCore, ConfigError, isObj, only, bool, num, strList, type Config as CoreConfig, type Obj, type SectionParser } from "candle-bot-core";
+import { parseConfig as parseCore, ConfigError, isObj, only, bool, num, strList, asAddress, type Config as CoreConfig, type Obj, type SectionParser } from "candle-bot-core";
 import { parseAdoption, type AdoptionConfig } from "candle-bot-core/adopt/adopter";
 
 export { ConfigError } from "candle-bot-core/config";
@@ -16,8 +16,10 @@ export interface Action {
   alertOnly: boolean;
 }
 export type WindowRule = Action & { dropPct: number; windowSec: number };
-export type DevRule = Action & { soldPct?: number; floorPct?: number };
-export type HolderRule = Action & { topN: number; soldPctOfSupply: number; windowSec: number };
+/** creators: a coin's creator wallet by hand, for coins whose launch transaction does not name it (see the README). */
+export type DevRule = Action & { soldPct?: number; floorPct?: number; creators: Record<string, string> };
+/** exclude: wallets never counted as large holders (an exchange, a locker that is a plain wallet). */
+export type HolderRule = Action & { topN: number; soldPctOfSupply: number; windowSec: number; exclude: string[] };
 
 export interface Rules {
   liquidityPull?: WindowRule;
@@ -64,21 +66,30 @@ const parseRules: SectionParser<Rules> = (raw) => {
   if (raw.devDump !== undefined) {
     const r = raw.devDump;
     if (!isObj(r)) throw new ConfigError(`${w}.devDump: an object`);
-    only(r, ["soldPct", "floorPct", "sell", "alertOnly"], `${w}.devDump`);
+    only(r, ["soldPct", "floorPct", "creators", "sell", "alertOnly"], `${w}.devDump`);
+    const creators: Record<string, string> = {};
+    const cr = r.creators === undefined ? {} : r.creators;
+    if (!isObj(cr)) throw new ConfigError(`${w}.devDump.creators: an object { "<mint>": "<creator wallet>" }`);
+    for (const [mint, who] of Object.entries(cr)) {
+      if (asAddress(mint) !== mint) throw new ConfigError(`${w}.devDump.creators: "${mint}" is not a mint address`);
+      if (typeof who !== "string" || asAddress(who) !== who) throw new ConfigError(`${w}.devDump.creators.${mint}: a wallet address`);
+      creators[mint] = who;
+    }
     const soldPct = r.soldPct === undefined ? undefined : num(r, "soldPct", `${w}.devDump`, { min: 1, max: 100 });
     const floorPct = r.floorPct === undefined ? undefined : num(r, "floorPct", `${w}.devDump`, { min: 0.0001, max: 100 });
     if (soldPct === undefined && floorPct === undefined) throw new ConfigError(`${w}.devDump: set soldPct, floorPct or both`);
-    out.devDump = { ...(soldPct !== undefined ? { soldPct } : {}), ...(floorPct !== undefined ? { floorPct } : {}), ...action(r, `${w}.devDump`) };
+    out.devDump = { ...(soldPct !== undefined ? { soldPct } : {}), ...(floorPct !== undefined ? { floorPct } : {}), creators, ...action(r, `${w}.devDump`) };
     checkAction(out.devDump, `${w}.devDump`);
   }
   if (raw.holderExit !== undefined) {
     const r = raw.holderExit;
     if (!isObj(r)) throw new ConfigError(`${w}.holderExit: an object`);
-    only(r, ["topN", "soldPctOfSupply", "windowSec", "sell", "alertOnly"], `${w}.holderExit`);
+    only(r, ["topN", "soldPctOfSupply", "windowSec", "exclude", "sell", "alertOnly"], `${w}.holderExit`);
     out.holderExit = {
       topN: num(r, "topN", `${w}.holderExit`, { min: 1, max: 20, int: true, def: 10 }),
       soldPctOfSupply: num(r, "soldPctOfSupply", `${w}.holderExit`, { min: 0.01, max: 100 }),
       windowSec: num(r, "windowSec", `${w}.holderExit`, { min: 10, max: 86_400, int: true, def: 600 }),
+      exclude: strList(r, "exclude", `${w}.holderExit`, { def: [], address: true })!,
       ...action(r, `${w}.holderExit`),
     };
     checkAction(out.holderExit, `${w}.holderExit`);

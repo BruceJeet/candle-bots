@@ -64,7 +64,9 @@ export class HolderPoller implements HolderSource {
 
   async snapshot(mint: string): Promise<HolderSnapshot> {
     const largest = await this.rpc.call<any>("getTokenLargestAccounts", [mint, { commitment: "confirmed" }]);
-    const rows: Array<{ address: string; amount: string }> = Array.isArray(largest?.value) ? largest.value : [];
+    // A malformed answer is a failed read (unknown), never "nobody holds it": the rules would read every holder as gone.
+    if (!Array.isArray(largest?.value)) throw new Error("holder largest accounts: bad response");
+    const rows: Array<{ address: string; amount: string }> = largest.value;
     const unknown = rows.map((r) => r.address).filter((a) => typeof a === "string" && !this.owners.has(a));
     if (unknown.length) {
       const r = await this.rpc.call<any>("getMultipleAccounts", [unknown, { encoding: "jsonParsed", commitment: "confirmed" }]);
