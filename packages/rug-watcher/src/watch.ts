@@ -256,15 +256,18 @@ export class RugWatch {
    * seen (from that source) is stale: read once more, then "stale" (unknown: no verdict, and not a failed read).
    */
   private async balance(owner: string, p: PositionRow, st: CoinState, confirm = false): Promise<BalanceAt | "stale" | null> {
-    const h = confirm ? (this.d.confirmHolders ?? this.d.holders) : this.d.holders;
+    // A confirm RPC of its own keeps its own slot history; without one, confirming reads go to the same node(s) and
+    // share the main history.
+    const own = confirm && !!this.d.confirmHolders;
+    const h = own ? this.d.confirmHolders! : this.d.holders;
     const tol = this.d.cfg.watch.slotTolerance;
     for (let i = 0; i < 2; i++) {
       const r = h.balanceAt ? await h.balanceAt(owner, p.mint) : await h.balanceOf(owner, p.mint).then((a) => (a === null ? null : { amount: a, slot: null }));
       if (!r) return null;
       if (r.slot === null) return r;
-      const last = confirm ? st.lastSlotConfirm : st.lastSlot;
+      const last = own ? st.lastSlotConfirm : st.lastSlot;
       if (r.slot < last - tol) continue;
-      if (confirm) st.lastSlotConfirm = Math.max(st.lastSlotConfirm, r.slot);
+      if (own) st.lastSlotConfirm = Math.max(st.lastSlotConfirm, r.slot);
       else st.lastSlot = Math.max(st.lastSlot, r.slot);
       return r;
     }
