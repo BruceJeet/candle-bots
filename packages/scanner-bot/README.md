@@ -55,7 +55,8 @@ only.
 - By default a rule does not fire on bars with a gap (`rules.allowIncomplete: false`). When it does, the alert says
   `[incomplete]`.
 - **`feedVolume`** uses the Candle feed's own rolling 5 min USD value, and says so in the alert. That value is coarse:
-  each window has its own observed time, and windows can disagree with each other.
+  windows can disagree with each other, and the feed gives no observed time for its 5 min and 1 h windows (the row's
+  update time is used). About 6 in 10 `onfire` rows carried a 5 min volume when checked.
 
 ## Rules
 

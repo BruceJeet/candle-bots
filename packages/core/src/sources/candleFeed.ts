@@ -6,6 +6,9 @@
  * per-field `marketObservedAt`; an incremental `since_seq` cursor (changed rows plus `removed`; `reset: true` means
  * replace what you hold). Many rows carry no volume.
  *
+ * Observed times: `marketObservedAt` covers price, market cap, volume24h, change1h and change24h (on most rows, not all);
+ * `volume5m` and `volume1h` have none, so their time is the row's `updatedAt`.
+ *
  * What this source keeps: per coin, each window's value WITH its own observed time, labelled `candle-feed` and never
  * complete. Windows are never mixed (a 1 h value is not a bar, and never folded with the 24 h one). It does not write
  * bars. A 503 (`FEED_UNAVAILABLE`, after a server restart) or any failed poll is an outage: alerted, backed off, and the
@@ -63,7 +66,8 @@ export interface CandleFeedOptions {
   alertAfter?: number;
 }
 
-const FIELDS = ["symbol", "launchpad", "buckets", "volume5m", "volume1h", "volume24h", "priceUsd", "priceChange5m", "buyCount5m", "sellCount5m", "liquidityUsd", "marketCap", "marketObservedAt", "updatedAt"];
+// Full rows, no `fields=`: the feed refuses `buckets` and `marketObservedAt` as selectable fields (HTTP 400, checked
+// Nov 5 2026), and the per-window observed times are what this source keeps. A full onfire answer was about 124 KB.
 
 export class CandleFeed {
   private d: CandleFeedDeps;
@@ -123,7 +127,7 @@ export class CandleFeed {
 
   private async pollBucket(b: FeedBucket): Promise<void> {
     const f = this.d.fetch ?? fetch;
-    const q = new URLSearchParams({ bucket: b, fields: FIELDS.join(","), limit: "500" });
+    const q = new URLSearchParams({ bucket: b, limit: "500" });
     if (this.o.where) q.set("where", JSON.stringify(this.o.where));
     const cur = this.cursors.get(b);
     if (cur) q.set("since_seq", cur);
