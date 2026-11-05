@@ -436,6 +436,20 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
 - **One websocket carries every coin** (`solana/logs-multi`), up to `maxSubscriptions` (default 50; a probe on the
   public RPC held 100). Coins past the cap are a gap, and alerted.
 - Candle curve and DAMM v2 coins have no trade-log source in this version: price only, and their volume is a gap.
+- **Which events count:** a trade event counts only from its own program's frame in the log's invoke stack: pump for
+  `TradeEvent`, PumpSwap for `BuyEvent`/`SellEvent`. A line any other program logs is ignored, and a stack the log
+  cannot account for (a depth mismatch, `Log truncated`) ends reading for that transaction. The log copy of each
+  event is used; pump's self-CPI copy of the same event is ignored.
+- **Liveness:**
+  - A stall (no message, not even a ping reply, for 90 s) is a gap from the last message, and the socket is rebuilt
+    at once.
+  - A notification more than `maxSlotLag` slots (default 150) behind the chain, judged against a `getSlot` read every
+    30 s, puts every coin in a gap until notifications catch up.
+  - A coin is in a `resolving` gap until its venue is read.
+  - A refused or unconfirmed subscription is retried with backoff and alerted after 3 failures in a row.
+- **Times:** a trade is placed in the bar of the moment it was received, not its block time (usually seconds apart,
+  more under a lag, which is then a gap). While a coin moves from its curve to its pool, the market read says
+  `migrating` and the coin has no log source (a gap) until the pool is found.
 
 `sources/candleFeed`, a `CandleFeed`:
 - It reads Candle's public market feed (`/api/v1/markets/feed`, no key): one or more of the buckets `new`,
@@ -444,11 +458,16 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
   observed time**, labelled `candle-feed` and never complete. It writes no bars, and never folds one window into
   another.
 - Failed polls (a 503 after a server restart included) back off and are alerted.
+- Times come from the feed only: a window's own `marketObservedAt`, else the row's `updatedAt`. The 5 m and 1 h
+  windows never have their own, so they take the row's time. A value with no time is stale and never fires. A full
+  page (500 rows) is alerted and the bucket is read in full next time.
 
 `sources/watchlist`, a `Watchlist`: which coins to watch.
 - **Sources:** a fixed list (never dropped), coins a bot pushes for a while, and a feed bucket (by 5 m volume), within
   one cap.
 - A feed coin leaves after `dropAfterMs` out of the feed.
+- **Hysteresis:** a feed coin enters within the top `maxFeedCoins`, and stays while it ranks within
+  `maxFeedCoins + feedMargin`, or for `minHoldMs`.
 - The cap is alerted when it leaves coins out.
 
 `market/indicators` (pure, on ended bars, each with `complete`): `fallFromHigh`, `riseFromLow`, `volumeVsBaseline`

@@ -85,6 +85,9 @@ repeat one. `rules.link` (default `https://alpha.candle.tv/token/{mint}`, `""` f
 - **Subscriptions:** one public-RPC socket held 100 per-coin subscriptions in a probe (Nov 2026), so the default
   `maxSubscriptions` is 50. Past it, coins are alerted and left out. A private RPC is the way to watch more.
 - **No backfill:** what was missed while disconnected stays a gap.
+- **Bar times are receive times,** not block times. A socket that falls more than `series.maxSlotLag` slots
+  (default 150) behind the chain turns every coin's bars incomplete, and is alerted.
+- **Only the trading program's own events count,** so a program logging look-alike events cannot fake volume.
 - **Server-side orders.** Candle's own price-triggered orders (`/trade/agent/orders`) are not used: the bots poll their
   series. A later version may.
 - **Solana only.**
