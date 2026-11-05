@@ -18,9 +18,10 @@ export type SignerConfig =
   /**
    * (0.5.0) The Candle CLI's own encrypted file store (credentials.enc, where the CLI keeps signers on a machine with no
    * OS keychain), read-only, with the CLI's keyring passphrase from `passphraseEnv`. `configDir`: the CLI's config
-   * folder (default $CANDLE_CONFIG_DIR, else ~/.config/candle).
+   * folder (default $CANDLE_CONFIG_DIR, else ~/.config/candle). `fingerprint` (CNDL-XXXX-XXXX-XXXX): pins the signer;
+   * required when Candle gives no signer quorum for the wallet.
    */
-  | { store: "candle-cli"; passphraseEnv: string; configDir?: string };
+  | { store: "candle-cli"; passphraseEnv: string; configDir?: string; fingerprint?: string };
 
 export type Payer = "linked" | "embedded";
 
@@ -184,10 +185,11 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
       only(s, ["store", "pemEnv"], "config.signer");
       signer = { store, pemEnv: str(s, "pemEnv", "config.signer", { re: ENV_NAME })! };
     } else if (store === "candle-cli") {
-      only(s, ["store", "passphraseEnv", "configDir"], "config.signer");
+      only(s, ["store", "passphraseEnv", "configDir", "fingerprint"], "config.signer");
       const configDir = str(s, "configDir", "config.signer", { optional: true });
+      const fingerprint = str(s, "fingerprint", "config.signer", { optional: true, re: /^CNDL-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/ });
       if (configDir !== undefined && configDir.startsWith("~")) throw new ConfigError("config.signer.configDir: an absolute or config-relative path (a leading ~ is not expanded)");
-      signer = { store, passphraseEnv: str(s, "passphraseEnv", "config.signer", { re: ENV_NAME })!, ...(configDir !== undefined ? { configDir: resolve(baseDir, configDir) } : {}) };
+      signer = { store, passphraseEnv: str(s, "passphraseEnv", "config.signer", { re: ENV_NAME })!, ...(configDir !== undefined ? { configDir: resolve(baseDir, configDir) } : {}), ...(fingerprint !== undefined ? { fingerprint } : {}) };
     } else throw new ConfigError('config.signer.store: "keychain", "file", "env" or "candle-cli"');
   }
   const payer = str(raw, "payer", "config", { def: "linked" }) as Payer;

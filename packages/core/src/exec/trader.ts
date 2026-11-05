@@ -19,10 +19,10 @@ import { spawn } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { b58encode } from "../solana/base58.ts";
 import { addSecret } from "../redact.ts";
-import { readCliEntry } from "./cliStore.ts";
+import { CliStoreError, cliFingerprint, readCliEntry } from "./cliStore.ts";
 import type { Config } from "../config.ts";
 
 export interface TradeRail {
@@ -199,10 +199,10 @@ export class CandleCliSignerStore implements SecretStore {
   private exec: ExecFn;
   private backend: "security" | "secret-tool" | "file";
   private configPath: string;
-  private file: { credentialsPath: string; passphrase: string } | null;
+  private file: { credentialsPath: string; passphrase: string; fingerprint?: string } | null;
   private keySigner: { linkedWalletId: string; keyPrefix: string; quorumId: string | null } | null = null;
 
-  constructor(opts: { exec?: ExecFn; backend?: "security" | "secret-tool"; configPath?: string; file?: { credentialsPath: string; passphrase: string } } = {}) {
+  constructor(opts: { exec?: ExecFn; backend?: "security" | "secret-tool"; configPath?: string; file?: { credentialsPath: string; passphrase: string; fingerprint?: string } } = {}) {
     this.exec = opts.exec ?? execFile;
     this.file = opts.file ?? null;
     this.backend = this.file ? "file" : opts.backend ?? (process.platform === "darwin" ? "security" : "secret-tool");
@@ -228,23 +228,33 @@ export class CandleCliSignerStore implements SecretStore {
 
   async get(walletRef: string): Promise<string | null> {
     if (this.keySigner && walletRef === this.keySigner.linkedWalletId) {
+      const file = this.backend === "file";
+      // The file backend (candle-cli) says why it found no signer; the keychain backends keep their null.
+      const none = (why: string): null => {
+        if (file) throw new CliStoreError(why);
+        return null;
+      };
       let entries: any[] = [];
       try {
         entries = JSON.parse(readFileSync(this.configPath, "utf8"))?.keySigners?.entries ?? [];
-      } catch {
-        return null;
+      } catch (e) {
+        return none(`cannot read the Candle CLI's signer index ${this.configPath} (${(e as NodeJS.ErrnoException)?.code ?? "not JSON"})`);
       }
       const ks = this.keySigner;
-      const mine = entries.filter((e) => e && e.keyPrefix === ks.keyPrefix && (!ks.quorumId || e.signerQuorumId === ks.quorumId));
-      if (mine.length !== 1 || !/^[0-9a-f]{64}$/.test(String(mine[0].spkiSha256))) return null;
+      const pin = file ? this.file!.fingerprint : undefined;
+      // candle-cli: with no signer quorum from Candle, only a pinned fingerprint may pick the signer (never "the only one").
+      if (file && !ks.quorumId && !pin) return none(`Candle gave no signer quorum for wallet ${ks.linkedWalletId}; set signer.fingerprint (the CNDL-… of key ${ks.keyPrefix}'s signer) to pick it`);
+      const mine = entries.filter((e) => e && e.keyPrefix === ks.keyPrefix && (!ks.quorumId || e.signerQuorumId === ks.quorumId) && (!pin || (/^[0-9a-f]{64}$/.test(String(e.spkiSha256)) && cliFingerprint(e.spkiSha256) === pin)));
+      if (mine.length !== 1) return none(`${mine.length} signers for key ${ks.keyPrefix} in the CLI's index${ks.quorumId ? ` with quorum ${ks.quorumId}` : ""}${pin ? ` and fingerprint ${pin}` : ""}; exactly one is needed`);
+      if (!/^[0-9a-f]{64}$/.test(String(mine[0].spkiSha256))) return none(`the CLI's index entry for key ${ks.keyPrefix} has no valid spkiSha256`);
       const stored = await this.read(`key_signer_${ks.keyPrefix}_${mine[0].spkiSha256}`);
-      if (!stored) return null;
-      const pem = toPem(stored);
+      if (!stored) return none(`no key_signer entry for key ${ks.keyPrefix} (${cliFingerprint(mine[0].spkiSha256)}) in the CLI's store`);
       addSecret(stored);
+      const pem = toPem(stored);
       // Every PEM line too (as the env store does): a line quoted alone in an error is masked as well.
       for (const line of pem.split(/\s+/)) if (line.length >= 16 && !line.startsWith("-----")) addSecret(line);
       const spki = createPublicKey(pem).export({ type: "spki", format: "der" });
-      if (createHash("sha256").update(spki).digest("hex") !== mine[0].spkiSha256) throw new Error("key signer in the keychain does not match the CLI's index");
+      if (createHash("sha256").update(spki).digest("hex") !== mine[0].spkiSha256) throw new Error(`key signer in the ${file ? "CLI's file store" : "keychain"} does not match the CLI's index`);
       return pem;
     }
     const stored = await this.read(`wallet_signer_${walletRef}`);
@@ -266,7 +276,7 @@ export class CandleCliSignerStore implements SecretStore {
 
 /** The Candle CLI's config folder for a `candle-cli` signer: configDir, else $CANDLE_CONFIG_DIR, else ~/.config/candle. */
 export function cliConfigDir(s: { configDir?: string }, env: NodeJS.ProcessEnv = process.env): string {
-  return s.configDir ?? (env.CANDLE_CONFIG_DIR?.trim() || join(homedir(), ".config", "candle"));
+  return s.configDir ?? resolve(env.CANDLE_CONFIG_DIR?.trim() || join(homedir(), ".config", "candle"));
 }
 
 export async function makeSecretStore(cfg: Config, w: ResolvedWallet, env: NodeJS.ProcessEnv = process.env): Promise<SecretStore> {
@@ -276,9 +286,16 @@ export async function makeSecretStore(cfg: Config, w: ResolvedWallet, env: NodeJ
   if (s.store === "candle-cli") {
     const pass = env[s.passphraseEnv];
     if (!pass) throw new Error(`signer.passphraseEnv: ${s.passphraseEnv} is not set`);
+    // Short values are not registered for redaction (redact.ts): refused rather than left unmasked.
+    if (pass.length < 8) throw new Error(`signer.passphraseEnv: ${s.passphraseEnv} is shorter than 8 characters`);
     addSecret(pass);
     const dir = cliConfigDir(s, env);
-    return new CandleCliSignerStore({ configPath: join(dir, "config.json"), file: { credentialsPath: join(dir, "credentials.enc"), passphrase: pass } }).forTeeWallet(w.linkedWalletId, w.keyPrefix, w.signerQuorumId);
+    // Loaded and checked ONCE, at start: the SDK asks the store on every signature, and a CLI command mid-run (a new
+    // signer, a rewrite of config.json) must never make a stop-loss fail. The checked key is kept in memory.
+    const pem = await new CandleCliSignerStore({ configPath: join(dir, "config.json"), file: { credentialsPath: join(dir, "credentials.enc"), passphrase: pass, ...(s.fingerprint ? { fingerprint: s.fingerprint } : {}) } }).forTeeWallet(w.linkedWalletId, w.keyPrefix, w.signerQuorumId).get(w.linkedWalletId);
+    const m = new InMemorySecretStore();
+    if (pem) await m.set(w.linkedWalletId, pem);
+    return m;
   }
   if (s.store === "file") {
     const pass = env[s.passphraseEnv];

@@ -20,7 +20,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { CandleCliSignerStore, cliConfigDir } from "candle-bot-core/exec/trader";
 import { cliFingerprint } from "candle-bot-core/exec/cliStore";
-import { redact } from "candle-bot-core/redact";
+import { addSecret, redact } from "candle-bot-core/redact";
 
 export interface CheckResult {
   ok: boolean;
@@ -66,12 +66,13 @@ export async function check(opts: { keyPrefix: string; quorum?: string; configDi
   out.indexFingerprint = typeof entry.fingerprint === "string" ? entry.fingerprint : null;
   const pass = env[opts.passphraseEnv];
   if (!pass) return { ...out, failure: `${opts.passphraseEnv} is not set` };
+  addSecret(pass);
   const store = new CandleCliSignerStore({ configPath: join(dir, "config.json"), file: { credentialsPath: join(dir, "credentials.enc"), passphrase: pass } }).forTeeWallet("signer-check", opts.keyPrefix, entry.signerQuorumId ?? null);
   let pem: string | null;
   try {
     pem = await store.get("signer-check");
   } catch (e) {
-    return { ...out, failure: redact(String((e as Error).message)).replace(pass, "***") };
+    return { ...out, failure: redact(String((e as Error).message)).split(pass).join("***") };
   }
   if (!pem) return { ...out, failure: `no signer entry for key ${opts.keyPrefix} in ${join(dir, "credentials.enc")}` };
   const pub = createPublicKey(createPrivateKey(pem));
