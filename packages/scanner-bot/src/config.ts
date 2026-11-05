@@ -21,6 +21,8 @@ export interface SeriesSection {
   maxSubscriptions: number;
   /** Bars kept per coin (1 min each). */
   maxBars: number;
+  /** A trade notification more than this many slots behind the chain marks the bars incomplete (about 400 ms a slot). */
+  maxSlotLag: number;
 }
 
 interface Cooldown {
@@ -60,10 +62,11 @@ const parseWatchlist: SectionParser<WatchlistSection> = (raw) => {
 const parseSeries: SectionParser<SeriesSection> = (raw) => {
   const r = raw === undefined ? {} : raw;
   if (!isObj(r)) throw new ConfigError("config.series: an object");
-  only(r, ["maxSubscriptions", "maxBars"], "config.series");
+  only(r, ["maxSubscriptions", "maxBars", "maxSlotLag"], "config.series");
   return {
     maxSubscriptions: num(r, "maxSubscriptions", "config.series", { min: 1, max: 500, int: true, def: 50 }),
     maxBars: num(r, "maxBars", "config.series", { min: 10, max: 1440, int: true, def: 1440 }),
+    maxSlotLag: num(r, "maxSlotLag", "config.series", { min: 10, max: 100_000, int: true, def: 150 }),
   };
 };
 

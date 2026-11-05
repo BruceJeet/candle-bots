@@ -40,6 +40,10 @@ export interface LogsSeriesOptions {
   priceEveryMs?: number;
   /** How often each coin's venue is read again (a curve coin migrates to its pool). */
   venueEveryMs?: number;
+  /** How often the chain's slot is read (getSlot, the same RPC) to judge how far the socket lags. */
+  slotEveryMs?: number;
+  /** A notification more than this many slots behind the chain marks every coin's bars incomplete (about 400 ms a slot). */
+  maxSlotLag?: number;
 }
 
 /** Socket gap reasons, closed when the subscription is confirmed. */
@@ -65,14 +69,21 @@ export class LogsSeries implements SeriesSource {
   /** Coins with no trade-log source (venue -> why), alerted as one summary when the set changes. */
   private noSource = new Map<string, string>();
   private noSourceAlerted = "";
+  /** The chain's slot as last read, and when; the socket's lag state. */
+  private chainSlot: { slot: number; at: number } | null = null;
+  private slotReadAt = 0;
+  private behind = false;
 
   constructor(d: LogsSeriesDeps, o: LogsSeriesOptions = {}) {
     this.d = d;
     this.now = d.now ?? Date.now;
-    this.o = { maxSubscriptions: o.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS, maxCoins: o.maxCoins ?? 200, maxBars: o.maxBars ?? 1440, priceEveryMs: o.priceEveryMs ?? 5_000, venueEveryMs: o.venueEveryMs ?? 60_000 };
+    this.o = { maxSubscriptions: o.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS, maxCoins: o.maxCoins ?? 200, maxBars: o.maxBars ?? 1440, priceEveryMs: o.priceEveryMs ?? 5_000, venueEveryMs: o.venueEveryMs ?? 60_000, slotEveryMs: o.slotEveryMs ?? 30_000, maxSlotLag: o.maxSlotLag ?? 150 };
     this.store = d.store ?? new SeriesStore({ maxCoins: this.o.maxCoins, maxBars: this.o.maxBars, now: this.now });
     const handlers: MultiLogsHandlers = {
-      onLogs: (e) => this.onLogs(e.address, e.signature, e.err, e.logs),
+      onLogs: (e) => {
+        this.checkLag(e.slot);
+        this.onLogs(e.address, e.signature, e.err, e.logs);
+      },
       onGapStart: (a, reason, at) => {
         const m = this.mintOf.get(a);
         if (m) this.store.gapStart(m, reason.startsWith("subscription refused") ? "subscription refused" : reason, at);
@@ -145,6 +156,7 @@ export class LogsSeries implements SeriesSource {
     try {
       const coins = this.store.watched();
       if (!coins.length) return;
+      await this.readSlot();
       const markets = await readMarkets(this.d.rpc, coins.map((m) => ({ mint: m, decimals: this.d.decimalsOf?.(m) ?? 6 })), this.now(), { pump: true });
       for (const m of coins) {
         const r = markets.get(m);
@@ -192,6 +204,40 @@ export class LogsSeries implements SeriesSource {
         this.addrOf.set(mint, addr);
         this.mintOf.set(addr, mint);
       } else this.addrOf.delete(mint);
+    }
+  }
+
+  /** The chain's slot, every slotEveryMs (a failed read leaves the last one; no verdict without one). */
+  private async readSlot(): Promise<void> {
+    if (this.now() - this.slotReadAt < this.o.slotEveryMs) return;
+    this.slotReadAt = this.now();
+    try {
+      const v = await this.d.rpc.call<number>("getSlot", [{ commitment: "confirmed" }]);
+      if (typeof v === "number" && Number.isSafeInteger(v) && v > 0) this.chainSlot = { slot: v, at: this.now() };
+    } catch (e) {
+      this.d.log.warn("series_slot_unreadable", { error: String((e as Error)?.message ?? e).slice(0, 160) });
+    }
+  }
+
+  /**
+   * A notification's slot against the chain's (the last getSlot, moved on at about 400 ms a slot). Past maxSlotLag: the
+   * socket is behind, every coin's bars are incomplete until a notification comes in within the limit again.
+   */
+  private checkLag(slot: number): void {
+    if (!this.chainSlot || !(slot > 0)) return;
+    const est = this.chainSlot.slot + Math.floor((this.now() - this.chainSlot.at) / 400);
+    const lag = est - slot;
+    if (lag > this.o.maxSlotLag) {
+      if (!this.behind) {
+        this.behind = true;
+        this.store.gapStart(null, "socket behind chain");
+        this.d.alerter.raise("series:socket_behind", `trade-log socket is ${lag} slots behind the chain (limit ${this.o.maxSlotLag}, about ${Math.round((lag * 0.4))} s): every coin's bars are incomplete until it catches up`);
+        this.d.log.warn("series_socket_behind", { lag, slot, chainSlot: est });
+      }
+    } else if (this.behind) {
+      this.behind = false;
+      this.store.gapEnd(null, "socket behind chain");
+      this.d.log.info("series_socket_caught_up", { lag });
     }
   }
 
@@ -243,6 +289,6 @@ export class LogsSeries implements SeriesSource {
   }
 
   status(): Record<string, unknown> {
-    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, noTradeLogSource: Object.fromEntries(this.noSource) };
+    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, noTradeLogSource: Object.fromEntries(this.noSource) };
   }
 }
