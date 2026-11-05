@@ -414,6 +414,62 @@ transaction (paged, capped; on Candle often a payer wallet).
 It is a poll: lag is the interval plus about a second. A streamed source can replace it behind the same two calls
 (`HolderSource`: `snapshot`, `balanceOf`), keeping its own state.
 
+## A price and volume series per coin (opt-in)
+
+`sources/series`: a `SeriesStore` keeps 1 min bars per coin, at most `maxBars` (default 1440, 24 h) and `maxCoins`
+(default 200). A `SeriesSource` answers `series(mint)` with `{ bars, lastTick, gaps }`, plus `subscribe`,
+`unsubscribe` and `watched`. Give one to the engine as `EngineDeps.series`, and a trigger reads it as `ctx.series`.
+- **A bar is complete** only when its minute has ended, lies wholly inside the time the coin was watched, and no gap
+  touched it.
+- **A gap is unknown, never zero volume.** A gap is any of: a coin still subscribing, a reconnect, a subscription
+  refused or not confirmed, the subscription cap, the coin cap, a venue with no trade-log source, a coin not quoted in
+  SOL. A quiet minute with no gap is a true zero.
+- **Nothing is backfilled.** A bar from any later backfill would say `backfilled: true`.
+
+`sources/logsSeries`, a `LogsSeries` (a `SeriesSource`):
+- **Volume** comes from the trade events in each coin's own logs subscription: its pump.fun curve PDA, or its
+  canonical PumpSwap pool, at `confirmed` commitment. Failed transactions are dropped, and each transaction is counted
+  once.
+- **Price** comes from the core's market reads (the curve's and the pool's effective reserves).
+- **The PumpSwap pool-to-coin map** is built from the pool account (its base mint, quoted in WSOL), never from an
+  event.
+- **One websocket carries every coin** (`solana/logs-multi`), up to `maxSubscriptions` (default 50; a probe on the
+  public RPC held 100). Coins past the cap are a gap, and alerted.
+- Candle curve and DAMM v2 coins have no trade-log source in this version: price only, and their volume is a gap.
+
+`sources/candleFeed`, a `CandleFeed`:
+- It reads Candle's public market feed (`/api/v1/markets/feed`, no key): one or more of the buckets `new`,
+  `graduated`, `onfire`, `bluechip`, `finalstretch`, incrementally through `since_seq`.
+- It keeps each coin's rolling `volume5m` / `volume1h` / `volume24h` (USD) and `priceUsd`, **each with its own
+  observed time**, labelled `candle-feed` and never complete. It writes no bars, and never folds one window into
+  another.
+- Failed polls (a 503 after a server restart included) back off and are alerted.
+
+`sources/watchlist`, a `Watchlist`: which coins to watch.
+- **Sources:** a fixed list (never dropped), coins a bot pushes for a while, and a feed bucket (by 5 m volume), within
+  one cap.
+- A feed coin leaves after `dropAfterMs` out of the feed.
+- The cap is alerted when it leaves coins out.
+
+`market/indicators` (pure, on ended bars, each with `complete`): `fallFromHigh`, `riseFromLow`, `volumeVsBaseline`
+(ratio and z-score), `vwap`. `market/pumpEvents` (pure) decodes pump.fun `TradeEvent` and PumpSwap `BuyEvent` /
+`SellEvent` from `Program data:` log lines. `sources/replay`: `SeriesRecorder` writes snapshots, and `ReplaySeries` /
+`replay()` serve them back by time, so a rule can be run on a recording; the same recording gives the same decisions.
+
+## Watch-only bots
+
+`watch.ts`: `parseWatchConfig` takes the shared keys a watcher has (`mode: "watch"`, `apiUrl`, `rpcUrlEnv`,
+`rpcWsUrlEnv`, `stateDir`, `loopMs`, `alerts`) plus the bot's sections. **Every trading key is refused**:
+`wallet`, `apiKeyEnv`, `payer`, `signer`, `buy`, `sell`, `exit`, `retry` and the wallet ids. So a watch-only config
+can never trade.
+
+`runWatch` runs a `Watcher`'s `step()` every `loopMs`, with the lock, a ledger for alert dedupe, the alert sinks,
+`STOP`, signals and `status.json`. It builds no executor and no trade rail, and reads no key.
+
+**Alert sinks** (any bot, opt-in): `alerts.discordWebhookEnv`, posted as Discord messages; `alerts.telegram:
+{ botTokenEnv, chatIdEnv }`, posted through the Bot API. Besides those, there are the existing `webhookEnv` and
+`command`.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;
@@ -443,7 +499,7 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/alerts`, `/log`, `/redact`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.

@@ -1,5 +1,21 @@
 # Changelog: candle-bot-core
 
+## 0.5.0 (batch 3 additions, unreleased)
+
+Opt-in; nothing changes for an existing bot.
+
+- **A price and volume series per coin**, in `sources/series`: 1 min bars, with gaps as unknown and bounded memory.
+  - `sources/logsSeries` reads volume from pump.fun and PumpSwap trade logs, one subscription per coin on one
+    websocket (`solana/logs-multi`), and price from market reads.
+  - `sources/candleFeed` gives the Candle feed's rolling values, each window with its own observed time, never complete.
+  - `sources/watchlist` picks which coins to watch.
+  - `sources/replay` records and replays.
+- **Pure helpers:** `market/indicators` (fall from high, rise from low, volume against baseline, VWAP) and
+  `market/pumpEvents` (trade-event decoders, from the on-chain IDLs).
+- **`EngineDeps.series`**, exposed to a trigger as `ctx.series`.
+- **Watch-only bots** (`watch.ts`): a config that refuses every trading key, and `runWatch` (no executor, no key).
+- **Alert sinks** `discordWebhookEnv` and `telegram`; the `alerts` parser is exported (`parseAlerts`).
+
 ## 0.5.0
 
 New API for bots that manage bags they did not buy, and for pump.fun venues. Everything is opt-in: a 0.4.x bot works as
