@@ -58,10 +58,11 @@ When the dry run looks right, use a new `stateDir` for live, set your API key an
   rewritten whenever it differs from its row (a file left by a crash is corrected on the next look).
    - While the request is open, it is checked again on every look. If the unswept profit has fallen under the amount
      asked (a later loss), or the balance less the reserve has (the wallet spent it), or `sweep.home` has changed,
-     the request turns **STALE**. The file says `"stale": true` with a `doNotSend` line, and the alert says do not
+     the request turns **STALE** (also when the bot's own `wallet` changed). The file says `"stale": true` with a `doNotSend` line, and the alert says do not
      send it. Cancel it, and a new request with the right amount follows. If the balance recovers, it is announced
      again as it stands.
-2. You send that amount from the wallet to your home address, however you move funds from it.
+2. You send that amount from the wallet to your home address, however you move funds from it. Send exactly
+   `amountLamports`, and read the file again just before sending: it turns stale if the amount no longer holds.
 3. You close the request:
 
    ```sh
@@ -73,7 +74,11 @@ When the dry run looks right, use a new `stateDir` for live, set your API key an
    recorded as swept.
    - A signature that is not a signature, or one that pays elsewhere, is refused.
    - One not on chain yet is kept and looked at again every `everyMs`, at most 20 times, then dropped and alerted.
-   - Sent in parts: run `swept` once per transfer. The first closes the request; each later one adds to it.
+   - Sent in parts: run `swept` once per transfer. The first closes the request; each later one adds to it. If the
+     request closes short, the rest is not asked for on its own: the next request waits for new realized profit, and
+     then covers the rest too.
+   - A transaction with no block time from the RPC is kept and looked at again, never accepted unchecked. A request
+     of the other mode (dry against live) is refused.
    - A signature counts once, across all requests.
 4. `--unverified` closes it at the requested amount without a signature. `cancel <requestId>` closes it without
    counting it, so the same profit is asked for again.
@@ -93,7 +98,7 @@ candle-exit-manager's), a `buy` section is refused.
 
 | Key | Meaning |
 |---|---|
-| `sweep.home` | required: the one address profit is asked to go to, written out in full (base58). Never taken from anywhere else; never the bot's own wallet; logged in full at start |
+| `sweep.home` | required: the one address profit is asked to go to, written out in full (base58). Never taken from anywhere else; never the bot's own wallet, a program or token address, or an address off the ed25519 curve (a program-derived address); logged in full at start |
 | `sweep.reserveSol` | SOL the wallet keeps: a request never asks for more than the balance less this (default 0.05) |
 | `sweep.minSweepSol` | the smallest sweep asked for (default 0.05) |
 | `sweep.everyMs` | how often profit is looked at, and `swept`/`cancel` requests are read (default 60000) |

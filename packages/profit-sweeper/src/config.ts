@@ -8,6 +8,8 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { parseConfig as parseCore, ConfigError, isObj, only, bool, num, strList, asAddress, type Config as CoreConfig, type SectionParser } from "candle-bot-core";
 import { parseAdoption, type AdoptionConfig } from "candle-bot-core/adopt/adopter";
+import { onCurve } from "candle-bot-core/solana/pda";
+import { b58decode } from "candle-bot-core/solana/base58";
 
 export { ConfigError } from "candle-bot-core/config";
 
@@ -80,6 +82,8 @@ const parseSweep: SectionParser<Sweep> = (raw, core) => {
   if (typeof home !== "string" || asAddress(home) !== home) throw new ConfigError(`${w}.home: a full Solana address (base58, 32 bytes), written out in full`);
   if (home === core.wallet) throw new ConfigError(`${w}.home: is the bot's own wallet`);
   if (NEVER_HOME.has(home)) throw new ConfigError(`${w}.home: ${home} is a program or token address, not a wallet`);
+  // A program-derived address (off the ed25519 curve) has no private key: SOL sent there is held by a program.
+  if (!onCurve(b58decode(home))) throw new ConfigError(`${w}.home: ${home} is off the ed25519 curve (a program-derived address, not a wallet)`);
   const denyHomes = strList(raw, "denyHomes", w, { def: [], address: true })!;
   if (denyHomes.includes(home)) throw new ConfigError(`${w}.home: ${home} is in sweep.denyHomes`);
   return {

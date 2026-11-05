@@ -63,6 +63,8 @@ export const CREATOR_RETRY_MS = 3_600_000;
 export const MAX_SAMPLES = 600;
 /** A creator found on chain is looked up again this often (and once per run), in case the first answer was wrong. */
 export const CREATOR_RECHECK_MS = 6 * 3_600_000;
+/** A changed creator must be read again this much later, the same, before it replaces the stored one. */
+export const CREATOR_CONFIRM_MS = 60_000;
 
 export interface WatchDeps {
   cfg: Config;
@@ -101,8 +103,13 @@ interface CoinState {
   devConfirm: { due: number; parts: string[] } | null;
   /** When the windows were frozen for one of our open sells (0: not frozen). */
   frozenSince: number;
-  /** SOL our own fills took out of the pool since the window began: added back to pool samples. */
-  ownOutSol: number;
+  /** Our own fills on this position (time, SOL out): pool samples older than a fill are lowered by it. */
+  fills: Array<{ at: number; sol: number }>;
+  /** The last freeze (start, end), so the window keeps its reference through it. */
+  lastFreeze: { start: number; end: number } | null;
+  /** Stale answers in a row (polls whose reads came from a node behind). */
+  staleInARow: number;
+  staleThisPoll: boolean;
   /** The position's proceeds at the last sample (-1: not read yet). */
   proceedsSeen: bigint;
 }
@@ -114,6 +121,8 @@ export class RugWatch {
   private creatorMiss = new Map<string, number>();
   /** When a chain-found creator was last looked up again (per mint, this run). */
   private creatorChecked = new Map<string, number>();
+  /** A different creator read on a re-check, waiting for a second agreeing read. */
+  private creatorChange = new Map<string, { creator: string; at: number }>();
   /** Real elapsed time (ms) for the poll budget. */
   private clock: () => number;
 
@@ -130,7 +139,7 @@ export class RugWatch {
   private state(positionId: number): CoinState {
     let s = this.coins.get(positionId);
     if (!s) {
-      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0, lastSlot: 0, lastSlotConfirm: 0, devConfirm: null, frozenSince: 0, ownOutSol: 0, proceedsSeen: -1n };
+      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0, lastSlot: 0, lastSlotConfirm: 0, devConfirm: null, frozenSince: 0, fills: [], lastFreeze: null, staleInARow: 0, staleThisPoll: false, proceedsSeen: -1n };
       this.coins.set(positionId, s);
     }
     return s;
@@ -169,9 +178,10 @@ export class RugWatch {
       const filled = this.d.ledger.ordersFor(p.id).filter((o) => o.side === "sell" && o.status === "filled").length;
       if (st.filledSells >= 0 && filled !== st.filledSells) {
         // One of our sells filled since the last sample. Price: its impact is ours, the price window starts again. Pool:
-        // the SOL it took out is added back to every later sample, so a pull around our sell still shows.
+        // every sample from before the fill is lowered by the SOL it took out, so a pull around our sell still shows,
+        // and the credit is gone once those samples leave the window.
         st.price = [];
-        if (st.proceedsSeen >= 0n && proceeds > st.proceedsSeen) st.ownOutSol += Number(proceeds - st.proceedsSeen) / 1e9;
+        if (st.proceedsSeen >= 0n && proceeds > st.proceedsSeen) st.fills.push({ at: m.nowMs, sol: Number(proceeds - st.proceedsSeen) / 1e9 });
       }
       st.filledSells = filled;
       st.proceedsSeen = proceeds;
@@ -180,18 +190,25 @@ export class RugWatch {
       if (this.d.ledger.openOrderFor(p.id)) {
         if (!st.frozenSince) st.frozenSince = m.nowMs;
         if (m.nowMs - st.frozenSince < this.d.cfg.watch.freezeMaxSec * 1000) return;
-      } else st.frozenSince = 0;
+      } else if (st.frozenSince) {
+        st.lastFreeze = { start: st.frozenSince, end: m.nowMs };
+        st.frozenSince = 0;
+      }
+      // After a freeze, for one window length, the window reaches back to what it held when the freeze began: a pull
+      // inside a long freeze still has its reference.
+      const reach = (windowSec: number) => (st.lastFreeze && m.nowMs - st.lastFreeze.end < windowSec * 1000 ? st.lastFreeze.start - windowSec * 1000 : undefined);
       if (m.problem) return;
       if (m.venue !== st.venue) {
         // A migration moves the SOL from the curve to a pool: not a pull. Both windows start again on a new venue.
         st.venue = m.venue;
         st.price = [];
         st.liq = [];
-        st.ownOutSol = 0;
+        st.fills = [];
       }
       if (r.priceCrash && m.priceSol !== null && m.priceSol > 0) {
-        st.price = prune([...st.price, { at: m.nowMs, value: m.priceSol }], m.nowMs, r.priceCrash.windowSec).slice(-MAX_SAMPLES);
-        const trip = windowDrop(st.price, m.nowMs, r.priceCrash, "price", fmtPrice);
+        const from = reach(r.priceCrash.windowSec);
+        st.price = prune([...st.price, { at: m.nowMs, value: m.priceSol }], m.nowMs, r.priceCrash.windowSec, from).slice(-MAX_SAMPLES);
+        const trip = windowDrop(st.price, m.nowMs, r.priceCrash, "price", fmtPrice, from);
         if (trip) {
           this.fireSeq(p, "priceCrash", trip, r.priceCrash);
           st.price = st.price.slice(-1);
@@ -199,8 +216,13 @@ export class RugWatch {
       }
       const liq = m.quoteLiquidityLamports;
       if (r.liquidityPull && POOL_VENUES.has(m.venue) && typeof liq === "bigint") {
-        st.liq = prune([...st.liq, { at: m.nowMs, value: Number(liq) / 1e9 + st.ownOutSol }], m.nowMs, r.liquidityPull.windowSec).slice(-MAX_SAMPLES);
-        const trip = windowDrop(st.liq, m.nowMs, r.liquidityPull, `pool SOL (${m.venue})`, fmtSol);
+        const from = reach(r.liquidityPull.windowSec);
+        st.liq = prune([...st.liq, { at: m.nowMs, value: Number(liq) / 1e9 }], m.nowMs, r.liquidityPull.windowSec, from).slice(-MAX_SAMPLES);
+        const oldest = st.liq[0]?.at ?? m.nowMs;
+        st.fills = st.fills.filter((f) => f.at > oldest);
+        // Each sample less the SOL our fills took out after it (raw samples kept; nothing inflates the current value).
+        const adjusted = st.liq.map((x) => ({ at: x.at, value: x.value - st.fills.filter((f) => f.at > x.at).reduce((a, f) => a + f.sol, 0) }));
+        const trip = windowDrop(adjusted, m.nowMs, r.liquidityPull, `pool SOL (${m.venue})`, fmtSol, from);
         if (trip) {
           this.fireSeq(p, "liquidityPull", trip, r.liquidityPull);
           st.liq = st.liq.slice(-1);
@@ -233,9 +255,19 @@ export class RugWatch {
       }
       st.nextPollAt = now + this.d.cfg.watch.holdersPollMs;
       try {
+        st.staleThisPoll = false;
         const failed = await this.pollOne(p, st);
         // A dev trip waiting for its confirming read: poll this coin again when it is due.
         if (st.devConfirm) st.nextPollAt = Math.min(st.nextPollAt, st.devConfirm.due);
+        // Stale answers in a row: not failures, but a node that stays behind. Backed off (2x up to 16x, a pending
+        // confirm included) and alerted after HOLDER_FAIL_ALERT polls.
+        if (st.staleThisPoll) {
+          st.staleInARow++;
+          const later = now + this.d.cfg.watch.holdersPollMs * Math.min(2 ** st.staleInARow, 16);
+          st.nextPollAt = Math.max(st.nextPollAt, later);
+          if (st.devConfirm) st.devConfirm.due = Math.max(st.devConfirm.due, later);
+          if (st.staleInARow >= HOLDER_FAIL_ALERT) this.d.alerter.raise(`rug:${p.id}:reads_stale`, `rug watcher: reads of ${p.mint} (position ${p.id}) came from a node behind the newest seen ${st.staleInARow} polls in a row; the dev and holder rules wait for a fresh answer`);
+        } else st.staleInARow = 0;
         if (failed.length) throw new Error(failed.join("; "));
         st.holderFails = 0;
       } catch (e) {
@@ -272,6 +304,7 @@ export class RugWatch {
       return r;
     }
     this.d.log.info("rug_read_stale", { position: p.id, mint: p.mint, owner, confirm });
+    st.staleThisPoll = true;
     return "stale";
   }
 
@@ -285,6 +318,7 @@ export class RugWatch {
       if (snap.slot < st.lastSlot - this.d.cfg.watch.slotTolerance) {
         // Stale: no verdict from it this poll (not a failure: the next poll reads again).
         snapOk = false;
+        st.staleThisPoll = true;
         this.d.log.info("rug_read_stale", { position: p.id, mint: p.mint, what: "holder list", slot: snap.slot, newest: st.lastSlot });
       } else st.lastSlot = Math.max(st.lastSlot, snap.slot);
     }
@@ -406,8 +440,22 @@ export class RugWatch {
     }
     this.creatorChecked.set(mint, this.now());
     if (row && row.source !== "config") {
-      if (!found || found.creator === row.creator) return { wallet: row.creator };
-      this.d.alerter.raise(`rug:creator_changed:${mint}`, `rug watcher: the creator of ${mint} read again is ${found.creator}, not ${row.creator} as first read; using the new one, and its high starts again`);
+      if (!found || found.creator === row.creator) {
+        this.creatorChange.delete(mint);
+        return { wallet: row.creator };
+      }
+      // A different answer replaces the stored creator only when a second re-check, at least CREATOR_CONFIRM_MS later,
+      // gives the same one: a single wrong read (a lagging node) never moves the dev rule onto another wallet.
+      const pend = this.creatorChange.get(mint);
+      if (!pend || pend.creator !== found.creator) {
+        this.creatorChange.set(mint, { creator: found.creator, at: this.now() });
+        this.creatorChecked.set(mint, this.now() - CREATOR_RECHECK_MS + CREATOR_CONFIRM_MS);
+        this.d.log.info("rug_creator_differs", { mint, stored: row.creator, read: found.creator });
+        return { wallet: row.creator };
+      }
+      if (this.now() - pend.at < CREATOR_CONFIRM_MS) return { wallet: row.creator };
+      this.creatorChange.delete(mint);
+      this.d.alerter.raise(`rug:creator_changed:${mint}`, `rug watcher: the creator of ${mint} read again (twice, apart) is ${found.creator}, not ${row.creator} as first read; using the new one, and its high starts again`);
       this.d.ledger.db.prepare("delete from rug_dev where mint = ?").run(mint);
     }
     if (!found) {

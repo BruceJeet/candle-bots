@@ -71,22 +71,25 @@ details, and the section on sharing a wallet with other bots applies here word f
   read: the largest-accounts list can show only some of them.
 - **The watcher's own sells** (a rule's, or the `exit` strategy's):
   - While one is pending or in flight, both windows are frozen: no new sample, the highs kept. The freeze lasts at
-    most `watch.freezeMaxSec` (default 120 s); after that, sampling resumes.
+    most `watch.freezeMaxSec` (default 120 s); after that, sampling resumes. For one window length after a freeze,
+    the window still reaches back to what it held when the freeze began, so a pull inside a freeze longer than
+    `windowSec` still has its reference.
   - Once it fills, the price window starts again, so the crash rule measures from the price after that fill.
-  - The pool window carries on, with the SOL our sells took out added back to every later sample (their proceeds,
-    after fees, so a little less than they took). A pull during or around our own sell still shows; our sell alone
-    does not.
+  - The pool window carries on. Each sample from before one of our fills is lowered by the SOL that fill took out
+    (its proceeds, after fees, so a little less than it took). A pull during or around our own sell still shows; our
+    sell alone does not. The credit leaves with those samples, so it never inflates a later pull.
 - **`devDump` never fires on one read.** A second read, `rules.devDump.confirmAfterMs` later (default 5 s), must
   agree. With `watch.confirmRpcUrlEnv` set, it is made on that second node. A node whose index misses the account
   answers 0, and it has to be confirmed by a later read, ideally from another node.
 - **Stale answers.** An answer more than `watch.slotTolerance` slots (default 5) older than the newest seen for the
   coin is stale. It is read once more. If it is still stale it gives no verdict this poll, and it does not count as a
-  failed poll.
+  failed poll. Stale answers several polls in a row are backed off (2x up to 16x the interval) and alerted after three.
 - **Our own wallets.** If the creator is this bot's wallet, or one listed in `rules.devDump.ourWallets` (another bot's,
   a launch helper's), the dev rule is off for that coin and alerted once, because their own sells would read as the
   dev selling. Those wallets never count as large holders either.
-- **The creator is looked up again** once per run and every 6 hours when it came from chain. A changed answer is used,
-  alerted, and its high starts again.
+- **The creator is looked up again** once per run and every 6 hours when it came from chain. A different answer
+  replaces the stored creator only when a second re-check, at least a minute later, gives the same one. It is then
+  used, alerted, and its high starts again.
 
 Firings are kept in the ledger (`rug_events`): a restart never fires the same event again. A selling firing stays owed
 until a sell with its reason (`rug:<rule>#<event>`) has filled; a refused sell is retried on the engine's clock (and

@@ -133,6 +133,7 @@ export class Sweeper {
   body(r: SweepRow): Record<string, unknown> {
     return {
       requestId: r.request_id, dry: !!r.dry, wallet: r.wallet, home: r.home, amountSol: Number(r.amount_lamports) / 1e9, amountLamports: r.amount_lamports, reason: r.reason, createdAt: new Date(r.created_at).toISOString(), status: r.status,
+      send: "send exactly amountLamports; read this file again just before sending (it turns stale if the amount no longer holds)",
       ...(r.status === "pending" && r.stale_at !== null ? { stale: true, doNotSend: "this request no longer holds (profit or balance fell, or home changed); cancel it and a new one is made" } : {}),
       ...(r.status === "done" ? { sentLamports: r.done_amount_lamports, signatures: this.transfers(r.request_id).map((t) => t.signature) } : {}),
     };
@@ -190,7 +191,7 @@ export class Sweeper {
     if (open) {
       // One sweep at a time. The pending one is checked again on every look: if the profit or the balance has fallen
       // under what it asks, or home has changed, it is stale (do not send; cancel it), else it is re-announced.
-      const why = open.home !== s.home ? `home is now ${s.home} in the config, not ${open.home}` : null;
+      const why = open.home !== s.home ? `home is now ${s.home} in the config, not ${open.home}` : open.wallet !== this.d.cfg.wallet ? `the bot's wallet is now ${this.d.cfg.wallet}, not ${open.wallet}` : null;
       let stale = why;
       if (!stale) {
         if (unswept < BigInt(open.amount_lamports)) stale = `unswept profit is now ${sol(unswept)}, under the ${sol(BigInt(open.amount_lamports))} asked`;
@@ -217,6 +218,13 @@ export class Sweeper {
       return;
     }
     if (unswept < min) return;
+    // After a sweep closed short (sent in part), the remainder is not asked for again on its own: the next request
+    // waits for new realized profit since that request (then it covers the remainder too).
+    const lastDone = this.rows().filter((x) => x.status === "done").pop();
+    if (lastDone && realized.lamports <= BigInt(lastDone.realized_lamports)) {
+      if (this.d.ledger.alert("sweep:remainder_waits", lastDone.request_id, now, 86_400_000)) this.d.log.info("sweep_remainder_waits", { unsweptLamports: unswept, afterRequest: lastDone.request_id });
+      return;
+    }
     const bal = await this.balance();
     if (bal === null) return;
     const room = bal - reserve;
@@ -316,6 +324,7 @@ export class Sweeper {
   async markDone(requestId: string, signature: string | null, unverified: boolean): Promise<string> {
     const r = this.d.ledger.db.prepare("select * from sweep_requests where request_id = ?").get(requestId) as unknown as SweepRow | undefined;
     if (!r) return `no sweep request ${requestId}`;
+    if (!!r.dry !== this.dry) return `sweep request ${requestId} is a ${r.dry ? "dry" : "live"} request; this run is ${this.dry ? "dry" : "live"}`;
     if (!signature) {
       if (r.status !== "pending") return `sweep request ${requestId} is ${r.status}`;
       if (!unverified) return "give --signature <sig> (checked on chain) or --unverified";
@@ -336,7 +345,9 @@ export class Sweeper {
     }
     if (!tx) return "not on chain yet (or not finalized); kept";
     if (tx.meta?.err) return `that transaction failed on chain (${JSON.stringify(tx.meta.err).slice(0, 80)}); not marked`;
-    if (typeof tx.blockTime === "number" && tx.blockTime < Math.floor(r.created_at / 1000) - BLOCK_TIME_SKEW_SEC) return `that transaction is older than the request (${new Date(tx.blockTime * 1000).toISOString()}); not marked`;
+    // No block time from the RPC: its age cannot be checked. Kept and looked at again (capped), never accepted blind.
+    if (typeof tx.blockTime !== "number") return "not on chain yet (the RPC gave no block time, so its age cannot be checked); kept";
+    if (tx.blockTime < Math.floor(r.created_at / 1000) - BLOCK_TIME_SKEW_SEC) return `that transaction is older than the request (${new Date(tx.blockTime * 1000).toISOString()}); not marked`;
     const keys: string[] = (tx.transaction?.message?.accountKeys ?? []).map((k: any) => (typeof k === "string" ? k : k?.pubkey));
     const loaded = tx.meta?.loadedAddresses ? [...(tx.meta.loadedAddresses.writable ?? []), ...(tx.meta.loadedAddresses.readonly ?? [])] : [];
     const all = [...keys, ...loaded];

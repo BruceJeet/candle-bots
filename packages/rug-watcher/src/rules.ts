@@ -15,9 +15,12 @@ export interface Trip {
   text: string;
 }
 
-/** Samples kept for a window: drop those older than the window (the newest is always kept). */
-export function prune(samples: Sample[], now: number, windowSec: number): Sample[] {
-  const from = now - windowSec * 1000;
+/**
+ * Samples kept for a window: drop those older than the window (the newest is always kept). `fromMs` (optional) reaches
+ * further back: after a freeze the window keeps what it held when the freeze began.
+ */
+export function prune(samples: Sample[], now: number, windowSec: number, fromMs?: number): Sample[] {
+  const from = Math.min(now - windowSec * 1000, fromMs ?? Infinity);
   const kept = samples.filter((s) => s.at >= from);
   return kept.length ? kept : samples.slice(-1);
 }
@@ -26,8 +29,8 @@ export function prune(samples: Sample[], now: number, windowSec: number): Sample
  * Price crash or liquidity pull: the newest sample against the highest in the window. Trips when the fall is at least
  * dropPct. Fewer than two samples: no verdict.
  */
-export function windowDrop(samples: Sample[], now: number, rule: WindowRule, what: string, unit: (v: number) => string): Trip | null {
-  const w = prune(samples, now, rule.windowSec);
+export function windowDrop(samples: Sample[], now: number, rule: WindowRule, what: string, unit: (v: number) => string, fromMs?: number): Trip | null {
+  const w = prune(samples, now, rule.windowSec, fromMs);
   if (w.length < 2) return null;
   const cur = w[w.length - 1];
   let hi = w[0];
