@@ -62,6 +62,9 @@ export class LogsSeries implements SeriesSource {
   private seen = new Map<string, Set<string>>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private inflight: Promise<void> | null = null;
+  /** Coins with no trade-log source (venue -> why), alerted as one summary when the set changes. */
+  private noSource = new Map<string, string>();
+  private noSourceAlerted = "";
 
   constructor(d: LogsSeriesDeps, o: LogsSeriesOptions = {}) {
     this.d = d;
@@ -150,6 +153,7 @@ export class LogsSeries implements SeriesSource {
         if (force || !this.venueAt.has(m) || this.now() - (this.venueAt.get(m) ?? 0) >= this.o.venueEveryMs || this.venueOf.get(m) !== r.venue) this.resolve(m, r);
       }
       this.applySockets();
+      this.alertNoSource();
     } catch (e) {
       this.d.log.warn("series_read_failed", { error: String((e as Error)?.message ?? e).slice(0, 160) });
     }
@@ -173,10 +177,14 @@ export class LogsSeries implements SeriesSource {
     }
     if (prev && prev !== r.venue) this.d.log.info("series_venue_changed", { mint, from: prev, to: r.venue });
     if (!addr) {
-      // No trade-log source for this venue in this version: price only, volume unknown.
+      // No trade-log source for this venue in this version: price only (when readable), volume unknown.
+      const why = r.venue === "unknown" ? `no pump.fun curve or canonical PumpSwap pool found${r.problem ? ` (${r.problem})` : ""}` : `on ${r.venue === "curve" ? "the Candle curve" : r.venue === "damm" ? "a DAMM v2 pool" : r.venue}`;
       this.store.gapStart(mint, `no trade log for venue ${r.venue}`);
-      this.d.alerter.raise(`series:no_log_source:${mint}:${r.venue}`, `series: ${mint} is on ${r.venue}; this version reads trade logs for pump.fun curves and PumpSwap only, so its volume is unknown`);
-    } else this.store.gapEnd(mint, `no trade log for venue ${prev ?? r.venue}`);
+      this.noSource.set(mint, why);
+    } else {
+      this.store.gapEnd(mint, `no trade log for venue ${prev ?? r.venue}`);
+      this.noSource.delete(mint);
+    }
     const old = this.addrOf.get(mint);
     if (old !== addr) {
       if (old) this.mintOf.delete(old);
@@ -185,6 +193,17 @@ export class LogsSeries implements SeriesSource {
         this.mintOf.set(addr, mint);
       } else this.addrOf.delete(mint);
     }
+  }
+
+  /** One summary alert when the set of coins without a trade-log source changes (not one per coin). */
+  private alertNoSource(): void {
+    for (const m of [...this.noSource.keys()]) if (!this.store.isWatched(m)) this.noSource.delete(m);
+    const key = [...this.noSource.keys()].sort().join(",");
+    if (key === this.noSourceAlerted) return;
+    this.noSourceAlerted = key;
+    if (!this.noSource.size) return;
+    const list = [...this.noSource].slice(0, 5).map(([m, why]) => `${m} (${why})`).join("; ");
+    this.d.alerter.raise(`series:no_log_source:${this.noSource.size}:${key.length}`, `series: ${this.noSource.size} watched coin(s) have no trade-log source in this version (pump.fun curves and PumpSwap only), so their volume is unknown: ${list}${this.noSource.size > 5 ? `; and ${this.noSource.size - 5} more (status.json)` : ""}`);
   }
 
   private applySockets(): void {
@@ -224,6 +243,6 @@ export class LogsSeries implements SeriesSource {
   }
 
   status(): Record<string, unknown> {
-    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins };
+    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, noTradeLogSource: Object.fromEntries(this.noSource) };
   }
 }
