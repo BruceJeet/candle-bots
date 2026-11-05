@@ -30,6 +30,9 @@ is, its reads, ledger and orders unchanged.
 - **Holder poller, `sources/holders`**: `HolderPoller` (largest accounts per owner, program-owned accounts left out,
   owners cached, a malformed answer throws; `balanceAt` and snapshots carry the answer's slot), `holderDiff`,
   `creatorOf` (a failed read throws `CreatorReadError`, never "no creator"); exported from the root as well.
+- **`signer.store: "candle-cli"`** (opt-in): the Candle CLI's encrypted file store, read-only, with the keyring
+  passphrase from `passphraseEnv` (`exec/cliStore`: `readCliEntry`, `cliFingerprint`); fails closed on any format
+  it does not know. `scripts/cli-signer-check.ts`: an offline check of such a store.
 - **Fix:** a build of a transaction version 1 or later is never signed (`TX_VERSION`, alerted; any bot, linked payer),
   and `signatureOfSigned` / `blockhashOfSigned` refuse such bytes instead of reading a wrong signature. Legacy and v0
   transactions, which Candle builds today, read as before.

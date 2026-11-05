@@ -365,6 +365,21 @@ With `EngineDeps.pauseSells`, a `PAUSE_SELLS` file in the state folder holds eve
 prices, peaks and trail marks go on. `sell` by hand still works, and a sell order already booked before the file
 appeared keeps going (it may be in flight). Remove the file and the next tick decides again.
 
+## The Candle CLI's file store as the signer (opt-in, linked payer)
+
+`"signer": { "store": "candle-cli", "passphraseEnv": "CANDLE_KEYRING_PASSPHRASE" }` reads the key signer from the
+Candle CLI's own encrypted file store (`credentials.enc` in `configDir`, default `$CANDLE_CONFIG_DIR`, else
+`~/.config/candle`). That is where the CLI keeps signers on a machine with no OS keychain. The signer is picked from
+the CLI's index (`config.json` `keySigners.entries`) by key prefix and the wallet's signer quorum, and its public key is
+checked against the index.
+- Read-only: the bot never writes the store.
+- Fail closed: a wrong passphrase, a missing or ambiguous index entry, an entry in a format this version does not know
+  (CLI 0.13.9's: PBKDF2-SHA256 and AES-GCM-256, the SDK's `EncryptedFileSecretStore` format), or a public key that
+  does not match the index each refuse. None of them guesses.
+- The passphrase comes only from the named environment variable, and is redacted from every log line.
+- `scripts/cli-signer-check.ts` checks a store offline: it loads the signer, prints its CNDL fingerprint, and signs
+  and verifies a test payload.
+
 ## Only known programs are signed (opt-in, linked payer)
 
 With `ExecutorDeps.knownPrograms`, a built transaction is parsed before signing: if a top-level instruction calls a
