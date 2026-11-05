@@ -40,6 +40,8 @@ export interface MultiLogsOptions {
   confirmMs?: number;
   /** Gap between subscribe requests, ms (polite pacing). */
   paceMs?: number;
+  /** A socket that has not opened by then is dropped and reconnected (ms, default 15 s). */
+  connectTimeoutMs?: number;
   /** Failed subscriptions in a row before onTrouble (default 3). */
   troubleAfter?: number;
   now?: () => number;
@@ -69,6 +71,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
   /** Requests we stopped waiting for: a late answer is accepted if still wanted, else unsubscribed. */
   const late = new Map<number, string>();
   const failed = (a: string, why: string) => {
+    if (!want.includes(a)) return; // an address no longer wanted: nothing to retry, no gap to open
     const t = tries.get(a) ?? { n: 0, nextAt: 0 };
     t.n++;
     t.nextAt = now() + Math.min(60_000, 2_000 * 2 ** Math.min(t.n, 5));
@@ -145,6 +148,14 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       schedule(`connect: ${(e as Error).name}`);
       return;
     }
+    // A socket that never opens (and never closes) would leave no ping and no stall check: give up on it.
+    const mine = ws;
+    setTimeout(() => {
+      if (!closed && ws === mine && mine.readyState !== 1) {
+        for (const a of want) openGap(a, "reconnect", lastMsg);
+        teardown("connect timeout");
+      }
+    }, o.connectTimeoutMs ?? 15_000);
     ws.onopen = () => {
       failures = 0;
       setUp(true);
@@ -280,6 +291,12 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       const overCap = uniq.slice(cap);
       const gone = want.filter((a) => !held.includes(a));
       const rebuild = want.length > 0 && gone.length > want.length / 2;
+      // A removed address whose subscription is still pending: its answer, when it comes, is an orphan to release.
+      for (const [id, p] of [...pendingReq]) if (gone.includes(p.address)) {
+        pendingReq.delete(id);
+        late.set(id, p.address);
+      }
+      for (const a of gone) tries.delete(a);
       for (const a of gone) {
         const id = subId.get(a);
         subId.delete(a);

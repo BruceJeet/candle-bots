@@ -5,9 +5,9 @@
  * - Order when the cap bites: the list first (never dropped), then pushed coins (newest first), then feed coins by
  *   their 5 m volume (highest first; no volume last).
  * - A feed coin leaves once it has been out of the feed for `dropAfterMs`; a pushed coin after its `ttlMs`.
- * - Hysteresis for feed coins near the cut: one enters within the top `maxFeedCoins`, and stays while within
- *   `maxFeedCoins + feedMargin` or for `minHoldMs` after it came in, so coins at the edge do not churn (and lose
- *   their bars).
+ * - Hysteresis for feed coins near the cut: watched coins rank by their 5 m volume times `feedStickiness` (default
+ *   1.25), so a newcomer takes a place only by trading 25 % more than the coin it displaces. Coins at the edge do not
+ *   churn (and lose their bars); a hot newcomer gets in at once.
  * - Coins the cap leaves out are alerted (once per change of the count) and listed in status.
  */
 import type { Alerter } from "../alerts.ts";
@@ -24,10 +24,11 @@ export interface WatchlistOptions {
   dropAfterMs?: number;
   /** A pushed coin's default stay (ms). */
   pushTtlMs?: number;
-  /** Hysteresis: a feed coin enters within the top maxFeedCoins and stays while within maxFeedCoins + this (default half). */
-  feedMargin?: number;
-  /** Hysteresis: a feed coin stays at least this long once in (ms, default 10 min), while it is in the feed. */
-  minHoldMs?: number;
+  /**
+   * Hysteresis: coins already watched rank by their 5 m volume times this (default 1.25), so a newcomer replaces one only
+   * when it trades at least that much more. Coins near the cut do not churn; a much hotter coin gets in at once.
+   */
+  feedStickiness?: number;
 }
 
 export interface WatchlistDeps {
@@ -55,7 +56,7 @@ export class Watchlist {
     this.d = d;
     this.now = d.now ?? Date.now;
     const maxFeed = o.maxFeedCoins ?? o.maxCoins;
-    this.o = { mints: [...new Set(o.mints ?? [])], maxCoins: o.maxCoins, maxFeedCoins: maxFeed, dropAfterMs: o.dropAfterMs ?? 900_000, pushTtlMs: o.pushTtlMs ?? 3_600_000, feedMargin: o.feedMargin ?? Math.ceil(maxFeed / 2), minHoldMs: o.minHoldMs ?? 600_000 };
+    this.o = { mints: [...new Set(o.mints ?? [])], maxCoins: o.maxCoins, maxFeedCoins: maxFeed, dropAfterMs: o.dropAfterMs ?? 900_000, pushTtlMs: o.pushTtlMs ?? 3_600_000, feedStickiness: o.feedStickiness ?? 1.25 };
   }
 
   /** Watch a coin for a while (a new launch a bot detected, a coin a rule wants a closer look at). */
@@ -75,15 +76,10 @@ export class Watchlist {
     for (const [m, at] of this.feedSeen) if (now - at > this.o.dropAfterMs) this.feedSeen.delete(m);
     for (const [m, p] of this.pushed) if (p.until <= now) this.pushed.delete(m);
     const vol = (m: string) => feed?.coin(m)?.volume5m?.value ?? -1;
-    const ranked = [...this.feedSeen.keys()].filter((m) => !this.o.mints.includes(m) && !this.pushed.has(m)).sort((a, b) => vol(b) - vol(a));
-    const rank = new Map(ranked.map((m, i) => [m, i]));
-    // Coins already in stay while within the margin, or for their minimum hold; new ones enter within the top N.
-    const stay = [...this.feedIn].filter(([m, at]) => rank.has(m) && (rank.get(m)! < this.o.maxFeedCoins + this.o.feedMargin || now - at < this.o.minHoldMs)).map(([m]) => m);
-    const feedCoins = [...stay];
-    for (const m of ranked) {
-      if (feedCoins.length >= this.o.maxFeedCoins) break;
-      if (rank.get(m)! < this.o.maxFeedCoins && !feedCoins.includes(m)) feedCoins.push(m);
-    }
+    const eligible = [...this.feedSeen.keys()].filter((m) => !this.o.mints.includes(m) && !this.pushed.has(m));
+    // Score: 5 m volume, an incumbent's raised by the stickiness (no volume known: last).
+    const score = (m: string) => (vol(m) < 0 ? -1 : vol(m) * (this.feedIn.has(m) ? this.o.feedStickiness : 1));
+    const feedCoins = eligible.sort((a, b) => score(b) - score(a) || (this.feedIn.has(b) ? 1 : 0) - (this.feedIn.has(a) ? 1 : 0)).slice(0, this.o.maxFeedCoins);
     const nextIn = new Map<string, number>();
     for (const m of feedCoins) nextIn.set(m, this.feedIn.get(m) ?? now);
     this.feedIn = nextIn;

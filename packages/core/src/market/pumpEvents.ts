@@ -189,23 +189,33 @@ const RETURN = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) (success|failed)/;
  * transaction gives none; a forged line from any other frame is ignored).
  */
 export function tradesFromLogs(logs: string[], err: unknown = null): PumpTrade[] {
-  if (err) return [];
+  return readTrades(logs, err).trades;
+}
+
+/**
+ * tradesFromLogs, and whether the log could be read to its end. `partial`: a `Log truncated`, or a stack the log cannot
+ * account for, stopped the reading; trades after that point (a pump trade inside a long aggregator route) may be
+ * missing, so the caller must treat that moment as unknown.
+ */
+export function readTrades(logs: string[], err: unknown = null): { trades: PumpTrade[]; partial: boolean } {
+  if (err) return { trades: [], partial: false };
   const out: PumpTrade[] = [];
   const stack: string[] = [];
+  const stop = () => ({ trades: out, partial: true });
   for (const l of logs) {
     const inv = INVOKE.exec(l);
     if (inv) {
       stack.push(inv[1]);
-      if (stack.length !== Number(inv[2])) return out; // the depth the log claims is not the depth it shows
+      if (stack.length !== Number(inv[2])) return stop(); // the depth the log claims is not the depth it shows
       continue;
     }
     const ret = RETURN.exec(l);
     if (ret) {
-      if (stack[stack.length - 1] !== ret[1]) return out; // a return from a program that is not running
+      if (stack[stack.length - 1] !== ret[1]) return stop(); // a return from a program that is not running
       stack.pop();
       continue;
     }
-    if (l.startsWith("Log truncated")) return out;
+    if (l.startsWith("Log truncated")) return stop();
     if (!l.startsWith("Program data: ")) continue;
     const top = stack[stack.length - 1];
     if (top !== PUMP_PROGRAM && top !== PUMP_AMM_PROGRAM) continue;
@@ -218,7 +228,7 @@ export function tradesFromLogs(logs: string[], err: unknown = null): PumpTrade[]
     const t = top === PUMP_PROGRAM ? decodeCurveTrade(b) : decodePoolTrade(b);
     if (t) out.push(t);
   }
-  return out;
+  return { trades: out, partial: false };
 }
 
 /** SOL per whole token after a curve trade (virtual reserves), for a coin with `decimals`. */

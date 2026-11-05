@@ -55,7 +55,7 @@ export { SeriesRecorder, ReplaySeries, replay, parseSnapshots } from "./sources/
 export type { SeriesSnapshot } from "./sources/replay.ts";
 export { fallFromHigh, riseFromLow, volumeVsBaseline, vwap, lastEnded } from "./market/indicators.ts";
 export type { Reading } from "./market/indicators.ts";
-export { decodeCurveTrade, decodePoolTrade, tradesFromLogs, curveTradePrice } from "./market/pumpEvents.ts";
+export { decodeCurveTrade, decodePoolTrade, tradesFromLogs, readTrades, curveTradePrice } from "./market/pumpEvents.ts";
 export type { CurveTrade, PoolTrade, PumpTrade } from "./market/pumpEvents.ts";
 export { multiLogs, DEFAULT_MAX_SUBSCRIPTIONS } from "./solana/logs-multi.ts";
 export type { MultiLogsSocket, MultiLogsEvent, MultiLogsHandlers, MultiLogsOptions } from "./solana/logs-multi.ts";

@@ -17,7 +17,7 @@ import type { Logger } from "../log.ts";
 import type { Rpc } from "../solana/rpc.ts";
 import { readMarkets, type MarketRead } from "../market/reader.ts";
 import { pumpCurve, pumpSwapPool } from "../solana/pda.ts";
-import { tradesFromLogs, curveTradePrice, WSOL_MINT } from "../market/pumpEvents.ts";
+import { readTrades, curveTradePrice, WSOL_MINT } from "../market/pumpEvents.ts";
 import { multiLogs, DEFAULT_MAX_SUBSCRIPTIONS, type MultiLogsOptions, type MultiLogsSocket, type MultiLogsHandlers } from "../solana/logs-multi.ts";
 import { SeriesStore, type SeriesSource, type SeriesView } from "./series.ts";
 
@@ -47,7 +47,9 @@ export interface LogsSeriesOptions {
 }
 
 /** Socket gap reasons, closed when the subscription is confirmed. */
-const SOCKET_REASONS = ["subscribing", "reconnect", "subscription not confirmed", "subscription refused"];
+const SOCKET_REASONS = ["subscribing", "reconnect", "stalled", "subscription not confirmed", "subscription refused"];
+/** Venue gap reasons (each "no trade log for venue X"): all closed once the coin has a log source. */
+const VENUES = ["unknown", "curve", "damm", "pump-curve", "pumpswap"];
 
 export class LogsSeries implements SeriesSource {
   readonly store: SeriesStore;
@@ -70,6 +72,8 @@ export class LogsSeries implements SeriesSource {
   private noSource = new Map<string, string>();
   /** Coins subscribed and not yet resolved (resolved on the next poll, without re-reading every coin's venue). */
   private fresh = new Set<string>();
+  /** Transactions whose log could not be read to its end. */
+  partialLogs = 0;
   private noSourceAlerted = "";
   /** The chain's slot as last read, and when; the socket's lag state. */
   private chainSlot: { slot: number; at: number } | null = null;
@@ -136,6 +140,8 @@ export class LogsSeries implements SeriesSource {
       }
       // Until its address is known, a coin's minutes are a gap (a failed read must not leave them as true zeros).
       if (!this.addrOf.has(m)) this.store.gapStart(m, "resolving");
+      // Watched while the socket is behind the chain: in that gap too.
+      if (this.behind) this.store.gapStart(m, "socket behind chain");
       this.fresh.add(m);
     }
     // Only the new coins are resolved now; the others keep their own schedule.
@@ -217,7 +223,8 @@ export class LogsSeries implements SeriesSource {
       this.store.gapStart(mint, `no trade log for venue ${r.venue}`);
       this.noSource.set(mint, why);
     } else {
-      this.store.gapEnd(mint, `no trade log for venue ${prev ?? r.venue}`);
+      // A log source now: every venue gap closes (a coin can pass through several, e.g. unknown, then the pool).
+      for (const v of VENUES) this.store.gapEnd(mint, `no trade log for venue ${v}`);
       this.noSource.delete(mint);
     }
     const old = this.addrOf.get(mint);
@@ -253,7 +260,8 @@ export class LogsSeries implements SeriesSource {
     if (lag > this.o.maxSlotLag) {
       if (!this.behind) {
         this.behind = true;
-        this.store.gapStart(null, "socket behind chain");
+        // The lag says how long the socket has been behind: the gap starts that long ago (about 400 ms a slot).
+        this.store.gapStart(null, "socket behind chain", this.now() - lag * 400);
         this.d.alerter.raise("series:socket_behind", `trade-log socket is ${lag} slots behind the chain (limit ${this.o.maxSlotLag}, about ${Math.round((lag * 0.4))} s): every coin's bars are incomplete until it catches up`);
         this.d.log.warn("series_socket_behind", { lag, slot, chainSlot: est });
       }
@@ -296,7 +304,15 @@ export class LogsSeries implements SeriesSource {
     if (seen.size > 2000) seen.delete(seen.values().next().value as string);
     this.seen.set(mint, seen);
     const at = this.now();
-    for (const t of tradesFromLogs(logs, err)) {
+    const read = readTrades(logs, err);
+    if (read.partial) {
+      // Part of this transaction's log could not be read: a trade may be missing, so this minute is unknown.
+      const m0 = at - (at % this.store.barMs);
+      this.store.gap(mint, m0, m0 + this.store.barMs, "log unreadable");
+      this.partialLogs++;
+      this.d.alerter.raise(`series:log_unreadable:${mint}`, `series: a transaction's log for ${mint} could not be read to its end (truncated or an unaccounted invoke stack); that minute's volume is unknown (${this.partialLogs} so far)`);
+    }
+    for (const t of read.trades) {
       if (t.kind === "pump-curve") {
         if (t.mint !== mint) continue;
         if (t.quoteMint !== WSOL_MINT) {
@@ -312,6 +328,6 @@ export class LogsSeries implements SeriesSource {
   }
 
   status(): Record<string, unknown> {
-    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, noTradeLogSource: Object.fromEntries(this.noSource) };
+    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, partialLogs: this.partialLogs, noTradeLogSource: Object.fromEntries(this.noSource) };
   }
 }
