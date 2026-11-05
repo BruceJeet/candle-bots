@@ -61,7 +61,7 @@ export class LogsSeries implements SeriesSource {
   private wanted: string[] = [];
   private seen = new Map<string, Set<string>>();
   private timer: ReturnType<typeof setInterval> | null = null;
-  private polling = false;
+  private inflight: Promise<void> | null = null;
 
   constructor(d: LogsSeriesDeps, o: LogsSeriesOptions = {}) {
     this.d = d;
@@ -129,9 +129,16 @@ export class LogsSeries implements SeriesSource {
   }
 
   /** One poll: venues (new coins, and every venueEveryMs), then prices, then the subscriptions. Never throws. */
-  async tick(force = false): Promise<void> {
-    if (this.polling) return;
-    this.polling = true;
+  tick(force = false): Promise<void> {
+    // One poll at a time; a caller during one waits for it (and a forced one runs right after).
+    if (this.inflight) return force ? this.inflight.then(() => this.tick(true)) : this.inflight;
+    this.inflight = this.poll(force).finally(() => {
+      this.inflight = null;
+    });
+    return this.inflight;
+  }
+
+  private async poll(force: boolean): Promise<void> {
     try {
       const coins = this.store.watched();
       if (!coins.length) return;
@@ -145,8 +152,6 @@ export class LogsSeries implements SeriesSource {
       this.applySockets();
     } catch (e) {
       this.d.log.warn("series_read_failed", { error: String((e as Error)?.message ?? e).slice(0, 160) });
-    } finally {
-      this.polling = false;
     }
   }
 
