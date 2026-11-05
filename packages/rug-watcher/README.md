@@ -61,9 +61,13 @@ details, and the section on sharing a wallet with other bots applies here word f
 - `priceCrash`, `liquidityPull`: after a firing the window starts again from the value then. Another firing needs a
   new fall of `dropPct` from there. A move from the launch curve to a pool starts both windows again (that is not a
   pull).
-- `devDump`: each part (`soldPct`, `floorPct`) fires once per coin. The creator's highest holding is kept in the
-  ledger, so a dump while the watcher was stopped fires on the first poll after.
-- `holderExit`: once per wallet per coin.
+- `devDump`: each part (`soldPct`, `floorPct`) fires once per position. The creator's highest holding since the coin
+  was adopted is kept in the ledger, so a dump while the watcher was stopped fires on the first poll after. A coin
+  released and adopted again starts from the creator's holding then.
+- `holderExit`: once per wallet per position. Before it fires, the wallet's whole balance (all its token accounts) is
+  read: the largest-accounts list can show only some of them.
+- One of the watcher's own sells filling (a rule's, or the `exit` strategy's) restarts the price and pool windows, so
+  its own impact on a thin pool is not read as a crash or a pull.
 
 Firings are kept in the ledger (`rug_events`): a restart never fires the same event again. A selling firing stays owed
 until a sell with its reason (`rug:<rule>#<event>`) has filled; a refused sell is retried on the engine's clock (and
@@ -102,7 +106,13 @@ A poll, not a stream: every `watch.holdersPollMs` (default 15 s), at most `watch
   large holders.
 - Lag: the poll interval plus about a second (confirmed commitment). A wallet outside the 20 largest accounts is not
   seen until it is in them.
-- A failed read is unknown, never a sale. Three failed polls in a row on a coin are alerted.
+- A failed read is unknown, never a sale. A failing coin is polled less often (2x, 4x, up to 16x the interval), and
+  three failed polls in a row are alerted.
+- One poll stops after `watch.pollBudgetMs` (default 3 s); the coins left are due first next cycle. Set
+  `watch.holdersRpcUrlEnv` to read holders through their own RPC, so a rate limit on these heavy calls never reaches
+  the balance read before a sell.
+- A creator found on chain that holds none of the coin at the first read is alerted once (it may be the wrong
+  wallet).
 
 ## Config reference
 
@@ -116,7 +126,7 @@ candle-exit-manager's), a `buy` section is refused.
   "devDump":       { "soldPct": 50, "floorPct": 1, "creators": { "Mint…": "Wallet…" } },
   "holderExit":    { "topN": 10, "soldPctOfSupply": 3, "windowSec": 600, "exclude": [], "alertOnly": true }
 },
-"watch": { "holdersPollMs": 15000, "maxCoinsPerPoll": 10, "checkPrograms": true, "extraPrograms": [], "sellFloorMarginBps": 200 },
+"watch": { "holdersPollMs": 15000, "maxCoinsPerPoll": 10, "pollBudgetMs": 3000, "holdersRpcUrlEnv": "HOLDERS_RPC_URL", "checkPrograms": true, "extraPrograms": [], "sellFloorMarginBps": 200 },
 "exit": { "strategy": "hold" }
 ```
 
@@ -129,6 +139,8 @@ candle-exit-manager's), a `buy` section is refused.
 | `holderExit` | `topN` (1 to 20, default 10), `soldPctOfSupply`, `windowSec` (default 600), `exclude` |
 | `watch.holdersPollMs` | how often each coin's holders are read (min 2000, default 15000) |
 | `watch.maxCoinsPerPoll` | coins read in one poll (default 10); the rest wait for the next |
+| `watch.pollBudgetMs` | longest one poll runs (default 3000) |
+| `watch.holdersRpcUrlEnv` | an env var with an RPC URL for holder and creator reads (default: the bot's RPC) |
 | `watch.checkPrograms`, `extraPrograms`, `sellFloorMarginBps` | TEE wallet signing checks, as candle-exit-manager's `manager.*` |
 | `exit` | the exit strategy for everything the rules do not sell (default `hold`; a `trail` works too) |
 
@@ -144,7 +156,10 @@ candle-exit-manager's), a `buy` section is refused.
 
 - **Price and pool SOL** are sampled on the engine's market reads (every `exitMs` while it watches, every `loopMs` at
   least), held in memory: after a restart the windows start empty.
-- **Holders are polled** (above). A fast dump between two polls is seen at the next one.
+- **Holders are polled** (above). A fast dump between two polls is seen at the next one. A wallet fires once per
+  position: its second dump is not a new event.
+- **Gaps:** a crash that happens while the watcher is stopped, or while reads fail, for longer than `windowSec` is
+  never seen as a crash (the window starts again after the gap). The dev rule still sees a dump made while stopped.
 - **Liquidity** is the SOL side of the pool. A bonding curve has no pool to pull; its falls are price crashes.
 - **Only the canonical PumpSwap pool** is read, as candle-exit-manager.
 - **Solana only.**
