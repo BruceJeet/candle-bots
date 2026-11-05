@@ -1,0 +1,17 @@
+{
+  "comment": "Dry run: decides and logs, never trades. No API key needed. Put the creators you follow in follow.creators.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "buy": { "sol": 0.01, "maxSlippageBps": 500, "maxOpen": 3, "lifetimeSol": 0.1, "maxPerCoin": 1 },
+  "sell": { "maxSlippageBps": 1000 },
+  "follow": {
+    "creators": [{ "address": "11111111111111111111111111111112", "label": "example", "sol": 0.005, "maxEntries": 3 }],
+    "maxAgeSec": 60,
+    "maxImpactBps": 300
+  },
+  "exit": { "strategy": "tpsl", "takeProfit": 2, "stopLoss": 0.5 }
+}

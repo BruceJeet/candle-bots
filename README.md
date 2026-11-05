@@ -9,6 +9,7 @@ one you want and you get that bot and the core, nothing else.
 |---|---|---|
 | [candle-launch-bot](packages/launch-bot/README.md) | Buys Candle launches as they appear (Candle's list and the chain), filtered by mode, age, impact and creator; exits by a strategy | `npx candle-launch-bot init`, then `npx candle-launch-bot run --config bot.json` |
 | [candle-graduation-bot](packages/graduation-bot/README.md) | Buys Candle coins as their curve completes and their DAMM v2 pool opens, filtered by time since graduation, impact on the pool, room above its floor and creator; exits by a strategy | `npx candle-graduation-bot run --config bot.json` (start from `examples/dry.json`) |
+| [candle-creator-bot](packages/creator-bot/README.md) | Buys the new launches of the creators you list, with a ticket and lifetime caps per creator; optional dev-buy wait; exits by a strategy | `npx candle-creator-bot run --config bot.json` (start from `examples/dry.json`) |
 
 Under them:
 

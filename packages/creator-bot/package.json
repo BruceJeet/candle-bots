@@ -1,0 +1,62 @@
+{
+  "name": "candle-creator-bot",
+  "version": "0.1.0",
+  "description": "Buys the new Candle launches of the creators you list, with a ticket and caps per creator, and exits them by a pluggable strategy. A Solana bot built on @candledottv/agent-sdk.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/creator-bot"
+  },
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/creator-bot#readme",
+  "bugs": {
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
+  },
+  "bin": {
+    "candle-creator-bot": "bin/candle-creator-bot"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "candle-bot-core": "0.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "candle",
+    "solana",
+    "trading-bot",
+    "creator",
+    "copy",
+    "launch",
+    "memecoin",
+    "bot",
+    "agent"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
