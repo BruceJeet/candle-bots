@@ -190,6 +190,8 @@ candle-launch-bot sell <mint> --config bot.json [--fraction 0.5]
 `sell` goes through the same order path as the bot (balance clamp, retries). If the bot is running, `sell` hands it
 the request through `<stateDir>/requests/` and the bot runs it. A position whose exits Candle keeps refusing
 (`exit_stuck`) gets one automatic try every `retry.stuckRetryMs` and an alert until it sells; `sell` tries at once.
+If Candle stops the profile (every order answered `RISK_LIMIT_REACHED` until an account owner clears it), the alert
+`profile_risk_limit` goes out, and again every `alerts.renotifyMs` while orders keep being refused.
 
 Each cycle runs exits first (sell orders, then the strategy's new exits), then entries, within a time budget. A slow
 market read while filtering times out after 3 s, and STOP or a signal is checked between steps and between orders.

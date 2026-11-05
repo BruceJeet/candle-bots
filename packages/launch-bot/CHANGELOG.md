@@ -1,5 +1,12 @@
 # Changelog: candle-launch-bot
 
+## 0.4.1
+
+- On candle-bot-core 0.3.1 (pinned exactly): when Candle stops the profile and answers an order `RISK_LIMIT_REACHED`
+  (every order refused until an account owner clears it), the alert `profile_risk_limit` goes to the configured
+  `alerts` command or webhook, and again every `alerts.renotifyMs` while refusals keep coming.
+- Nothing else changes: same CLI, config, state dir, ledger, `status.json` fields, events and order handling.
+
 ## 0.4.0
 
 - On candle-bot-core 0.3.0 (pinned exactly): buy and sell attempts (build, sign, submit) no longer run under the
