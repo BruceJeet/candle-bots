@@ -132,6 +132,8 @@ export interface TriggerContext {
    * cycle. Debounced; cheap to call often; a no-op after STOP.
    */
   wake(): void;
+  /** (0.6.0) The bot's per-coin price and volume series, when it gave the engine one (EngineDeps.series). */
+  readonly series?: import("./sources/series.ts").SeriesSource;
 }
 
 export interface Trigger {

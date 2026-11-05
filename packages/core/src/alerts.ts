@@ -18,6 +18,10 @@ export interface AlertConfig {
   /** Env var names passed to the command besides PATH, ALERT_KEY, ALERT_MESSAGE (nothing else is inherited). */
   commandEnv?: string[];
   webhookEnv?: string;
+  /** (0.6.0) A Discord webhook URL in this env var. */
+  discordWebhookEnv?: string;
+  /** (0.6.0) A Telegram bot token and chat id, each in an env var. */
+  telegram?: { botTokenEnv: string; chatIdEnv: string };
   renotifyMs: number;
 }
 
@@ -48,6 +52,32 @@ export function webhookSink(url: string, f: typeof fetch = fetch, timeoutMs = 10
       await f(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(a), signal: AbortSignal.timeout(timeoutMs) });
     } catch {
       /* a dead webhook never stops the bot; the ledger and the log keep the alert */
+    }
+  };
+}
+
+/** (0.6.0) A Discord webhook: each alert as a message (`content`, at most 2000 characters). */
+export function discordSink(url: string, f: typeof fetch = fetch, timeoutMs = 10_000): AlertSink {
+  addSecret(url);
+  return async (a) => {
+    try {
+      const content = `**${a.key}**\n${a.message}`.slice(0, 2000);
+      await f(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content, allowed_mentions: { parse: [] } }), signal: AbortSignal.timeout(timeoutMs) });
+    } catch {
+      /* a dead webhook never stops the bot */
+    }
+  };
+}
+
+/** (0.6.0) A Telegram bot: each alert as a message to one chat (at most 4096 characters). */
+export function telegramSink(botToken: string, chatId: string, f: typeof fetch = fetch, timeoutMs = 10_000): AlertSink {
+  addSecret(botToken);
+  return async (a) => {
+    try {
+      const text = `${a.key}\n${a.message}`.slice(0, 4096);
+      await f(`https://api.telegram.org/bot${botToken}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }), signal: AbortSignal.timeout(timeoutMs) });
+    } catch {
+      /* a dead sink never stops the bot */
     }
   };
 }
@@ -90,6 +120,18 @@ export function makeAlerter(cfg: AlertConfig, ledger: Ledger, log: Logger, env: 
     const url = env[cfg.webhookEnv];
     if (!url) throw new Error(`alerts.webhookEnv: ${cfg.webhookEnv} is not set`);
     sinks.push(webhookSink(url));
+  }
+  if (cfg.discordWebhookEnv) {
+    const url = env[cfg.discordWebhookEnv];
+    if (!url) throw new Error(`alerts.discordWebhookEnv: ${cfg.discordWebhookEnv} is not set`);
+    sinks.push(discordSink(url));
+  }
+  if (cfg.telegram) {
+    const token = env[cfg.telegram.botTokenEnv];
+    const chat = env[cfg.telegram.chatIdEnv];
+    if (!token) throw new Error(`alerts.telegram.botTokenEnv: ${cfg.telegram.botTokenEnv} is not set`);
+    if (!chat) throw new Error(`alerts.telegram.chatIdEnv: ${cfg.telegram.chatIdEnv} is not set`);
+    sinks.push(telegramSink(token, chat));
   }
   return new Alerter(ledger, log, sinks, cfg.renotifyMs, now);
 }

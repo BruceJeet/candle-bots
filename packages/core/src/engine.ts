@@ -15,6 +15,7 @@ import { fillFromTx, type Fill } from "./exec/fills.ts";
 import type { Ledger, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import { expectedSellOut, readMarkets, type MarketRead, type ReadOptions } from "./market/reader.ts";
+import type { SeriesSource } from "./sources/series.ts";
 import { redactDeep } from "./redact.ts";
 import { getAccounts, tokenBalance, type Rpc } from "./solana/rpc.ts";
 import type { ExitStrategy, PositionView } from "./strategies/types.ts";
@@ -60,6 +61,8 @@ export interface EngineDeps {
   adopter?: AdoptionHook;
   /** (0.5.0) Honour a PAUSE_SELLS file in the state dir: the exit strategy's sells are held; reads and marks go on. */
   pauseSells?: boolean;
+  /** (0.6.0) A per-coin price and volume series (sources/series) the trigger may read as `ctx.series`. */
+  series?: SeriesSource;
 }
 
 /** (0.5.0) What the engine calls on an Adopter. */
@@ -286,6 +289,8 @@ export class Engine {
       shouldStop: () => self.shouldStop(),
       readCurve: (mint: string, address?: string) => self.readCurve(mint, address),
       wake: () => self.wake(),
+      // (0.6.0) Opt-in: only present when the bot gives the engine a series source.
+      ...(d.series ? { series: d.series } : {}),
     });
   }
 

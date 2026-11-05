@@ -61,7 +61,7 @@ export interface Config {
      * chase a pump). Unset: no such check (0.3.1 behavior). Graduated (DAMM) buys use maxBuyImpactBps for this.
      */
     maxPriceDriftBps?: number };
-  alerts: { command?: string[]; commandEnv?: string[]; webhookEnv?: string; renotifyMs: number; holdAlertMs: number };
+  alerts: AlertsConfig;
   /** The folder of the config file: relative paths in it (stateDir, signer.path, exit.module) resolve here. */
   configDir: string;
 }
@@ -249,18 +249,7 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
     ...(r.maxPriceDriftBps === undefined ? {} : { maxPriceDriftBps: num(r, "maxPriceDriftBps", "config.retry", { min: 0, max: 10_000, int: true }) }),
   };
 
-  const al = raw.alerts === undefined ? {} : raw.alerts;
-  if (!isObj(al)) throw new ConfigError("config.alerts: must be an object");
-  only(al, ["command", "commandEnv", "webhookEnv", "renotifyMs", "holdAlertMs"], "config.alerts");
-  const command = strList(al, "command", "config.alerts");
-  if (command && !command.length) throw new ConfigError("config.alerts.command: an argv list, e.g. [\"/usr/local/bin/notify\", \"bot\"]");
-  const alerts = {
-    command,
-    commandEnv: strList(al, "commandEnv", "config.alerts"),
-    webhookEnv: str(al, "webhookEnv", "config.alerts", { optional: true, re: ENV_NAME }),
-    renotifyMs: num(al, "renotifyMs", "config.alerts", { min: 60_000, int: true, def: 3_600_000 }),
-    holdAlertMs: num(al, "holdAlertMs", "config.alerts", { min: 0, int: true, def: 300_000 }),
-  };
+  const alerts = parseAlerts(raw.alerts);
 
   // Frozen through: the engine, the executor and every trigger read this one object, and none may change it.
   return deepFreeze({ mode, payer, apiUrl, apiKeyEnv, rpcUrlEnv, rpcWsUrlEnv, wallet, linkedWalletId, privyWalletId, privyAppId, signer, stateDir, loopMs, exitMs, buy, sell, ...own, exit, retry, alerts, configDir: resolve(baseDir) }) as BotConfig<S>;
@@ -280,4 +269,42 @@ export function loadConfig<S extends Sections = {}>(path: string, sections: S = 
     throw new ConfigError(`config ${path} is not valid JSON: ${(e as Error).message}`);
   }
   return parseConfig(raw, dirname(resolve(path)), sections);
+}
+
+export interface AlertsConfig {
+  command?: string[];
+  commandEnv?: string[];
+  webhookEnv?: string;
+  /** (0.6.0) A Discord webhook URL in this env var: alerts posted as messages. */
+  discordWebhookEnv?: string;
+  /** (0.6.0) A Telegram bot: its token and the chat id, each in an env var. */
+  telegram?: { botTokenEnv: string; chatIdEnv: string };
+  renotifyMs: number;
+  holdAlertMs: number;
+}
+
+/** The `alerts` section (shared by every bot, and the watch-only config). Keys present only when set. */
+export function parseAlerts(raw: unknown): AlertsConfig {
+  const al = raw === undefined ? {} : raw;
+  if (!isObj(al)) throw new ConfigError("config.alerts: must be an object");
+  only(al, ["command", "commandEnv", "webhookEnv", "discordWebhookEnv", "telegram", "renotifyMs", "holdAlertMs"], "config.alerts");
+  const command = strList(al, "command", "config.alerts");
+  if (command && !command.length) throw new ConfigError("config.alerts.command: an argv list, e.g. [\"/usr/local/bin/notify\", \"bot\"]");
+  const discordWebhookEnv = str(al, "discordWebhookEnv", "config.alerts", { optional: true, re: ENV_NAME });
+  let telegram: AlertsConfig["telegram"];
+  if (al.telegram !== undefined) {
+    const t = al.telegram;
+    if (!isObj(t)) throw new ConfigError("config.alerts.telegram: { botTokenEnv, chatIdEnv }");
+    only(t, ["botTokenEnv", "chatIdEnv"], "config.alerts.telegram");
+    telegram = { botTokenEnv: str(t, "botTokenEnv", "config.alerts.telegram", { re: ENV_NAME })!, chatIdEnv: str(t, "chatIdEnv", "config.alerts.telegram", { re: ENV_NAME })! };
+  }
+  return {
+    command,
+    commandEnv: strList(al, "commandEnv", "config.alerts"),
+    webhookEnv: str(al, "webhookEnv", "config.alerts", { optional: true, re: ENV_NAME }),
+    ...(discordWebhookEnv !== undefined ? { discordWebhookEnv } : {}),
+    ...(telegram ? { telegram } : {}),
+    renotifyMs: num(al, "renotifyMs", "config.alerts", { min: 60_000, int: true, def: 3_600_000 }),
+    holdAlertMs: num(al, "holdAlertMs", "config.alerts", { min: 0, int: true, def: 300_000 }),
+  };
 }
