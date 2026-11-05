@@ -255,10 +255,18 @@ candle-launch-helper opens its dev bag with it.
 
 A buy rebuilt after a failed attempt is rechecked against `maxBuyImpactBps`: the ticket's own impact on the curve.
 That impact falls as the price rises, so on its own it lets a retry rebuild into a pump. `retry.maxPriceDriftBps`
-(config, unset by default) adds the price check: the retry must still buy at least the order's expected fill (the
-decision's, or Candle's build quote) less that many bps, or it ends `IMPACT`; an order with no expected fill ends too.
-Unset, a curve retry is checked exactly as in 0.3.1. A graduated coin's retry under `dammBuys` always has this check,
-at `maxBuyImpactBps`, and refuses (`POOL`) an order with no expected fill.
+(config, unset by default) adds the price check: the retry must still buy at least the order's **decision fill** less
+that many bps, or it ends `IMPACT`; an order with no decision fill ends too. Unset, a curve retry is checked exactly as
+in 0.3.1. A graduated coin's retry under `dammBuys` always has this check, at `maxBuyImpactBps`, and refuses (`POOL`)
+an order with no decision fill.
+
+The decision fill (`orders.decision_out_raw`) is set once: at booking, from the decision's expected fill (the smaller
+of the trigger's and the engine's own read), or, for an order booked without one, from its first build quote. It is
+never overwritten, so the limit holds the total move since the decision, not each step: a climb of 5 % per attempt
+is refused once the total passes the limit. `expected_out_raw` still follows each build's quote (the uncertain-buy
+adoption cap uses it). The column is added only when a drift check is on (an Executor with `retry.maxPriceDriftBps`
+set or `dammBuys`): a ledger whose bot never turns one on is never migrated. An order booked before the column existed
+is held to its `expected_out_raw`.
 
 ## How money is handled
 

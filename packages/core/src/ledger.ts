@@ -66,6 +66,13 @@ export interface OrderRow {
   /** Buys only: past this time no new attempt is built (the filter's decision is stale). */
   deadline_at: number | null;
   expected_out_raw: string | null;
+  /**
+   * (0.4.0) The decision's expected fill, set once: at booking (the engine's min of trigger and own read), else from
+   * the first build quote. Never overwritten (expected_out_raw follows each build's quote, for the adoption cap).
+   * The retry drift checks hold every retry to it. The column exists only once a drift check is on
+   * (Ledger.ensureDecisionColumn, from the Executor): a ledger whose bot never turns one on is never migrated.
+   */
+  decision_out_raw?: string | null;
   min_out_raw: string | null;
   /** Status / job reads that failed for this order (no attempt spent; alerted in buckets). */
   read_failures: number;
@@ -129,6 +136,8 @@ create table if not exists alerts (
 export class Ledger {
   readonly db: DatabaseSync;
   private depth = 0;
+  /** orders.decision_out_raw exists (added by ensureDecisionColumn, kept once added). */
+  private decisionCol = false;
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
@@ -140,6 +149,7 @@ export class Ledger {
       ["candle_confirmed", "integer not null default 0"], ["final_check", "integer not null default 0"], ["built_seen_at", "integer"], ["probed", "integer not null default 0"],
       ["ending", "text"], ["adopt_scans", "integer not null default 0"], ["extra_signatures", "text"], ["internal_errors", "integer not null default 0"]] as const)
       if (!cols.has(c)) this.db.exec(`alter table orders add column ${c} ${ddl}`);
+    this.decisionCol = cols.has("decision_out_raw");
     const pcols = new Set((this.db.prepare("pragma table_info(positions)").all() as Array<{ name: string }>).map((c) => c.name));
     for (const [c, ddl] of [["rent_lamports", "text not null default '0'"], ["written_down_raw", "text not null default '0'"]] as const)
       if (!pcols.has(c)) this.db.exec(`alter table positions add column ${c} ${ddl}`);
@@ -221,12 +231,31 @@ export class Ledger {
 
   // ---------------------------------------------------------------- orders
   createOrder(o: { positionId: number; side: Side; clientTradeId: string; amountRaw: bigint; slippageBps: number; maxAttempts: number; now: number; reason: string; manual?: boolean; deadlineAt?: number | null; expectedOutRaw?: bigint | null }): number {
+    const exp = o.expectedOutRaw == null ? null : o.expectedOutRaw.toString();
     const r = this.db
       .prepare(
-        "insert into orders (position_id, side, client_trade_id, amount_raw, slippage_bps, status, max_attempts, next_attempt_at, created_at, updated_at, reason, manual, deadline_at, expected_out_raw) values (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
+        `insert into orders (position_id, side, client_trade_id, amount_raw, slippage_bps, status, max_attempts, next_attempt_at, created_at, updated_at, reason, manual, deadline_at, expected_out_raw${this.decisionCol ? ", decision_out_raw" : ""}) values (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?${this.decisionCol ? ", ?" : ""})`,
       )
-      .run(o.positionId, o.side, o.clientTradeId, o.amountRaw.toString(), o.slippageBps, o.maxAttempts, o.now, o.now, o.now, o.reason, o.manual ? 1 : 0, o.deadlineAt ?? null, o.expectedOutRaw == null ? null : o.expectedOutRaw.toString());
+      .run(o.positionId, o.side, o.clientTradeId, o.amountRaw.toString(), o.slippageBps, o.maxAttempts, o.now, o.now, o.now, o.reason, o.manual ? 1 : 0, o.deadlineAt ?? null, ...(this.decisionCol ? [exp, exp] : [exp]));
     return Number(r.lastInsertRowid);
+  }
+
+  /**
+   * (0.4.0) Add orders.decision_out_raw (lossless: one nullable column; older orders keep null and their retries fall
+   * back to expected_out_raw). Called by an Executor with a drift check on (retry.maxPriceDriftBps, dammBuys); with
+   * neither, the ledger is never migrated (a 0.1.3 or 0.3.x ledger opens unchanged).
+   */
+  ensureDecisionColumn(): void {
+    if (this.decisionCol) return;
+    const cols = new Set((this.db.prepare("pragma table_info(orders)").all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has("decision_out_raw")) this.db.exec("alter table orders add column decision_out_raw text");
+    this.decisionCol = true;
+  }
+
+  /** Set the order's decision fill if it has none (the first build quote of an order booked without one). */
+  setDecisionOutIfUnset(id: number, raw: string): void {
+    if (!this.decisionCol) return;
+    this.db.prepare("update orders set decision_out_raw = ? where id = ? and decision_out_raw is null").run(raw, id);
   }
 
   order(id: number): OrderRow | undefined {

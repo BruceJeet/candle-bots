@@ -118,10 +118,16 @@ function logsOf(x: any): string[] | undefined {
 /** Transport-level codes (Node fetch/undici, sockets, DNS): the request may or may not have arrived. */
 const TRANSPORT = /^(E[A-Z]+|UND_ERR_[A-Z_]+|ABORT_ERR|ERR_[A-Z_]+)$/;
 
-/** The order's expected fill (the decision's, or Candle's build quote), when it is a positive integer; else null. */
-function expectedOf(o: OrderRow): bigint | null {
-  if (!o.expected_out_raw || !/^\d+$/.test(o.expected_out_raw)) return null;
-  const v = BigInt(o.expected_out_raw);
+/**
+ * The fill every retry is held to: the decision's expected fill (decision_out_raw, set once: at booking, else from the
+ * first build quote), never a later build's quote, so the drift limit does not compound per attempt. An order made
+ * before the column existed (a ledger from 0.3.x, mid-flight across the upgrade) falls back to expected_out_raw.
+ * Null when neither is a positive integer.
+ */
+function decisionOf(o: OrderRow): bigint | null {
+  const raw = o.decision_out_raw ?? o.expected_out_raw;
+  if (!raw || !/^\d+$/.test(raw)) return null;
+  const v = BigInt(raw);
   return v > 0n ? v : null;
 }
 
@@ -150,6 +156,9 @@ export class Executor {
 
   constructor(d: ExecutorDeps) {
     if (typeof d.maxBuyImpactBps !== "number" || !Number.isFinite(d.maxBuyImpactBps) || d.maxBuyImpactBps < 0) throw new Error("Executor: maxBuyImpactBps must be a number >= 0");
+    // (0.4.0) A drift check holds every retry to the decision fill: the ledger keeps it in its own column, added
+    // only when a check is on (no drift check: the ledger is never migrated, 0.3.1 behavior).
+    if (d.cfg.retry.maxPriceDriftBps !== undefined || d.dammBuys) d.ledger.ensureDecisionColumn();
     this.d = d;
     this.now = d.now ?? Date.now;
     this.random = d.random ?? Math.random;
@@ -502,6 +511,8 @@ export class Executor {
         return this.apply(o, pos, r);
       }
       this.d.ledger.updateOrder(o.id, { ...(built.expectedOutRaw ? { expected_out_raw: String(built.expectedOutRaw) } : {}), min_out_raw: String(built.minOutRaw ?? ""), fee_bps: Number(built.fee?.bps ?? 0) });
+      // The decision fill is set once: an order booked without one takes the first build's quote, and keeps it.
+      if (built.expectedOutRaw && /^\d+$/.test(String(built.expectedOutRaw))) this.d.ledger.setDecisionOutIfUnset(o.id, String(built.expectedOutRaw));
       if (this.d.rail.payer?.type === "main") {
         // A main-payer build executes inline; an unsigned "built" answer spent nothing and is not ours to sign.
         this.d.ledger.endAttempt(att, this.now(), "rejected", "MAIN_NOT_EXECUTED", null);
@@ -604,8 +615,8 @@ export class Executor {
       // ticket must still buy at least the order's expected fill less that many bps. Unset: 0.3.1 behavior.
       const drift = this.d.cfg.retry.maxPriceDriftBps;
       if (drift !== undefined) {
-        const booked = expectedOf(o);
-        if (booked === null) return { kind: "rejected", code: "IMPACT", detail: "retry.maxPriceDriftBps is set and the order has no expected fill to hold the retry to" };
+        const booked = decisionOf(o);
+        if (booked === null) return { kind: "rejected", code: "IMPACT", detail: "retry.maxPriceDriftBps is set and the order has no decision fill to hold the retry to" };
         if (bi.expectedOutRaw < (booked * BigInt(10_000 - Math.min(10_000, drift))) / 10_000n)
           return { kind: "rejected", code: "IMPACT", detail: `price moved up on retry: ${bi.expectedOutRaw} < ${booked} less ${drift} bps` };
       }
@@ -629,10 +640,10 @@ export class Executor {
       const r = dammBuy(p, pos.mint, BigInt(o.amount_raw));
       if (r.impactBps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${r.impactBps} bps on retry (pool)` };
       // The ticket's own impact falls as the price rises, so it alone does not stop a rebuild into a pump: the ticket
-      // must still buy at least the expected fill on the order (the decision's, or Candle's build quote) less
-      // maxBuyImpactBps.
-      const booked = expectedOf(o);
-      if (booked === null) return { kind: "rejected", code: "POOL", detail: "no expected fill on the order to hold the retry to (dammBuys refuses a pool retry without one)" };
+      // must still buy at least the order's decision fill (set once; never a later build's quote, so the limit does
+      // not compound per attempt) less maxBuyImpactBps.
+      const booked = decisionOf(o);
+      if (booked === null) return { kind: "rejected", code: "POOL", detail: "no decision fill on the order to hold the retry to (dammBuys refuses a pool retry without one)" };
       if (r.expectedOutRaw < (booked * BigInt(10_000 - Math.min(10_000, Math.round(this.d.maxBuyImpactBps)))) / 10_000n)
         return { kind: "rejected", code: "IMPACT", detail: `price moved up on retry (pool): ${r.expectedOutRaw} < ${booked} less ${this.d.maxBuyImpactBps} bps` };
       return null;

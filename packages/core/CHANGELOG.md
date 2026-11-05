@@ -29,9 +29,13 @@ New API for bots that buy graduated coins or watch Candle launches. A 0.3.x bot 
   call holds the coin as the uncertain-buy scan does). A booking race answers `ok: false`, never throws. An
   `expectedQtyRaw` more than 1 % off the chain is logged and alerted (`fill_disagrees`). Live only.
 - **`retry.maxPriceDriftBps`** (config, opt-in, unset by default): a curve buy's retry must still buy at least the
-  order's expected fill less that many bps (`IMPACT` otherwise; an order with no expected fill ends too), so a retry
-  cannot rebuild into a pump. Unset: exactly 0.3.1's curve recheck. Under `dammBuys` a pool retry with no expected
-  fill on the order ends `POOL`.
+  order's decision fill less that many bps (`IMPACT` otherwise; an order with none ends too), so a retry cannot rebuild
+  into a pump. Unset: exactly 0.3.1's curve recheck. Under `dammBuys` a pool retry with no decision fill ends `POOL`.
+- **`orders.decision_out_raw`**: the fill both drift checks hold every retry to, set once (at booking, else from the
+  first build quote) and never overwritten, so the limit does not compound per attempt (`expected_out_raw` still
+  follows each build's quote, for the adoption cap). Added only by an Executor with a drift check on
+  (`Ledger.ensureDecisionColumn`); without one the ledger is never migrated. Older orders fall back to
+  `expected_out_raw`.
 - **`Trigger.stop()` may return a promise**; `run` awaits it before the ledger closes (a trigger with a call in flight
   finishes it). A throwing `stop` is logged (`trigger_stop_failed`) and the ledger still closes.
 - **`sources/candleLaunches`** (root export `CandleLaunches`): candle-launch-bot's launch detector (Candle's token
