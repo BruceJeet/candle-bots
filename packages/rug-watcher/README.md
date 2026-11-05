@@ -49,6 +49,10 @@ export CANDLE_API_KEY=cndl_live_...
 candle-rug-watcher run --config bot.json
 ```
 
+**The dev and holder rules need an RPC that serves `getTokenLargestAccounts`.** Solana's public RPC refuses that call
+(HTTP 429, "Too many requests for a specific RPC call", on every try as of November 2026); the watcher then reads the
+holders as unknown, fires nothing on them, and alerts after three polls. The price and liquidity rules work on any RPC.
+
 What it needs (API key with `swap:write`, a payer, an RPC) is the same as candle-exit-manager's; its README has the
 details, and the section on sharing a wallet with other bots applies here word for word.
 
