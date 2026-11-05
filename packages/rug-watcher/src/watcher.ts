@@ -41,7 +41,7 @@ export class RugExit implements ExitStrategy {
     const row = this.positionOf(p.mint);
     if (row) {
       this.watch.observeOne(row, m as MarketRead);
-      const owed = this.watch.pendingSell(row.id);
+      const owed = this.watch.pendingSell(row.id, p.remainingRaw);
       if (owed) return { action: "sell" as const, fraction: owed.fraction, reason: owed.reason };
     }
     return this.fallback.onTick(p, m);
@@ -79,7 +79,7 @@ export class WatcherTrigger implements Trigger {
         poolSol: typeof m?.quoteLiquidityLamports === "bigint" ? Number(m.quoteLiquidityLamports) / 1e9 : null,
         creator: c ? { wallet: c.creator, source: c.source, maxHeldRaw: w.devHigh(p.id) } : null,
         remainingRaw: p.remaining_raw, basis: r.basis_source,
-        fired: w.events(p.id).map((e) => ({ event: e.id, rule: e.rule, key: e.key, at: new Date(e.fired_at).toISOString(), alertOnly: !!e.alert_only, sell: e.sell, sold: w.soldFor(e), numbers: JSON.parse(e.numbers) })),
+        fired: w.events(p.id).map((e) => ({ event: e.id, rule: e.rule, key: e.key, at: new Date(e.fired_at).toISOString(), alertOnly: !!e.alert_only, sell: e.sell, sold: w.soldFor(e), outcome: e.outcome, numbers: JSON.parse(e.numbers) })),
       };
     });
     return { watched, rules: Object.keys(this.cfg.rules), adoption: { mode: this.cfg.adoption.mode, skipped: a.skips }, sellsPaused: this.engine?.sellsPaused() ?? false };

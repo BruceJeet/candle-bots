@@ -14,6 +14,7 @@ a rule fires: the pool's SOL pulled, a price crash, the creator dumping, a large
   candle-rug-watcher sell    <mint> --config bot.json [--fraction 1]
   candle-rug-watcher adopt   <mint> --config bot.json [--signatures s1,s2 | --cost-sol 0.2 | --basis mark]
   candle-rug-watcher release <mint> --config bot.json              stop watching a coin; nothing is sold
+  candle-rug-watcher dismiss <event> --config bot.json             a firing owes no sell (the coin stays watched)
 
 Start from examples/dry.json. Controls in the state folder: STOP (stop), PAUSE_SELLS (hold every sell, keep watching and alerting).
 Docs: the README.
@@ -86,6 +87,32 @@ async function request(ctx: Ctx, kind: "adopt" | "release", mint: string, opt: R
   }
 }
 
+/** dismiss: a request file while the watcher runs; done here (under the lock) while it is stopped. */
+async function dismissCommand(ctx: Ctx, event: string): Promise<number> {
+  const id = Number(event);
+  if (!Number.isSafeInteger(id) || id <= 0) die(`${event} is not an event id (status.json lists them)`);
+  const lock = acquireLock(ctx.cfg.stateDir);
+  if (!lock) {
+    const dir = join(ctx.cfg.stateDir, "requests");
+    mkdirSync(dir, { recursive: true });
+    const f = join(dir, `dismiss-${Date.now()}-${process.pid}.json`);
+    writeFileSync(f + ".tmp", JSON.stringify({ event: id }));
+    renameSync(f + ".tmp", f);
+    process.stdout.write(`the watcher is running: request written to ${f}; watch events.jsonl for dismiss_request\n`);
+    return 0;
+  }
+  const ledger = openLedger(ctx)();
+  try {
+    const { watch } = await makeWatcher(ctx, ledger);
+    const r = watch.dismiss(id);
+    process.stdout.write(r + "\n");
+    return r.startsWith("dismissed") ? 0 : 1;
+  } finally {
+    ledger.close();
+    lock.release();
+  }
+}
+
 /** The entry point: never lets an error out unredacted (the SDK puts RPC URLs in its messages). */
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   return guardMain(async () => {
@@ -119,6 +146,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         if (!pos[1]) die("sell <mint> [--fraction f]");
         const ctx = context(config);
         return sell(ctx, pos[1], opt.fraction ? Number(opt.fraction) : 1, openLedger(ctx), async (ledger) => ({ engine: (await makeWatcher(ctx, ledger)).engine }));
+      }
+      case "dismiss": {
+        if (!pos[1]) die("dismiss <event>");
+        return dismissCommand(context(config), pos[1]);
       }
       case "adopt":
       case "release": {

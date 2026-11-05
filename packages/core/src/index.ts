@@ -31,8 +31,8 @@ export { decodeCandleCurve, buyImpact, curveProgress, decodeDamm, dammBuy } from
 export type { CandleCurve, DammPool, BuyImpact } from "./market/curve.ts";
 export { Detector as CandleLaunches } from "./sources/candleLaunches.ts";
 export type { Launch, Sighting, DetectorDeps as CandleLaunchesDeps, DetectorOptions as CandleLaunchesOptions } from "./sources/candleLaunches.ts";
-export { HolderPoller, holderDiff, creatorOf } from "./sources/holders.ts";
-export type { Holder, HolderSnapshot, HolderSource } from "./sources/holders.ts";
+export { HolderPoller, holderDiff, creatorOf, CreatorReadError } from "./sources/holders.ts";
+export type { Holder, HolderSnapshot, HolderSource, BalanceAt } from "./sources/holders.ts";
 export { httpRpc, tokenBalance, PUBLIC_RPC } from "./solana/rpc.ts";
 export type { Rpc } from "./solana/rpc.ts";
 export { asAddress } from "./solana/base58.ts";

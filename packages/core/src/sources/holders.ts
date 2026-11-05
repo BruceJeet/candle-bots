@@ -30,11 +30,21 @@ export interface HolderSnapshot {
   holders: Holder[];
   /** The mint's supply in raw units, as getTokenLargestAccounts' context could not say: from getTokenSupply. */
   supply: bigint;
+  /** The slot the largest-accounts answer was read at (its context), when the RPC said. */
+  slot?: number | null;
+}
+
+/** A wallet's holding with the slot it was read at (null when the RPC did not say). */
+export interface BalanceAt {
+  amount: bigint;
+  slot: number | null;
 }
 
 export interface HolderSource {
   snapshot(mint: string): Promise<HolderSnapshot>;
   balanceOf(owner: string, mint: string): Promise<bigint | null>;
+  /** The holding and the slot it was read at (a source that cannot say the slot may leave this out). */
+  balanceAt?(owner: string, mint: string): Promise<BalanceAt | null>;
 }
 
 /** Each owner's change from `prev` to `cur` (owners in either; an owner gone from the list counts as 0 now). */
@@ -96,53 +106,91 @@ export class HolderPoller implements HolderSource {
       by.set(owner, (by.get(owner) ?? 0n) + BigInt(r.amount));
     }
     const holders = [...by].map(([owner, amount]) => ({ owner, amount })).sort((x, y) => (y.amount > x.amount ? 1 : y.amount < x.amount ? -1 : 0));
-    return { mint, atMs: this.now(), holders, supply: BigInt(supplyRaw) };
+    const slot = typeof largest?.context?.slot === "number" ? largest.context.slot : null;
+    return { mint, atMs: this.now(), holders, supply: BigInt(supplyRaw), slot };
   }
 
   balanceOf(owner: string, mint: string): Promise<bigint | null> {
     return tokenBalance(this.rpc, owner, mint);
   }
+
+  /** Every token account the owner holds for the mint, summed, with the answer's slot. Null when the read fails. */
+  async balanceAt(owner: string, mint: string): Promise<BalanceAt | null> {
+    try {
+      const r = await this.rpc.call<any>("getTokenAccountsByOwner", [owner, { mint }, { encoding: "jsonParsed", commitment: "confirmed" }]);
+      if (!r || !Array.isArray(r.value)) return null;
+      let sum = 0n;
+      for (const a of r.value) {
+        const amt = a?.account?.data?.parsed?.info?.tokenAmount?.amount;
+        if (typeof amt !== "string" || !/^\d+$/.test(amt)) return null;
+        sum += BigInt(amt);
+      }
+      return { amount: sum, slot: typeof r.context?.slot === "number" ? r.context.slot : null };
+    } catch {
+      return null;
+    }
+  }
 }
+
+/** A read on the way to a coin's creator failed: try again later (not the same as "no creator"). */
+export class CreatorReadError extends Error {}
 
 /**
  * A coin's creator from chain: a pump.fun coin's curve names it (`creator`). Otherwise the fee payer of the mint's
- * oldest transaction (its launch), paged back through the mint's history (at most `pages` pages of 1000). Null when it
- * cannot be found (a history longer than the cap, a read that fails).
+ * oldest successful transaction (its launch), paged back through the mint's history (at most `pages` pages of 1000).
+ * Null when there is none to find (no history, or one longer than the cap). A read that fails throws CreatorReadError:
+ * a failed curve read never falls through to the fee-payer path.
  */
 export async function creatorOf(rpc: Rpc, mint: string, pages = 10): Promise<{ creator: string; source: "pump-curve" | "first-tx" } | null> {
+  let v: any;
   try {
-    const v = (await rpc.call<any>("getAccountInfo", [pumpCurve(mint), { encoding: "base64", commitment: "confirmed" }]))?.value;
-    if (v) {
-      const c = decodePumpCurve(v);
-      if (c.creator && c.creator !== "11111111111111111111111111111111") return { creator: c.creator, source: "pump-curve" };
+    v = (await rpc.call<any>("getAccountInfo", [pumpCurve(mint), { encoding: "base64", commitment: "confirmed" }]))?.value;
+  } catch (e) {
+    throw new CreatorReadError(`pump curve read failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
+  }
+  if (v) {
+    let c: ReturnType<typeof decodePumpCurve> | null = null;
+    try {
+      c = decodePumpCurve(v);
+    } catch {
+      c = null; // an account at that address that is not a pump curve: the launch transaction below
     }
-  } catch {
-    /* not a pump coin, or unreadable: the launch transaction below */
+    if (c && c.creator && c.creator !== "11111111111111111111111111111111") return { creator: c.creator, source: "pump-curve" };
   }
   let before: string | undefined;
-  let oldest: string | null = null;
+  let lastPage: any[] = [];
+  let reachedStart = false;
   for (let i = 0; i < pages; i++) {
     let list: any[];
     try {
       list = (await rpc.call<any[]>("getSignaturesForAddress", [mint, { limit: 1000, commitment: "confirmed", ...(before ? { before } : {}) }])) ?? [];
-    } catch {
-      return null;
+    } catch (e) {
+      throw new CreatorReadError(`history read failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
     }
-    if (!list.length) break;
-    oldest = list[list.length - 1].signature;
-    before = oldest ?? undefined;
+    if (!Array.isArray(list)) throw new CreatorReadError("history read: bad response");
+    if (!list.length) {
+      reachedStart = true; // an exact multiple of 1000: the empty page after the last full one
+      break;
+    }
+    lastPage = list;
+    before = list[list.length - 1].signature;
     if (list.length < 1000) {
-      before = undefined;
+      reachedStart = true;
       break;
     }
   }
-  if (!oldest || before) return null; // never reached the start of the history
+  if (!reachedStart) return null; // never reached the start of the history within the cap
+  // The oldest transaction that succeeded (a failed one touching the address may come first).
+  const oldest = [...lastPage].reverse().find((x) => x && x.err == null)?.signature as string | undefined;
+  if (!oldest) return null;
+  let tx: any;
   try {
-    const tx = await rpc.call<any>("getTransaction", [oldest, { encoding: "json", maxSupportedTransactionVersion: 1, commitment: "confirmed" }]);
-    const k = tx?.transaction?.message?.accountKeys?.[0];
-    const key = typeof k === "string" ? k : k?.pubkey;
-    return typeof key === "string" ? { creator: key, source: "first-tx" } : null;
-  } catch {
-    return null;
+    tx = await rpc.call<any>("getTransaction", [oldest, { encoding: "json", maxSupportedTransactionVersion: 1, commitment: "confirmed" }]);
+  } catch (e) {
+    throw new CreatorReadError(`launch transaction read failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
   }
+  if (!tx) throw new CreatorReadError("launch transaction not served yet");
+  const k = tx?.transaction?.message?.accountKeys?.[0];
+  const key = typeof k === "string" ? k : k?.pubkey;
+  return typeof key === "string" ? { creator: key, source: "first-tx" } : null;
 }

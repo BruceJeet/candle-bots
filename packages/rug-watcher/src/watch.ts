@@ -16,7 +16,9 @@
 import type { Alerter, Logger } from "candle-bot-core";
 import type { Ledger, PositionRow } from "candle-bot-core/ledger";
 import type { MarketRead } from "candle-bot-core/market/reader";
-import type { HolderSource } from "candle-bot-core/sources/holders";
+import { CreatorReadError, type BalanceAt, type HolderSource } from "candle-bot-core/sources/holders";
+import { readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import type { Action, Config } from "./config.ts";
 import { devTrips, fmtSol, fmtPrice, holderTrips, prune, watchedHolders, windowDrop, type HolderSample, type Sample, type Trip } from "./rules.ts";
 
@@ -24,7 +26,7 @@ const TABLES = `
 create table if not exists rug_events (
   id integer primary key, position_id integer not null, mint text not null, rule text not null, key text not null,
   fired_at integer not null, numbers text not null, sell real not null, alert_only integer not null, done_at integer,
-  unique (position_id, key)
+  outcome text, unique (position_id, key)
 );
 create table if not exists rug_creators (
   mint text primary key, creator text not null, source text not null, updated_at integer not null
@@ -47,6 +49,8 @@ export interface EventRow {
   sell: number;
   alert_only: number;
   done_at: number | null;
+  /** Why the event owes nothing more: sold, position closed, dismissed (by hand, or the rule is now off or alertOnly). */
+  outcome: string | null;
 }
 
 /** Venues whose SOL is a pool someone can pull (a bonding curve's SOL only leaves through sells). */
@@ -55,6 +59,8 @@ const POOL_VENUES = new Set(["damm", "pumpswap"]);
 export const HOLDER_FAIL_ALERT = 3;
 /** A creator that could not be found is looked for again after this long. */
 export const CREATOR_RETRY_MS = 3_600_000;
+/** Price and pool samples kept per coin at most (besides the window). */
+export const MAX_SAMPLES = 600;
 
 export interface WatchDeps {
   cfg: Config;
@@ -84,6 +90,8 @@ interface CoinState {
   filledSells: number;
   /** Where the next poll starts its direct reads (they rotate, so no wallet is starved). */
   rot: number;
+  /** The highest RPC slot a holder or balance read of this coin answered at: an older answer is stale. */
+  lastSlot: number;
 }
 
 export class RugWatch {
@@ -104,7 +112,7 @@ export class RugWatch {
   private state(positionId: number): CoinState {
     let s = this.coins.get(positionId);
     if (!s) {
-      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0 };
+      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0, lastSlot: 0 };
       this.coins.set(positionId, s);
     }
     return s;
@@ -121,6 +129,7 @@ export class RugWatch {
       this.d.log.error("rug_observe_failed", { error: String((e as Error)?.message ?? e) });
       return;
     }
+    this.dismissRequests();
     this.settleEvents();
     const live = new Set(open.map((p) => p.id));
     for (const id of this.coins.keys()) if (!live.has(id)) this.coins.delete(id);
@@ -144,6 +153,13 @@ export class RugWatch {
         st.liq = [];
       }
       st.filledSells = filled;
+      // A sell of this position pending or in flight: its own impact may already show in the pool before the fill is
+      // booked. No sample now; the fill restarts the windows.
+      if (this.d.ledger.openOrderFor(p.id)) {
+        st.price = [];
+        st.liq = [];
+        return;
+      }
       if (m.problem) return;
       if (m.venue !== st.venue) {
         // A migration moves the SOL from the curve to a pool: not a pull. Both windows start again on a new venue.
@@ -152,7 +168,7 @@ export class RugWatch {
         st.liq = [];
       }
       if (r.priceCrash && m.priceSol !== null && m.priceSol > 0) {
-        st.price = prune([...st.price, { at: m.nowMs, value: m.priceSol }], m.nowMs, r.priceCrash.windowSec);
+        st.price = prune([...st.price, { at: m.nowMs, value: m.priceSol }], m.nowMs, r.priceCrash.windowSec).slice(-MAX_SAMPLES);
         const trip = windowDrop(st.price, m.nowMs, r.priceCrash, "price", fmtPrice);
         if (trip) {
           this.fireSeq(p, "priceCrash", trip, r.priceCrash);
@@ -161,7 +177,7 @@ export class RugWatch {
       }
       const liq = m.quoteLiquidityLamports;
       if (r.liquidityPull && POOL_VENUES.has(m.venue) && typeof liq === "bigint") {
-        st.liq = prune([...st.liq, { at: m.nowMs, value: Number(liq) / 1e9 }], m.nowMs, r.liquidityPull.windowSec);
+        st.liq = prune([...st.liq, { at: m.nowMs, value: Number(liq) / 1e9 }], m.nowMs, r.liquidityPull.windowSec).slice(-MAX_SAMPLES);
         const trip = windowDrop(st.liq, m.nowMs, r.liquidityPull, `pool SOL (${m.venue})`, fmtSol);
         if (trip) {
           this.fireSeq(p, "liquidityPull", trip, r.liquidityPull);
@@ -195,9 +211,12 @@ export class RugWatch {
       }
       st.nextPollAt = now + this.d.cfg.watch.holdersPollMs;
       try {
-        await this.pollOne(p, st);
+        const failed = await this.pollOne(p, st);
+        if (failed.length) throw new Error(failed.join("; "));
         st.holderFails = 0;
       } catch (e) {
+        // Any read of the poll that failed (a snapshot, the creator, its balance, a direct or confirming read) counts:
+        // the backoff and the alert see a 429 on any of them.
         st.holderFails++;
         // Back off a failing coin (2x, 4x ... up to 16x the interval): a rate-limited RPC is not hammered.
         st.nextPollAt = now + this.d.cfg.watch.holdersPollMs * Math.min(2 ** st.holderFails, 16);
@@ -208,31 +227,72 @@ export class RugWatch {
     }
   }
 
-  private async pollOne(p: PositionRow, st: CoinState): Promise<void> {
+  /** A balance read with its slot; a read at an older slot than this coin has seen is stale (null). */
+  private async balance(owner: string, p: PositionRow, st: CoinState): Promise<BalanceAt | null> {
+    const h = this.d.holders;
+    const r = h.balanceAt ? await h.balanceAt(owner, p.mint) : await h.balanceOf(owner, p.mint).then((a) => (a === null ? null : { amount: a, slot: null }));
+    if (!r) return null;
+    if (r.slot !== null) {
+      if (r.slot < st.lastSlot) return null;
+      st.lastSlot = r.slot;
+    }
+    return r;
+  }
+
+  /** One coin's holder and creator reads. Returns what failed (empty: all read). */
+  private async pollOne(p: PositionRow, st: CoinState): Promise<string[]> {
     const r = this.d.cfg.rules;
+    const failed: string[] = [];
     const snap = await this.d.holders.snapshot(p.mint);
-    const creator = r.devDump ? await this.creator(p.mint) : null;
-    if (r.devDump && creator) {
-      const held = await this.d.holders.balanceOf(creator, p.mint);
-      if (held !== null) {
+    let snapOk = true;
+    if (typeof snap.slot === "number") {
+      if (snap.slot < st.lastSlot) {
+        snapOk = false;
+        failed.push(`holder list at slot ${snap.slot}, older than ${st.lastSlot}`);
+      } else st.lastSlot = snap.slot;
+    }
+    let creator: string | null = null;
+    if (r.devDump) {
+      const c = await this.creator(p.mint);
+      if ("error" in c) failed.push(`creator: ${c.error}`);
+      else if ("wallet" in c) creator = c.wallet;
+    }
+    if (r.devDump && creator === this.d.cfg.wallet) {
+      // Our own wallet launched it: our own sells would read as the dev selling. The dev rule is off for this coin.
+      this.d.alerter.raise(`rug:${p.id}:creator_is_us`, `rug watcher: the creator of ${p.mint} is this bot's own wallet; the dev rule does not run for it (its own sells would read as the dev selling)`);
+    } else if (r.devDump && creator) {
+      const first = await this.balance(creator, p, st);
+      if (!first) failed.push("creator balance unreadable or stale");
+      else {
         const row = this.d.ledger.db.prepare("select max_raw from rug_dev where position_id = ?").get(p.id) as { max_raw: string } | undefined;
         const prevMax = row ? BigInt(row.max_raw) : 0n;
-        const max = held > prevMax ? held : prevMax;
+        const max = first.amount > prevMax ? first.amount : prevMax;
         if (!row || max !== prevMax) this.d.ledger.db.prepare("insert into rug_dev (position_id, mint, max_raw, updated_at) values (?, ?, ?, ?) on conflict(position_id) do update set max_raw = excluded.max_raw, updated_at = excluded.updated_at").run(p.id, p.mint, max.toString(), this.now());
         // A creator that holds none of the coin when first read: the dev rule can only fire if it buys. Said once.
-        if (!row && held === 0n) this.d.alerter.raise(`rug:${p.id}:creator_empty`, `rug watcher: the creator found for ${p.mint} (${creator}) holds none of it; the dev rule fires only if it buys some. If that is the wrong wallet, name the right one in rules.devDump.creators`);
-        for (const t of devTrips(r.devDump, { maxRaw: max }, held, snap.supply, p.decimals)) this.fire(p, "devDump", `dev:${t.part}`, { ...t.trip, numbers: { creator, ...t.trip.numbers } }, r.devDump);
+        if (!row && first.amount === 0n) this.d.alerter.raise(`rug:${p.id}:creator_empty`, `rug watcher: the creator found for ${p.mint} (${creator}) holds none of it; the dev rule fires only if it buys some. If that is the wrong wallet, name the right one in rules.devDump.creators`);
+        const trips = devTrips(r.devDump, { maxRaw: max }, first.amount, snap.supply, p.decimals);
+        if (trips.length) {
+          // A single read never fires: a second read (at the same or a later slot) must show it too. An empty answer
+          // from a lagging node reads as 0; it has to say so twice.
+          const second = await this.balance(creator, p, st);
+          if (!second) failed.push("creator confirming read unreadable or stale");
+          else {
+            const again = new Set(devTrips(r.devDump, { maxRaw: max }, second.amount, snap.supply, p.decimals).map((t) => t.part));
+            for (const t of devTrips(r.devDump, { maxRaw: max }, second.amount, snap.supply, p.decimals)) if (again.has(t.part) && trips.some((x) => x.part === t.part)) this.fire(p, "devDump", `dev:${t.part}`, { ...t.trip, numbers: { creator, ...t.trip.numbers } }, r.devDump);
+            if (!trips.every((t) => again.has(t.part))) this.d.log.info("rug_dev_unconfirmed", { position: p.id, mint: p.mint, creator, firstRaw: first.amount.toString(), secondRaw: second.amount.toString() });
+          }
+        }
       }
     }
-    if (r.holderExit) {
+    if (r.holderExit && snapOk) {
       const rule = r.holderExit;
       const skip = new Set([this.d.cfg.wallet, ...rule.exclude, ...(r.devDump && creator ? [creator] : [])]);
       const list = snap.holders.filter((h) => !skip.has(h.owner));
       const sample: HolderSample = { at: snap.atMs, amounts: new Map(list.map((h) => [h.owner, h.amount])), top: list.slice(0, rule.topN).map((h) => h.owner) };
-      st.holders = [...st.holders, sample].filter((s) => s.at >= snap.atMs - rule.windowSec * 1000);
+      st.holders = [...st.holders, sample].filter((s) => s.at >= snap.atMs - rule.windowSec * 1000).slice(-MAX_SAMPLES);
       const nowAmounts = new Map<string, bigint | null>();
       let direct = 0;
-      const watched = [...watchedHolders(st.holders)];
+      const watched = [...watchedHolders(st.holders)].filter((o) => !skip.has(o));
       const start = watched.length ? st.rot % watched.length : 0;
       st.rot++;
       for (const owner of [...watched.slice(start), ...watched.slice(0, start)]) {
@@ -241,23 +301,32 @@ export class RugWatch {
         else if (direct < rule.topN) {
           // Out of the largest accounts now: its balance is read directly (unknown on a failed read, never zero).
           direct++;
-          nowAmounts.set(owner, await this.d.holders.balanceOf(owner, p.mint));
+          const b = await this.balance(owner, p, st);
+          if (!b) failed.push(`balance of ${owner} unreadable or stale`);
+          nowAmounts.set(owner, b ? b.amount : null);
         }
       }
       for (const t of holderTrips(rule, st.holders, nowAmounts, snap.supply, p.decimals)) {
         // The largest-accounts list shows only some of a wallet's accounts: confirm on the wallet's whole balance
         // (all its accounts) before firing. Unreadable: unknown, no firing this poll.
-        const full = await this.d.holders.balanceOf(t.owner, p.mint);
-        if (full === null) continue;
-        const ok = holderTrips(rule, st.holders, new Map([[t.owner, full]]), snap.supply, p.decimals)[0];
+        const full = await this.balance(t.owner, p, st);
+        if (!full) {
+          failed.push(`confirming read of ${t.owner} unreadable or stale`);
+          continue;
+        }
+        const ok = holderTrips(rule, st.holders, new Map([[t.owner, full.amount]]), snap.supply, p.decimals)[0];
         if (ok) this.fire(p, "holderExit", `holder:${t.owner}`, ok.trip, rule);
-        else this.d.log.info("rug_holder_unconfirmed", { position: p.id, mint: p.mint, owner: t.owner, wholeBalanceRaw: full.toString() });
+        else this.d.log.info("rug_holder_unconfirmed", { position: p.id, mint: p.mint, owner: t.owner, wholeBalanceRaw: full.amount.toString() });
       }
     }
+    return failed;
   }
 
-  /** The coin's creator: from config, else from chain (kept in the ledger); null when it cannot be found. */
-  private async creator(mint: string): Promise<string | null> {
+  /**
+   * The coin's creator: from config, else from chain (kept in the ledger once found). `none`: chain names none (looked
+   * for again after CREATOR_RETRY_MS, alerted). `error`: a read failed (tried again next poll; nothing is kept).
+   */
+  private async creator(mint: string): Promise<{ wallet: string } | { none: true } | { error: string }> {
     const given = this.d.cfg.rules.devDump?.creators[mint];
     const row = this.d.ledger.db.prepare("select creator, source from rug_creators where mint = ?").get(mint) as { creator: string; source: string } | undefined;
     if (given) {
@@ -266,19 +335,25 @@ export class RugWatch {
         // Another wallet: the highs kept for the old one do not apply.
         if (row) this.d.ledger.db.prepare("delete from rug_dev where mint = ?").run(mint);
       }
-      return given;
+      return { wallet: given };
     }
-    if (row) return row.creator;
-    if ((this.creatorMiss.get(mint) ?? 0) > this.now()) return null;
-    const found = await this.d.creatorOf(mint);
+    if (row && row.source !== "config") return { wallet: row.creator };
+    if ((this.creatorMiss.get(mint) ?? 0) > this.now()) return { none: true };
+    let found: { creator: string; source: string } | null;
+    try {
+      found = await this.d.creatorOf(mint);
+    } catch (e) {
+      const why = e instanceof CreatorReadError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
+      return { error: why };
+    }
     if (!found) {
       this.creatorMiss.set(mint, this.now() + CREATOR_RETRY_MS);
       this.d.alerter.raise(`rug:creator_unknown:${mint}`, `rug watcher: no creator found on chain for ${mint}; the dev rule does not run for it (set rules.devDump.creators to name one)`);
-      return null;
+      return { none: true };
     }
-    this.d.ledger.db.prepare("insert or ignore into rug_creators (mint, creator, source, updated_at) values (?, ?, ?, ?)").run(mint, found.creator, found.source, this.now());
+    this.d.ledger.db.prepare("insert into rug_creators (mint, creator, source, updated_at) values (?, ?, ?, ?) on conflict(mint) do update set creator = excluded.creator, source = excluded.source, updated_at = excluded.updated_at").run(mint, found.creator, found.source, this.now());
     this.d.log.info("rug_creator", { mint, creator: found.creator, source: found.source });
-    return found.creator;
+    return { wallet: found.creator };
   }
 
   // ------------------------------------------------------------------ firings
@@ -332,15 +407,24 @@ export class RugWatch {
     const rows = this.d.ledger.db.prepare("select * from rug_events where alert_only = 0 and done_at is null").all() as unknown as EventRow[];
     for (const e of rows) {
       const p = this.d.ledger.position(e.position_id);
-      if (this.soldFor(e) || !p || (p.status !== "open" && p.status !== "exit_stuck" && p.status !== "opening")) this.d.ledger.db.prepare("update rug_events set done_at = ? where id = ?").run(this.now(), e.id);
+      if (this.soldFor(e)) this.settle(e.id, "sold");
+      else if (!p || (p.status !== "open" && p.status !== "exit_stuck" && p.status !== "opening")) this.settle(e.id, `position ${p?.status ?? "gone"}`);
     }
+  }
+
+  /** Close an event that owes nothing more, with why. */
+  private settle(id: number, outcome: string): void {
+    this.d.ledger.db.prepare("update rug_events set done_at = ?, outcome = ? where id = ? and done_at is null").run(this.now(), outcome, id);
   }
 
   /**
    * The sell a firing still owes this position: the oldest selling event whose sell has not filled. Its reason
    * (`rug:<rule>#<event id>`) ties the order to the event. Null while that sell is in flight, or when none is owed.
+   * Checked against the rules as configured NOW: a rule since turned off or set to alertOnly owes nothing (the event is
+   * dismissed), and the share sold is the rule's current `sell`. A share that rounds to nothing of what remains is
+   * settled, so it never holds the configured exit back.
    */
-  pendingSell(positionId: number): { fraction: number; reason: string } | null {
+  pendingSell(positionId: number, remainingRaw?: bigint): { fraction: number; reason: string } | null {
     const rows = this.d.ledger.db.prepare("select * from rug_events where position_id = ? and alert_only = 0 and done_at is null order by id").all(positionId) as unknown as EventRow[];
     if (!rows.length) return null;
     const sells = this.d.ledger.ordersFor(positionId).filter((o) => o.side === "sell");
@@ -348,12 +432,57 @@ export class RugWatch {
       const reason = `rug:${e.rule}#${e.id}`;
       const mine = sells.filter((o) => o.reason === reason);
       if (mine.some((o) => o.status === "filled")) {
-        this.d.ledger.db.prepare("update rug_events set done_at = ? where id = ?").run(this.now(), e.id);
+        this.settle(e.id, "sold");
         continue;
       }
       if (mine.some((o) => o.status === "pending" || o.status === "inflight")) return null;
-      return { fraction: e.sell, reason };
+      const rule = this.d.cfg.rules[e.rule] as Action | undefined;
+      if (!rule || rule.alertOnly) {
+        this.settle(e.id, `dismissed: the rule is now ${rule ? "alertOnly" : "off"}`);
+        this.d.log.info("rug_event_dismissed", { event: e.id, position: positionId, why: rule ? "alertOnly" : "rule off" });
+        continue;
+      }
+      if (remainingRaw !== undefined && (rule.sell >= 1 ? remainingRaw : (remainingRaw * BigInt(Math.round(rule.sell * 1e6))) / 1_000_000n) <= 0n) {
+        this.settle(e.id, "nothing left to sell");
+        continue;
+      }
+      return { fraction: rule.sell, reason };
     }
     return null;
+  }
+
+  /** Dismiss an event by hand: it owes no sell; the coin stays watched. */
+  dismiss(eventId: number): string {
+    const e = this.d.ledger.db.prepare("select * from rug_events where id = ?").get(eventId) as unknown as EventRow | undefined;
+    if (!e) return `no event ${eventId}`;
+    if (e.done_at !== null) return `event ${eventId} is already settled (${e.outcome ?? "done"})`;
+    this.settle(eventId, "dismissed by hand");
+    this.d.log.info("rug_event_dismissed", { event: eventId, position: e.position_id, why: "by hand" });
+    return `dismissed event ${eventId}`;
+  }
+
+  /** `dismiss` request files (written by the command line while the watcher runs). */
+  private dismissRequests(): void {
+    const dir = join(this.d.cfg.stateDir, "requests");
+    let names: string[];
+    try {
+      names = readdirSync(dir).filter((n) => /^dismiss-.*\.json$/.test(n)).sort();
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      const f = join(dir, n);
+      try {
+        const req = JSON.parse(readFileSync(f, "utf8"));
+        this.d.log.info("dismiss_request", { file: n, result: this.dismiss(Number(req.event)) });
+      } catch (e) {
+        this.d.log.warn("dismiss_request_unreadable", { file: n, error: String((e as Error)?.message ?? e) });
+      }
+      try {
+        unlinkSync(f);
+      } catch {
+        /* gone */
+      }
+    }
   }
 }
