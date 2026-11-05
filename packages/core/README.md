@@ -231,6 +231,16 @@ expected fill and the engine's read of the pool. A bot whose buys fill on pools 
 (`parts(ctx, ledger, { maxBuyImpactBps, executor: (d) => new Executor({ ...d, dammBuys: true }) })`) so a retry
 rechecks the pool (the ticket's impact, and the price move since the decision) rather than ending as `CURVE`. `readMarkets` returns the pool as `MarketRead.pool`.
 
+## Opening a position from a fill the engine did not place
+
+`engine.openFromFill({ mint, signature, decimals, reason, entry?, expectedQtyRaw? })` books a position from a
+transaction on chain: the wallet's token gain is the quantity, its SOL spent (network fee and rent apart) the cost.
+It answers `{ ok: true, positionId, qtyRaw, costLamports }`, or `{ ok: false, reason }` (`tx_not_found`: read again
+later; `tx_failed`; `no_tokens`; `dry`) and books nothing. An API's number (`expectedQtyRaw`) is only compared: the
+chain wins. The position gets a filled buy order `fill-<signature>` (idempotent), so `maxPerCoin`, `maxOpen` and
+`lifetimeSol` count it and the strategy, the sell clamp and `sell` treat it as any other. candle-launch-helper opens
+its dev bag with it.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;

@@ -11,6 +11,7 @@ import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readd
 import { join } from "node:path";
 import type { Config } from "./config.ts";
 import { Executor } from "./exec/executor.ts";
+import { fillFromTx, type Fill } from "./exec/fills.ts";
 import type { Ledger, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import { readMarkets, type MarketRead } from "./market/reader.ts";
@@ -1386,6 +1387,58 @@ export class Engine {
    * The `sell` command's path: same clamp, same executor. Moves an exit_stuck position back to open. (0.3.0) Holds the
    * coin for the whole request (the reopen scan, the balance read, the booking): no attempt on it runs meanwhile.
    */
+  /**
+   * (0.4.0) Open a position from a buy this engine did not place (a launch's dev buy; later, an adopted bag): the
+   * quantity and cost are read from the transaction on chain (the wallet's token and SOL deltas, network fee and rent
+   * apart), never from an API's number. The position is booked with a filled buy order (`fill-<signature>`) so the
+   * caps count it (maxPerCoin, maxOpen, lifetimeSol) and the exits, the clamp and `sell` treat it as any other.
+   * Idempotent per signature. Nothing is booked when the transaction cannot be read (`tx_not_found`: read again
+   * later), failed on chain, or gave the wallet no tokens. `expectedQtyRaw` (the API's word) is only compared: the
+   * chain wins, and a gap over 1 % is logged and alerted. Dry runs refuse (a dry ledger never books a real fill).
+   */
+  async openFromFill(p: { mint: string; signature: string; decimals: number; reason: string; entry?: unknown; expectedQtyRaw?: bigint | null }): Promise<{ ok: true; positionId: number; qtyRaw: bigint; costLamports: bigint } | { ok: false; reason: string }> {
+    if (this.d.cfg.mode !== "live") return { ok: false, reason: "dry" };
+    if (!asAddress(p.mint)) return { ok: false, reason: "bad_mint" };
+    const id = `fill-${p.signature}`;
+    const have = this.d.ledger.db.prepare("select o.position_id pid, p.qty_raw q, p.cost_lamports c from orders o join positions p on p.id = o.position_id where o.client_trade_id = ?").get(id) as { pid: number; q: string; c: string } | undefined;
+    if (have) return { ok: true, positionId: have.pid, qtyRaw: BigInt(have.q), costLamports: BigInt(have.c) };
+    let tx: any;
+    try {
+      tx = await this.d.rpc.call<any>("getTransaction", [p.signature, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
+    } catch (e) {
+      return { ok: false, reason: `tx_read_failed: ${String((e as Error)?.message ?? e).slice(0, 120)}` };
+    }
+    if (!tx) return { ok: false, reason: "tx_not_found" };
+    let fill: Fill;
+    try {
+      fill = fillFromTx(tx, this.d.cfg.wallet, p.mint);
+    } catch (e) {
+      return { ok: false, reason: `tx_unreadable: ${(e as Error).message}` };
+    }
+    if (fill.err) return { ok: false, reason: "tx_failed" };
+    if (fill.tokenDeltaRaw <= 0n) return { ok: false, reason: "no_tokens" };
+    const cost = fill.swapLamports < 0n ? -fill.swapLamports : 0n;
+    const now = this.now();
+    const pid = this.d.ledger.tx(() => {
+      const pos = this.d.ledger.createPosition({ mint: p.mint, chain: "solana", dry: false, now, decimals: p.decimals, strategy: this.d.strategy.name, entry: p.entry ?? { from: "fill", signature: p.signature } });
+      const oid = this.d.ledger.createOrder({ positionId: pos, side: "buy", clientTradeId: id, amountRaw: cost, slippageBps: 0, maxAttempts: 0, now, reason: p.reason, manual: true, expectedOutRaw: p.expectedQtyRaw ?? null });
+      this.d.ledger.updateOrder(oid, { status: "filled", signature: p.signature, qty_source: "onchain", fill_json: JSON.stringify({ fill, result: { from: "openFromFill" } }, (_k, v) => (typeof v === "bigint" ? v.toString() : v)), updated_at: now });
+      const entry = cost > 0n ? Number(cost) / 1e9 / (Number(fill.tokenDeltaRaw) / 10 ** p.decimals) : 0;
+      this.d.ledger.updatePosition(pos, { status: "open", qty_raw: fill.tokenDeltaRaw.toString(), qty_source: "onchain", remaining_raw: fill.tokenDeltaRaw.toString(), cost_lamports: cost.toString(), network_fees_lamports: fill.networkFeeLamports.toString(), rent_lamports: fill.rentLamports.toString(), peak_price: entry });
+      return pos;
+    });
+    this.d.log.info("position_from_fill", { position: pid, mint: p.mint, signature: p.signature, qtyRaw: fill.tokenDeltaRaw, costLamports: cost, expectedQtyRaw: p.expectedQtyRaw ?? null });
+    const exp = p.expectedQtyRaw;
+    if (exp !== undefined && exp !== null && exp > 0n) {
+      const gap = Number(fill.tokenDeltaRaw - exp) / Number(exp);
+      if (Math.abs(gap) > 0.01) {
+        this.d.log.warn("fill_disagrees", { position: pid, mint: p.mint, chainQtyRaw: fill.tokenDeltaRaw, expectedQtyRaw: exp, gap });
+        this.d.alerter.raise(`position:${pid}:fill_disagrees`, `position ${pid} ${p.mint}: the chain says ${fill.tokenDeltaRaw}, the API said ${exp} (${(gap * 100).toFixed(1)} %); booked from the chain`);
+      }
+    }
+    return { ok: true, positionId: pid, qtyRaw: fill.tokenDeltaRaw, costLamports: cost };
+  }
+
   async manualSell(mint: string, fraction: number): Promise<string> {
     if (!this.d.executor.reserveMint(mint)) return "an order attempt on this coin is in flight; try again";
     try {

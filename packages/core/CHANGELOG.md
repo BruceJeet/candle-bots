@@ -19,6 +19,12 @@ New API for bots that buy graduated coins or watch Candle launches. A 0.3.x bot 
   `POOL` for a pool that does not match, a read failure waits. Without it, as before, such a retry ends `CURVE`.
 - `dammBuy` refuses (`pool_layout`) a fee mode or scheduler mode it does not know, rather than guess the fee.
 - **`MarketRead.pool`**: the decoded pool for a graduated coin. Dry fills price a graduated coin's buy on its pool.
+- **`Engine.openFromFill({ mint, signature, decimals, reason, entry?, expectedQtyRaw? })`**: opens a position from a
+  buy the engine did not place (a launch's dev buy; later, an adopted bag). Quantity and cost come from the
+  transaction on chain (the wallet's deltas, fee and rent apart), never from an API's number; a filled buy order
+  `fill-<signature>` is booked with it, so the caps count it and the exits, the clamp and `sell` treat it as any
+  position. Idempotent per signature; nothing is booked for a transaction that cannot be read, failed, or gave no
+  tokens; an `expectedQtyRaw` more than 1 % off the chain is logged and alerted (`fill_disagrees`). Live only.
 - **`sources/candleLaunches`** (root export `CandleLaunches`): candle-launch-bot's launch detector (Candle's token
   list and the curve program on chain, deduped by mint, latency from block time), moved into the core unchanged so
   every bot that watches Candle launches shares it.

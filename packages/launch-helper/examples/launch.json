@@ -1,0 +1,13 @@
+{
+  "comment": "Dry run: prints the launch it would send and calls nothing. For live: your wallet, \"mode\": \"live\", and the API key in CANDLE_API_KEY.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-launch",
+  "buy": { "sol": 0.1, "maxSlippageBps": 500, "maxOpen": 1, "lifetimeSol": 0.1 },
+  "sell": { "maxSlippageBps": 1500 },
+  "launch": { "name": "Example Coin", "symbol": "EXMPL", "imageUrl": "https://example.com/logo.png", "mode": "open", "devBuySol": 0.05 },
+  "exit": { "strategy": "ladder", "rungs": [{ "at": 3, "sell": 0.3 }, { "at": 10, "sell": 0.3 }] }
+}
