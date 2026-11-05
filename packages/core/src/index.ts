@@ -19,7 +19,7 @@ export type { AlertSink, AlertConfig } from "./alerts.ts";
 export { makeLogger, memoryLogger } from "./log.ts";
 export type { Logger, Level } from "./log.ts";
 export { redact, redactDeep, addSecret, errorJson } from "./redact.ts";
-export { readMarkets, dryPricer, expectedSellOut } from "./market/reader.ts";
+export { readMarkets, dryPricer, expectedSellOut, sellFloor } from "./market/reader.ts";
 export type { MarketRead, CoinRef, QuoteSource, ReadOptions } from "./market/reader.ts";
 export { decodePumpCurve, decodePumpPool, decodeFeeConfig, decodeTokenAccount, feesAt, pumpCurveSell, pumpPoolSell, pumpCurvePrice, pumpPoolPrice, pumpPoolState, pumpCurveProgress } from "./market/pump.ts";
 export type { PumpCurve, PumpPool, PumpPoolState, FeeConfig, PumpFees, SellOut } from "./market/pump.ts";

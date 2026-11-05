@@ -261,7 +261,9 @@ export function pumpPoolSell(s: PumpPoolState, mint: string, raw: bigint, supply
   if (raw <= 0n) throw new DecodeError("pump_amount");
   const gross = (raw * s.quoteReserve) / (s.baseReserve + raw);
   if (gross > s.quoteVault) throw new DecodeError("pump_reserves");
-  const fees = feesAt(cfg, pumpPoolMcap(s, supply));
+  const tier = feesAt(cfg, pumpPoolMcap(s, supply));
+  // A pool with no coin creator set pays no creator fee (not checked on a real sell: every fixture pool has one).
+  const fees = s.pool.coinCreator === SYSTEM ? { ...tier, creatorBps: 0n } : tier;
   const fee = ceilBps(gross, fees.lpBps) + ceilBps(gross, fees.protocolBps) + ceilBps(gross, fees.creatorBps);
   return { outLamports: gross > fee ? gross - fee : 0n, grossLamports: gross, feeLamports: fee, fees };
 }

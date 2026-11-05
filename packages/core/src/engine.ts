@@ -289,6 +289,12 @@ export class Engine {
     });
   }
 
+  /** (0.5.0) The last exit tick's market read of a coin (a frozen copy), if any. */
+  market(mint: string): Readonly<MarketRead> | undefined {
+    const m = this.markets.get(mint);
+    return m ? Object.freeze({ ...m }) : undefined;
+  }
+
   get executor(): Executor {
     return this.d.executor;
   }
@@ -1250,6 +1256,16 @@ export class Engine {
         const peak = Math.max(p.peak_price, m.priceSol);
         if (p.last_price !== m.priceSol || p.peak_price !== peak) this.d.ledger.updatePosition(p.id, { last_price: m.priceSol, peak_price: peak });
         if (trail) {
+          // A reset asked by a partial trail sell applies once that sell filled; a sell that ended otherwise drops it
+          // (the bag keeps the mark it had, so the trail still protects it).
+          const reset = this.d.ledger.trailReset(p.id);
+          if (reset) {
+            const o = this.d.ledger.order(reset.orderId);
+            if (o?.status === "filled") {
+              this.d.ledger.setTrailMark(p.id, reset.price, this.now());
+              this.d.ledger.clearTrailReset(p.id);
+            } else if (!o || ["rejected", "reverted", "failed"].includes(o.status)) this.d.ledger.clearTrailReset(p.id);
+          }
           const mark = this.d.ledger.trailMark(p.id);
           const next = Math.max(mark ?? p.peak_price, m.priceSol);
           if (mark !== next) this.d.ledger.setTrailMark(p.id, next, this.now());
@@ -1316,7 +1332,7 @@ export class Engine {
       for (const x of toSell) {
         if (this.shouldStop()) return;
         const id = await this.placeSell(x.p, x.fraction, x.reason, false);
-        if (id !== null && x.resetTrail !== null) this.d.ledger.setTrailMark(x.p.id, x.resetTrail, this.now());
+        if (id !== null && x.resetTrail !== null) this.d.ledger.setTrailReset(x.p.id, id, x.resetTrail, this.now());
       }
       return;
     }
@@ -1329,7 +1345,7 @@ export class Engine {
         // One sell that throws ends neither the others nor the pass early (every worker is awaited below).
         try {
           const id = await this.placeSell(x.p, x.fraction, x.reason, false);
-          if (id !== null && x.resetTrail !== null) this.d.ledger.setTrailMark(x.p.id, x.resetTrail, this.now());
+          if (id !== null && x.resetTrail !== null) this.d.ledger.setTrailReset(x.p.id, id, x.resetTrail, this.now());
           if (id !== null) this.pump();
         } catch (e) {
           this.d.log.error("cycle_step_failed", { step: "exits", position: x.p.id, error: String((e as Error)?.stack ?? e) });

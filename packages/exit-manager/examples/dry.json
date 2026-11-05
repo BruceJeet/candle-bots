@@ -1,0 +1,13 @@
+{
+  "comment": "Dry run: adopts into the ledger and logs every exit it would take, never trades. No API key needed. Set your wallet before running.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "sell": { "maxSlippageBps": 1000 },
+  "adoption": { "mode": "wallet", "exclude": [], "excludeStateDirs": [], "minValueSol": 0.01, "noBasis": "skip" },
+  "manager": { "exits": {} },
+  "exit": { "strategy": "trail", "trailBps": 2500 }
+}

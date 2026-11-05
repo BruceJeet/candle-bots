@@ -11,6 +11,7 @@ one you want and you get that bot and the core, nothing else.
 | [candle-graduation-bot](packages/graduation-bot/README.md) | Buys Candle coins as their curve completes and their DAMM v2 pool opens, filtered by time since graduation, impact on the pool, room above its floor and creator; exits by a strategy | `npx candle-graduation-bot run --config bot.json` (start from `examples/dry.json`) |
 | [candle-launch-helper](packages/launch-helper/README.md) | Fires the Candle launch you describe with its dev buy in the same bundle (never twice), then manages the dev bag with exits and controls | `npx candle-launch-helper plan --config launch.json`, then `run` |
 | [candle-creator-bot](packages/creator-bot/README.md) | Buys the new launches of the creators you list, with a ticket and lifetime caps per creator; optional dev-buy wait; exits by a strategy | `npx candle-creator-bot run --config bot.json` (start from `examples/dry.json`) |
+| [candle-exit-manager](packages/exit-manager/README.md) | Never buys: adopts bags already in the wallet (a list, or the whole wallet less other bots' coins, dust and junk mints) and exits them by a strategy, a trailing stop included; Candle coins, pump.fun curves and PumpSwap | `npx candle-exit-manager run --config bot.json` (start from `examples/dry.json`) |
 
 Under them:
 
@@ -24,7 +25,7 @@ Under them:
 Each bot's README says what it buys, what it needs (a Candle API key, a wallet, an RPC) and how to start in dry mode,
 which runs the whole loop with paper fills and spends nothing. Start there, read `status.json`, then go live with small
 caps. Every bot has the same controls: `STOP` and `PAUSE_BUYS` files in its state folder, a `sell` command, and the
-same exit strategies.
+same exit strategies. The bots that only sell (candle-exit-manager) have `PAUSE_SELLS` instead of `PAUSE_BUYS`.
 
 ## Adding a bot
 

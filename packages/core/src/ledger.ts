@@ -372,7 +372,7 @@ export class Ledger {
   /** (0.5.0) The trail-mark table, created on first use only (a ledger whose bot never uses `trail` is never changed). */
   ensureTrailTable(): void {
     if (this.trailTable) return;
-    this.db.exec("create table if not exists trail_marks (position_id integer primary key, mark real not null, updated_at integer not null)");
+    this.db.exec("create table if not exists trail_marks (position_id integer primary key, mark real not null, updated_at integer not null, reset_order integer, reset_price real)");
     this.trailTable = true;
   }
 
@@ -385,6 +385,23 @@ export class Ledger {
   setTrailMark(positionId: number, mark: number, now: number): void {
     this.ensureTrailTable();
     this.db.prepare("insert into trail_marks (position_id, mark, updated_at) values (?, ?, ?) on conflict(position_id) do update set mark = excluded.mark, updated_at = excluded.updated_at").run(positionId, mark, now);
+  }
+
+  /** A mark reset that waits for its sell to fill (resetTrail): applied once order `orderId` is filled, dropped if it ends otherwise. */
+  setTrailReset(positionId: number, orderId: number, price: number, now: number): void {
+    this.ensureTrailTable();
+    const mark = this.trailMark(positionId) ?? price;
+    this.db.prepare("insert into trail_marks (position_id, mark, updated_at, reset_order, reset_price) values (?, ?, ?, ?, ?) on conflict(position_id) do update set reset_order = excluded.reset_order, reset_price = excluded.reset_price, updated_at = excluded.updated_at").run(positionId, mark, now, orderId, price);
+  }
+
+  trailReset(positionId: number): { orderId: number; price: number } | undefined {
+    this.ensureTrailTable();
+    const r = this.db.prepare("select reset_order o, reset_price p from trail_marks where position_id = ? and reset_order is not null").get(positionId) as { o: number; p: number } | undefined;
+    return r ? { orderId: r.o, price: r.p } : undefined;
+  }
+
+  clearTrailReset(positionId: number): void {
+    this.db.prepare("update trail_marks set reset_order = null, reset_price = null where position_id = ?").run(positionId);
   }
 
   // ---------------------------------------------------------------- alerts

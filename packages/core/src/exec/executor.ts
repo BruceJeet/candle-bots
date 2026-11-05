@@ -87,6 +87,13 @@ export interface ExecutorDeps {
    * Unset: no check (0.4.0). Payer main cannot be checked: Candle signs inside the build. See trader.ts KNOWN_PROGRAMS.
    */
   knownPrograms?: ReadonlySet<string>;
+  /**
+   * (0.5.0) Linked payer, sells only: the least SOL (lamports) a sell of `amountRaw` of `mint` may be built to accept,
+   * from the bot's own fresh read of the venue (market/reader `sellFloor`), or null for no check. A build whose
+   * minOutRaw is under it is never signed (rejected, SELL_FLOOR, alerted; the next exit is a new order). A read that
+   * fails answers null: Candle's own floor still applies.
+   */
+  sellFloor?: (mint: string, amountRaw: bigint, decimals: number) => Promise<bigint | null>;
 }
 
 type Outcome =
@@ -545,11 +552,28 @@ export class Executor {
           return this.apply(o, pos, { kind: "rejected", code, detail: unknown.join(", ").slice(0, 200) });
         }
       }
+      if (o.side === "sell" && this.d.sellFloor) {
+        // (0.5.0) Candle's floor must not sit under what the venue itself pays (less the slippage and a margin).
+        const floor = await this.d.sellFloor(pos.mint, BigInt(o.amount_raw), pos.decimals).catch(() => null);
+        const minOut = /^\d+$/.test(String(built.minOutRaw ?? "")) ? BigInt(String(built.minOutRaw)) : null;
+        if (floor !== null && (minOut === null || minOut < floor)) {
+          this.d.ledger.endAttempt(att, this.now(), "rejected", "SELL_FLOOR", JSON.stringify({ minOutRaw: String(built.minOutRaw ?? ""), floor: floor.toString() }));
+          this.alert(`order:${o.id}:SELL_FLOOR`, `order ${o.id} sell ${pos.mint}: not signed, Candle's floor ${String(built.minOutRaw ?? "none")} is under ${floor} lamports (the venue's own price less slippage)`);
+          return this.apply(o, pos, { kind: "rejected", code: "SELL_FLOOR", detail: `minOut ${String(built.minOutRaw ?? "none")} < ${floor}` });
+        }
+      }
       // (0.3.0) STOP while the build was under way: nothing is signed or submitted. The built transaction is dropped
       // (it was never signed, so it can never land); the order goes back as it was, its attempt counted.
       if (shouldStop?.()) {
         this.d.ledger.endAttempt(att, this.now(), "stopped", null, null);
         return this.apply(o, pos, { kind: "wait", untilMs: this.now(), why: "stop requested before signing" });
+      }
+      // (0.5.0) A build of a transaction version this code cannot read the signature of (v1 and later start with their
+      // version byte) is never signed: its signature could not be saved before submit.
+      if (Buffer.from(String(built.artifacts.transactionBase64 ?? "").slice(0, 8), "base64")[0] & 0x80) {
+        this.d.ledger.endAttempt(att, this.now(), "rejected", "TX_VERSION", null);
+        this.alert(`order:${o.id}:TX_VERSION`, `order ${o.id} ${o.side} ${pos.mint}: not signed, the build is a transaction version this bot cannot read`);
+        return this.apply(o, pos, { kind: "rejected", code: "TX_VERSION", detail: "transaction version 1 or later" });
       }
       phase = "sign";
       const signed = await this.d.rail.sign(built.artifacts.transactionBase64);

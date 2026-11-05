@@ -180,7 +180,8 @@ async function readMarketsWide(rpc: Rpc, coins: CoinRef[], nowMs: number, opts: 
               second.push(quoteVault);
               later.push(() => {
                 try {
-                  base.quoteLiquidityLamports = decodeTokenAccount(vaultVals.get(quoteVault)).amount;
+                  const v = decodeTokenAccount(vaultVals.get(quoteVault));
+                  base.quoteLiquidityLamports = v.mint === WSOL ? v.amount : null;
                 } catch {
                   base.quoteLiquidityLamports = null;
                 }
@@ -278,6 +279,20 @@ export function expectedSellOut(m: MarketRead, raw: bigint): bigint | null {
     return null;
   }
   return null;
+}
+
+/**
+ * (0.5.0) For ExecutorDeps.sellFloor: a fresh wide read of the coin and its venue's expected out for the sell, less
+ * `slippageBps + marginBps`. Null (no check) when the venue is not a pump.fun one or nothing can be computed.
+ */
+export function sellFloor(rpc: Rpc, slippageBps: number, marginBps = 200): (mint: string, amountRaw: bigint, decimals: number) => Promise<bigint | null> {
+  return async (mint, amountRaw, decimals) => {
+    const m = (await readMarkets(rpc, [{ mint, decimals }], Date.now(), { pump: true })).get(mint);
+    const exp = m ? expectedSellOut(m, amountRaw) : null;
+    if (exp === null) return null;
+    const keep = BigInt(Math.max(0, 10_000 - Math.round(slippageBps) - Math.round(marginBps)));
+    return (exp * keep) / 10_000n;
+  };
 }
 
 export function impactBps(curve: CandleCurve, lamports: bigint): { bps: number; expectedOutRaw: bigint } | { error: string } {

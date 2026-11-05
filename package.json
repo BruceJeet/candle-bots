@@ -10,10 +10,11 @@
     "packages/graduation-bot",
     "packages/creator-bot",
     "packages/launch-helper",
+    "packages/exit-manager",
     "packages/example-bot"
   ],
   "scripts": {
-    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot && npm run build -w candle-graduation-bot && npm run build -w candle-creator-bot && npm run build -w candle-launch-helper",
+    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot && npm run build -w candle-graduation-bot && npm run build -w candle-creator-bot && npm run build -w candle-launch-helper && npm run build -w candle-exit-manager",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "check": "sh scripts/check-neutral.sh .",
     "pack:all": "sh scripts/release.sh pack"

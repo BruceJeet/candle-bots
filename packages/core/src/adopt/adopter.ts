@@ -68,6 +68,15 @@ export const RECONCILE_CONFIRM_MS = 60_000;
 export const SKIP_RETRY_MS = 600_000;
 /** Mints adopted in one step at most (each costs a few reads; the rest wait for the next step). */
 export const ADOPT_PER_STEP = 10;
+/**
+ * Candidate mints looked at in one step at most, adopted or not (each look costs reads; a wallet full of airdropped
+ * junk must not stall the cycle or flood the RPC). The rest are looked at in the next steps, oldest look first.
+ */
+export const LOOKS_PER_STEP = 20;
+/** A mint whose read failed (RPC error, rate limit) is looked at again after this long, not SKIP_RETRY_MS. */
+export const READ_RETRY_MS = 60_000;
+/** Another bot's open mints as last read stay good for a sell check this long when a fresh read fails. */
+export const OTHERS_GRACE_MS = 300_000;
 /** A mint's junk check is re-read before a sell when it is older than this. */
 export const SELL_CHECK_MS = 60_000;
 
@@ -176,7 +185,8 @@ export interface AdoptionRow {
   updated_at: number;
 }
 
-export type Basis = { source: "signatures" | "manual" | "chain" | "mark" | "none"; costLamports: bigint; detail?: Record<string, unknown> };
+/** `signatures`: buys counted in the basis (recorded so a later growth never counts them again). */
+export type Basis = { source: "signatures" | "manual" | "chain" | "mark" | "none"; costLamports: bigint; detail?: Record<string, unknown>; signatures?: string[] };
 
 const TABLES = `
 create table if not exists adoptions (
@@ -195,8 +205,11 @@ export class Adopter {
   /** A difference seen once (mint -> first seen, balance then), waiting for the confirming read. */
   private pendingDiff = new Map<string, { at: number; bal: bigint }>();
   private mintChecks = new Map<string, { at: number; why: string | null }>();
-  /** Other bots' open mints as of the last step (null: a ledger could not be read). */
-  private others: Set<string> | null = new Set();
+  /** Other bots' open mints as of the last read (null: not read yet, or a ledger could not be read). */
+  private others: Set<string> | null = null;
+  /** The last good read of other bots' mints, and when. */
+  private othersOk: Set<string> | null = null;
+  private othersOkAt = 0;
   /** Mints the `adopt` request added this run (list mode). */
   private added = new Map<string, AdoptMint>();
 
@@ -246,7 +259,13 @@ export class Adopter {
       try {
         db = new DatabaseSync(path, { readOnly: true });
         db.exec("pragma busy_timeout = 250");
-        const rows = db.prepare("select distinct mint from positions where status in ('opening','open','exit_stuck')").all() as Array<{ mint: string }>;
+        // Open positions, and failed buys that may have landed (signed, or a possible execution): that bot's `sell` can
+        // still reopen those tokens, so they are its own.
+        const rows = db.prepare(
+          `select distinct p.mint mint from positions p where p.status in ('opening','open','exit_stuck')
+             or (p.status = 'failed' and exists (select 1 from orders o where o.position_id = p.id and o.side = 'buy'
+                   and (o.signature is not null or o.ever_signed = 1) and o.status in ('failed','rejected')))`,
+        ).all() as Array<{ mint: string }>;
         for (const r of rows) out.add(String(r.mint));
       } catch (e) {
         this.ledgerAlert(dir, String((e as Error)?.message ?? e).slice(0, 160));
@@ -259,6 +278,8 @@ export class Adopter {
         }
       }
     }
+    this.othersOk = out;
+    this.othersOkAt = this.now();
     return out;
   }
 
@@ -322,16 +343,25 @@ export class Adopter {
     }
     if (shouldStop() || this.others === null) return;
     let n = 0;
-    for (const t of this.candidates(wallet)) {
-      if (shouldStop() || n >= ADOPT_PER_STEP) break;
+    let looks = 0;
+    // Least recently looked at first, so a long wallet is worked through over several steps.
+    const cands = this.candidates(wallet).sort((x, y) => (this.lookedAt.get(x.mint) ?? 0) - (this.lookedAt.get(y.mint) ?? 0));
+    for (const t of cands) {
+      if (shouldStop() || n >= ADOPT_PER_STEP || looks >= LOOKS_PER_STEP) break;
+      looks++;
+      this.lookedAt.set(t.mint, this.now());
       try {
         const r = await this.adopt(t.mint, t);
         if (r.ok) n++;
       } catch (e) {
-        this.d.log.error("adoption_failed", { mint: t.mint, error: String((e as Error)?.stack ?? e) });
+        // A read that threw (RPC error, rate limit): looked at again soon, never counted as a verdict on the coin.
+        this.skip(t.mint, `read failed (${String((e as Error)?.message ?? e).slice(0, 80)})`, {}, READ_RETRY_MS);
       }
     }
   }
+
+  /** When each candidate mint was last looked at (round robin across steps). */
+  private lookedAt = new Map<string, number>();
 
   /** Wallet tokens that may be adopted now (mode, exclusions, not managed or released, not skipped recently). */
   private candidates(wallet: Map<string, WalletToken>): WalletToken[] {
@@ -352,20 +382,20 @@ export class Adopter {
     return out;
   }
 
-  private skip(mint: string, why: string, fields: Record<string, unknown> = {}): { ok: false; reason: string } {
+  private skip(mint: string, why: string, fields: Record<string, unknown> = {}, retryMs = SKIP_RETRY_MS): { ok: false; reason: string } {
     const prev = this.skipped.get(mint);
-    this.skipped.set(mint, { until: this.now() + SKIP_RETRY_MS, why });
+    this.skipped.set(mint, { until: this.now() + retryMs, why });
     if (prev?.why !== why) this.d.log.info("adoption_skip", { mint, why, ...fields });
     return { ok: false, reason: why };
   }
 
   /** The junk check for one mint (read now), or why it cannot be judged. */
-  async mintCheck(mint: string): Promise<{ why: string | null; decimals?: number }> {
+  async mintCheck(mint: string): Promise<{ why: string | null; decimals?: number; transient?: boolean }> {
     let v: any;
     try {
       v = (await this.d.rpc.call<any>("getAccountInfo", [mint, { encoding: "base64", commitment: "confirmed" }]))?.value;
     } catch (e) {
-      return { why: `mint unreadable (${String((e as Error)?.message ?? e).slice(0, 80)})` };
+      return { why: `mint unreadable (${String((e as Error)?.message ?? e).slice(0, 80)})`, transient: true };
     }
     try {
       const m = decodeMint(v);
@@ -383,10 +413,17 @@ export class Adopter {
    */
   async sellCheck(p: PositionRow): Promise<string | null> {
     if (!this.adoption(p.id)) return null;
-    // Read the other bots' ledgers now (a `sell` run with the bot stopped has had no adoption step yet).
-    this.others = this.otherBotsMints();
-    if (this.others === null) return "another bot's ledger could not be read";
-    if (this.others.has(p.mint)) return "another bot holds an open position in this coin";
+    // Read the other bots' ledgers now (a `sell` run with the bot stopped has had no adoption step yet). A read that
+    // fails falls back to the last good one for OTHERS_GRACE_MS (a busy moment never holds a stop-loss); past that
+    // the sell is refused and alerted.
+    const fresh = this.otherBotsMints();
+    this.others = fresh;
+    const known = fresh ?? (this.now() - this.othersOkAt <= OTHERS_GRACE_MS ? this.othersOk : null);
+    if (known === null) {
+      this.d.alerter.raise(`adoption:exits_blocked`, `exits of adopted bags are held: another bot's ledger has not been readable for over ${Math.round(OTHERS_GRACE_MS / 60_000)} min (see adoption_exclude_unreadable)`);
+      return "another bot's ledger could not be read";
+    }
+    if (known.has(p.mint)) return "another bot holds an open position in this coin";
     const c = this.mintChecks.get(p.mint);
     if (c && this.now() - c.at < SELL_CHECK_MS) return c.why;
     return (await this.mintCheck(p.mint)).why;
@@ -399,6 +436,8 @@ export class Adopter {
   async adopt(mint: string, t?: WalletToken): Promise<{ ok: true; positionId: number } | { ok: false; reason: string }> {
     if (asAddress(mint) !== mint) return { ok: false, reason: "bad_mint" };
     if (this.d.adoption.exclude.includes(mint)) return this.skip(mint, "excluded");
+    // Read now, whoever calls (the step, an `adopt` command with the bot stopped, a mirror): never a stale answer.
+    this.others = this.otherBotsMints();
     if (this.others === null) return { ok: false, reason: "another bot's ledger could not be read" };
     if (this.others.has(mint)) return this.skip(mint, "another bot holds an open position in this coin");
     if (this.positionsOf(mint).length) return { ok: false, reason: "already managed or released" };
@@ -412,7 +451,7 @@ export class Adopter {
       }
       if (t.frozen) return this.skip(mint, "token account frozen");
       const mc = await this.mintCheck(mint);
-      if (mc.why) return this.skip(mint, `junk: ${mc.why}`);
+      if (mc.why) return mc.transient ? this.skip(mint, mc.why, {}, READ_RETRY_MS) : this.skip(mint, `junk: ${mc.why}`);
       const decimals = mc.decimals ?? t.decimals;
       const m = (await readMarkets(this.d.rpc, [{ mint, decimals }], this.now(), this.d.venues ?? { pump: true })).get(mint);
       if (!m || m.priceSol === null || m.problem) return this.skip(mint, `unpriceable: ${m?.problem ?? "no price"}`);
@@ -425,6 +464,10 @@ export class Adopter {
         return this.skip(mint, `basis: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
       }
       if (basis === null) return this.skip(mint, "no cost basis (the exit needs one; noBasis \"skip\")");
+      // The other bots' ledgers once more right before booking (the reads above can take a while).
+      this.others = this.otherBotsMints();
+      if (this.others === null) return { ok: false, reason: "another bot's ledger could not be read" };
+      if (this.others.has(mint)) return this.skip(mint, "another bot holds an open position in this coin");
       return this.book(mint, t.amount, decimals, m, basis);
     } finally {
       this.d.holds.releaseMint(mint);
@@ -447,14 +490,16 @@ export class Adopter {
         cost += -f.swapLamports;
       }
       // The signatures' cost, scaled to the tokens held (fewer held than bought: the held share's cost).
-      return { source: "signatures", costLamports: tokens > qty ? (cost * qty) / tokens : cost, detail: { signatures: c.signatures, tokensBought: tokens.toString() } };
+      // The signatures' average cost per token, for the tokens held (more held than they bought: the rest at the same
+      // average, never at zero).
+      return { source: "signatures", costLamports: (cost * qty) / tokens, detail: { signatures: c.signatures, tokensBought: tokens.toString() } };
     }
     if (c?.costSol !== undefined) return { source: "manual", costLamports: BigInt(Math.round(c.costSol * 1e9)) };
     if (c?.basis !== "mark") {
       const h = await this.historyBuys(mint);
       if (h && h.tokens > 0n) {
         // The average cost of the buys found, for the tokens held.
-        return { source: "chain", costLamports: (h.cost * qty) / h.tokens, detail: { buys: h.signatures.length, tokensBought: h.tokens.toString(), complete: h.complete } };
+        return { source: "chain", costLamports: (h.cost * qty) / h.tokens, detail: { buys: h.signatures.length, tokensBought: h.tokens.toString(), complete: h.complete }, signatures: h.signatures };
       }
     }
     if (c?.basis === "mark") return { source: "mark", costLamports: markCost };
@@ -527,7 +572,7 @@ export class Adopter {
         const id = this.d.ledger.createPosition({ mint, chain: "solana", dry: this.dry, now, decimals, strategy: this.d.strategyName(mint), entry });
         this.d.ledger.updatePosition(id, { status: "open", qty_raw: qty.toString(), qty_source: "wallet", remaining_raw: qty.toString(), cost_lamports: basis.costLamports.toString(), peak_price: m.priceSol ?? 0, last_price: m.priceSol ?? null, note: `adopted (basis ${basis.source})` });
         this.d.ledger.db.prepare("insert into adoptions (position_id, mint, basis_source, wallet_seen_raw, since, adopted_at, updated_at) values (?, ?, ?, ?, ?, ?, ?)").run(id, mint, basis.source, qty.toString(), Math.floor(now / 1000), now, now);
-        const sigs = (basis.detail?.signatures as string[] | undefined) ?? [];
+        const sigs = [...((basis.detail?.signatures as string[] | undefined) ?? []), ...(basis.signatures ?? [])];
         for (const s of sigs) this.d.ledger.db.prepare("insert or ignore into adoption_sigs (signature, position_id) values (?, ?)").run(s, id);
         return id;
       });
@@ -641,11 +686,13 @@ export class Adopter {
 
   private async grow(a: AdoptionRow, p: PositionRow, delta: bigint, bal: bigint): Promise<void> {
     if (this.others === null) return; // fail closed: another bot's ledger unread
+    // The history scan runs without holding the coin (a sell of this bag never waits for it); the booking holds it and
+    // goes ahead only on the row the scan began from.
+    const h = this.dry ? null : await this.historyBuys(p.mint, a.since - 60);
     if (!this.d.holds.reserveMint(p.mint)) return;
     try {
-      const h = this.dry ? null : await this.historyBuys(p.mint, a.since - 60);
       const fresh = this.d.ledger.position(p.id);
-      if (!fresh || fresh.remaining_raw !== p.remaining_raw || (fresh.status !== "open" && fresh.status !== "exit_stuck")) return;
+      if (!fresh || fresh.remaining_raw !== p.remaining_raw || (fresh.status !== "open" && fresh.status !== "exit_stuck") || this.d.ledger.openOrderFor(p.id)) return;
       const qty = BigInt(p.qty_raw);
       const avgCost = qty > 0n ? (BigInt(p.cost_lamports) * delta) / qty : 0n;
       let add = avgCost;
