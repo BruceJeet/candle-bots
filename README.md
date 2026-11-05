@@ -13,6 +13,7 @@ one you want and you get that bot and the core, nothing else.
 | [candle-creator-bot](packages/creator-bot/README.md) | Buys the new launches of the creators you list, with a ticket and lifetime caps per creator; optional dev-buy wait; exits by a strategy | `npx candle-creator-bot run --config bot.json` (start from `examples/dry.json`) |
 | [candle-exit-manager](packages/exit-manager/README.md) | Never buys: adopts bags already in the wallet (a list, or the whole wallet less other bots' coins, dust and junk mints) and exits them by a strategy, a trailing stop included; Candle coins, pump.fun curves and PumpSwap | `npx candle-exit-manager run --config bot.json` (start from `examples/dry.json`) |
 | [candle-rug-watcher](packages/rug-watcher/README.md) | Never buys: watches the coins a wallet holds (adopted like the exit manager) and sells, or only alerts, on a liquidity pull, a price crash, the creator dumping or a large holder leaving; every firing alerted with its numbers | `npx candle-rug-watcher run --config bot.json` (start from `examples/dry.json`) |
+| [candle-profit-sweeper](packages/profit-sweeper/README.md) | Never buys: sells the wallet's bags at your targets and asks for the realized profit to go to your home address: one sweep request at a time (wallet, amount, full home address, request id), alerted and kept until the transfer is shown on chain. It never moves funds itself | `npx candle-profit-sweeper run --config bot.json` (start from `examples/dry.json`) |
 
 Under them:
 
@@ -26,7 +27,7 @@ Under them:
 Each bot's README says what it buys, what it needs (a Candle API key, a wallet, an RPC) and how to start in dry mode,
 which runs the whole loop with paper fills and spends nothing. Start there, read `status.json`, then go live with small
 caps. Every bot has the same controls: `STOP` and `PAUSE_BUYS` files in its state folder, a `sell` command, and the
-same exit strategies. The bots that only sell (candle-exit-manager, candle-rug-watcher) have `PAUSE_SELLS` instead of `PAUSE_BUYS`.
+same exit strategies. The bots that only sell (candle-exit-manager, candle-rug-watcher, candle-profit-sweeper) have `PAUSE_SELLS` instead of `PAUSE_BUYS`.
 
 ## Adding a bot
 

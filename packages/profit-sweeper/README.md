@@ -1,30 +1,32 @@
-# candle-exit-manager
+# candle-profit-sweeper
 
-Runs exits on bags that are already in a Solana wallet: bought by hand, by another tool, or left over. It adopts them
-and sells by a strategy you pick, a trailing stop included. It never buys. One config file, one process, a local
-SQLite ledger. Built on Candle's official SDK, [`@candledottv/agent-sdk`](https://www.npmjs.com/package/@candledottv/agent-sdk)
-(pinned at 0.6.14), and [candle-bot-core](https://www.npmjs.com/package/candle-bot-core).
+Sells the bags in a Solana wallet at your targets and asks for the profit to be sent to your home address. It never
+moves funds itself. Each sweep is a **request**: the wallet, the amount, your home address in full and a request id,
+written to the state folder and sent through your alerts. It is kept until you mark it done. It never buys. One config
+file, one process, a local SQLite ledger. Built on Candle's official SDK,
+[`@candledottv/agent-sdk`](https://www.npmjs.com/package/@candledottv/agent-sdk) (pinned at 0.6.14), and
+[candle-bot-core](https://www.npmjs.com/package/candle-bot-core).
 
 Built by [Bruce Jeet](https://github.com/BruceJeet).
 
-- **Which bags:** a list of coins you name, or the whole wallet. In whole-wallet mode every token is adopted except the
-  ones you exclude, the ones another bot holds (`excludeStateDirs`: their ledgers are read every cycle), dust under
-  `minValueSol`, and anything it cannot judge or price.
-- **Venues:** Candle coins (launch curve, then the DAMM v2 pool), pump.fun coins on their bonding curve, and pump.fun
-  coins that moved to PumpSwap. The venue is read from chain per coin; prices and expected sell proceeds come from each
-  venue's own math and fees.
-- **Junk filter:** a coin is not adopted (and an adopted one is not sold) when its mint can take the tokens back or
-  stop a transfer: a token-2022 transfer hook, a permanent delegate, non-transferable, frozen by default, paused,
-  confidential transfers, a transfer fee over your cap, or an extension it does not know. A frozen token account too.
-- **Cost basis:** from the buy signatures you give, a cost you enter, or the wallet's own buys found on chain;
-  otherwise none. Exits that need a basis (`tpsl`, `ladder`, `trail` with `activate`) skip a bag without one unless you
-  choose to use the price at adoption (`noBasis: "mark"`).
-- **Exits:** `trail` (a trailing stop; the high-water mark survives restarts), `tpsl`, `ladder`, `time`, `hold`,
-  `preGrad`, or your own file; one per coin if you like (`manager.exits`).
-- **Execution** through Candle's trade API, from your account's embedded wallet or a TEE wallet signed on your machine.
-  Fills are booked from the transaction; sells are clamped to the wallet balance; retries are capped with backoff. With
-  a TEE wallet, a transaction that calls a program the manager does not know is never signed.
-- **Dry mode** adopts into its own ledger and logs every exit it would take; it signs nothing.
+- **Which bags, which venues, which exits:** the same as candle-exit-manager.
+  - Bags: a list, or the whole wallet less other bots' coins, dust and junk mints.
+  - Venues: Candle's curve and DAMM v2, pump.fun curves, PumpSwap.
+  - Exits: `ladder`, `tpsl`, `trail`, `time`, `hold`, `preGrad`, or your own, one per coin if you like.
+  - Its README covers each in detail.
+- **Profit is realized profit:** what the sells brought in, less the cost of the tokens sold (or written off when they
+  left the wallet some other way), less network fees. It is summed over every bag with a cost basis, so losses count
+  against it. Bags adopted with no basis are left out.
+- **Sweeps:**
+  - When unswept profit reaches `minSweepSol`, the sweeper makes **one** request. The amount is never more than the
+    wallet's SOL balance, read just before, less the `reserveSol` it keeps for fees and rent.
+  - While that request is open, no new one is made, however much more profit comes in. The alert repeats on your
+    alert schedule.
+  - Close the request with the transfer's signature, and the next request counts only profit not yet swept.
+
+Why requests and not transfers: Candle's agent API does not yet offer a transfer to an outside address that a bot can
+make safely. The embedded wallet can only move funds between your own account's wallets, and a transfer has no request
+id to check after a timeout. So the sweeper says what to send, and you send it from the wallet you control.
 
 Solana only.
 
@@ -33,155 +35,78 @@ Solana only.
 Node 22.18 or newer.
 
 ```sh
-npm install -g candle-exit-manager      # or npx candle-exit-manager ...
-cp "$(npm root -g)/candle-exit-manager/examples/dry.json" bot.json
-# set "wallet" in bot.json to the wallet whose bags you want managed
-candle-exit-manager run    --config bot.json      # dry run: adopts and logs the exits it would take
-candle-exit-manager status --config bot.json      # each bag: venue, basis, next exit
+npm install -g candle-profit-sweeper      # or npx candle-profit-sweeper ...
+cp "$(npm root -g)/candle-profit-sweeper/examples/dry.json" bot.json
+# set "wallet", and "sweep.home": the full address profit should go to (the bot refuses to start until you do)
+candle-profit-sweeper run    --config bot.json      # dry run: sells on paper, writes dry sweep requests
+candle-profit-sweeper status --config bot.json      # bags, realized profit, sweeps
 ```
 
-When the dry run looks right, use a new `stateDir` for live, set your API key, `"mode": "live"`, and run again:
+When the dry run looks right, use a new `stateDir` for live, set your API key and `"mode": "live"`, and run again.
 
-```sh
-export CANDLE_API_KEY=cndl_live_...
-candle-exit-manager run --config bot.json
+## A sweep, step by step
+
+1. Profit reaches the minimum. The sweeper writes `sweeps/sweep-<id>.json`:
+
+   ```json
+   { "requestId": "sweep-mhx3k2a1-9f02c4", "dry": false, "wallet": "<the bot's wallet>", "home": "<your home address>",
+     "amountSol": 0.42, "amountLamports": "420000000", "reason": "realized profit 0.42 SOL over 3 position(s), 0 SOL swept before",
+     "createdAt": "2026-11-05T18:00:00.000Z", "status": "pending" }
+   ```
+
+   It sends the same through your alerts: Telegram, a webhook, or a command.
+2. You send that amount from the wallet to your home address, however you move funds from it.
+3. You close the request:
+
+   ```sh
+   candle-profit-sweeper swept sweep-mhx3k2a1-9f02c4 --config bot.json --signature <the transfer's signature>
+   ```
+
+   The sweeper reads that transaction from chain. It must have succeeded, been paid from the bot's wallet, and paid
+   your home address. What home received is recorded as swept. A signature not on chain yet is kept and checked again;
+   one that pays elsewhere is refused.
+4. `--unverified` closes it at the requested amount without a signature. `cancel <requestId>` closes it without
+   counting it, so the same profit is asked for again.
+
+With the sweeper running, `swept` and `cancel` hand it a request file; with it stopped, they run directly.
+
+## Config reference
+
+`examples/dry.json` is a working start. Besides the shared keys (see candle-launch-bot's README) and `adoption` (see
+candle-exit-manager's), a `buy` section is refused.
+
+```jsonc
+"targets": { "exits": { "Mint…": { "strategy": "tpsl", "takeProfit": 3 } }, "checkPrograms": true, "extraPrograms": [] },
+"exit": { "strategy": "ladder", "rungs": [{ "at": 2, "sell": 0.5 }, { "at": 4, "sell": 0.5 }] },
+"sweep": { "home": "<your full address>", "reserveSol": 0.05, "minSweepSol": 0.05, "everyMs": 60000 }
 ```
 
-## What it needs
-
-- A **Candle API key** with the `swap:write` scope, in an environment variable (`apiKeyEnv`), never in the file.
-  A coin Candle did not launch (pump.fun, PumpSwap) sells through Candle's Jupiter route: check that your Candle plan
-  covers trading coins Candle did not launch.
-- A **payer**: `embedded` (your account's embedded Solana wallet; Candle signs) or `linked` (a TEE wallet bound to the
-  key, signed on this machine with the key's signer). Setup is the same as candle-launch-bot's; its README walks
-  through it.
-- An **RPC**: `rpcUrlEnv` names an env var with your Solana RPC URL. The public one works for a dry run but is
-  rate-limited.
-
-## Sharing a wallet with other bots
-
-If another bot trades from the same wallet, list its state dir in `adoption.excludeStateDirs`. Every cycle the manager
-opens that bot's `ledger.sqlite` read-only (one short query, then closed; a SQLite reader never blocks the other
-bot) and never adopts a coin it holds open. If the other bot opens a position in a coin the manager already manages,
-the manager releases that coin (stops managing it, sells nothing) and alerts. A listed dir with no `ledger.sqlite`
-refuses to start. If a listed ledger cannot be read while running, the manager adopts nothing new and grows nothing
-until it can, and alerts; sells use the last good read for up to 5 minutes, then are held and alerted.
-
-A bot that keeps its ledger in another format cannot be read: put its coins in `adoption.exclude` instead.
-
-## Controls
-
-Files in the state dir, read every cycle:
-
-- `STOP`: finish the cycle, write status, exit 0. The file stays until you remove it.
-- `PAUSE_SELLS`: every new exit is held; prices, peaks and trail marks keep updating. A sell already booked keeps going.
-  Remove it and the next tick decides.
-- `candle-exit-manager sell <mint> [--fraction 0.5]`: a manual sell through the same order path (works under
-  `PAUSE_SELLS`).
-- `candle-exit-manager adopt <mint> [--signatures s1,s2 | --cost-sol 0.2 | --basis mark]`: adopt one coin now (list
-  mode, or one the manager let go of before).
-- `candle-exit-manager release <mint>`: stop managing a coin. Nothing is sold; the tokens stay in the wallet. A
-  released coin is not adopted again unless you `adopt` it.
-
-With the manager running, `sell`, `adopt` and `release` hand it a request file; with it stopped, they run directly.
-`SIGINT`/`SIGTERM` stop the same way as `STOP`. A restart picks up from the ledger.
-
-## Bags that change outside the manager
-
-The manager compares each bag with the wallet every `adoption.everyMs`. A change counts once two reads at least a minute
-apart agree and no order of that coin is in flight (a balance read lagging behind one of its own sells is not a change).
-
-- **More tokens:** the bag grows. Tokens from a buy the wallet made (found on chain) add that buy's cost; tokens that
-  arrived any other way add at the bag's average entry price, so they never make its multiple look better.
-- **Fewer tokens:** the bag shrinks to the wallet's balance; the difference is written off, never counted as a sell and
-  never sold again. At zero the bag closes.
-
-Both are alerted.
+| Key | Meaning |
+|---|---|
+| `sweep.home` | required: the one address profit is asked to go to, written out in full (base58). Never taken from anywhere else; never the bot's own wallet; logged in full at start |
+| `sweep.reserveSol` | SOL the wallet keeps: a request never asks for more than the balance less this (default 0.05) |
+| `sweep.minSweepSol` | the smallest sweep asked for (default 0.05) |
+| `sweep.everyMs` | how often profit is looked at (default 60000) |
+| `targets.exits` | a coin's own exit, instead of `exit` |
+| `targets.checkPrograms`, `extraPrograms`, `sellFloorMarginBps` | TEE wallet signing checks, as candle-exit-manager's `manager.*` |
 
 ## State dir
 
 | File | What |
 |---|---|
-| `ledger.sqlite` | positions (one per adopted bag), orders, every attempt with its full error, `adoptions` (basis source, when), trail marks, alerts |
-| `status.json` | every cycle: open positions with venue and price, `managed` (each bag's basis, strategy and next exit), `adoption.skipped` (coins left alone and why), `sellsPaused` |
-| `events.jsonl` | one JSON line per event (also on stdout): `adopted`, `adoption_skip` (with the reason), `adopted_grown`, `adopted_shrunk`, `released`, `sell_order`, fills, `exits_paused` |
-| `requests/` | `sell`, `adopt` and `release` requests while the manager runs |
-| `lock` | one process per state dir |
-
-## Config reference
-
-`examples/dry.json` is a working start. Besides the shared keys (`mode`, `payer`, `apiKeyEnv`, `rpcUrlEnv`,
-`wallet`, `stateDir`, `loopMs`, `exitMs`, `sell`, `exit`, `retry`, `alerts`; see candle-launch-bot's README), a
-`buy` section is refused: this bot never buys.
-
-```jsonc
-"adoption": {
-  "mode": "wallet",                         // or "list"
-  "mints": [ "Mint…", { "mint": "Mint…", "signatures": ["…"] }, { "mint": "Mint…", "costSol": 0.2 }, { "mint": "Mint…", "basis": "mark" } ],
-  "exclude": [],
-  "excludeStateDirs": [ "../launch-bot/state" ],
-  "minValueSol": 0.001,
-  "maxTransferFeeBps": 0,
-  "noBasis": "skip",
-  "historyPages": 3,
-  "everyMs": 15000
-},
-"manager": {
-  "exits": { "Mint…": { "strategy": "tpsl", "takeProfit": 3, "stopLoss": 0.5 } },
-  "checkPrograms": true,
-  "extraPrograms": []
-},
-"exit": { "strategy": "trail", "trailBps": 2500 }
-```
-
-| Key | Meaning |
-|---|---|
-| `adoption.mode` | `list`: only `mints` (and `adopt` requests). `wallet`: every token in the wallet, less the exclusions |
-| `adoption.mints` | coins and, optionally, how to find each one's cost: buy `signatures`, `costSol`, or `basis: "mark"` |
-| `adoption.exclude` | never adopted (wrapped SOL never is) |
-| `adoption.excludeStateDirs` | other bots' state dirs on the same wallet; their open coins are never adopted |
-| `adoption.minValueSol` | a bag worth less (at its venue's sell price) is dust and left alone (default 0.001) |
-| `adoption.maxTransferFeeBps` | a token-2022 transfer fee above this refuses the coin (default 0: any fee refuses) |
-| `adoption.noBasis` | for an exit that needs a cost basis when none is found: `skip` (default) or `mark` (the value at adoption) |
-| `adoption.historyPages` | pages of 100 signatures per token account read to find the wallet's own buys (default 3; 0: never) |
-| `adoption.everyMs` | how often the wallet is read for new bags and changes (default 15000) |
-| `manager.exits` | a coin's own exit, instead of `exit` |
-| `manager.checkPrograms` | TEE wallet: refuse to sign a build that calls a program outside the known set (default true) |
-| `manager.extraPrograms` | programs to add to that set |
-| `manager.sellFloorMarginBps` | TEE wallet, pump.fun venues: a sell is not signed when Candle's floor sits more than `sell.maxSlippageBps` plus this under the venue's own price (default 200) |
-| `exit` | the default exit. `trail`: `trailBps` (sell this far under the high), `activate` (arm at this multiple of the entry; needs a basis), `sell` (share of the rest per hit) |
-
-## How the money paths work
-
-The same as every candle-bot-core bot (fills from the transaction, sells clamped to the balance, one live transaction
-per order, refusals read from their structure, uncertain orders recovered from chain). What is particular here:
-
-- **Quantity is the wallet's.** A bag's size is the wallet's balance when it is adopted, then follows the wallet as
-  described above. A sell never asks for more than the wallet holds.
-- **Expected proceeds are the venue's.** On pump.fun curves and PumpSwap the engine computes what a sell should bring
-  (reproduced to the lamport on real sells, fees included) and records it on the order; Candle's build sets the
-  slippage floor (`sell.maxSlippageBps`).
-- **Checks before every sell of an adopted bag:** the mint passes the junk filter again (read at most a minute
-  before), no other bot holds the coin, and with a TEE wallet the built transaction calls only known programs and its
-  floor is not far under the venue's own price (`manager.sellFloorMarginBps`). Any of these failing holds the sell and
-  alerts.
+| `ledger.sqlite` | positions, orders, attempts, `adoptions`, trail marks, `sweep_requests` (each request: amount, home, status, the signature and amount that closed it) |
+| `sweeps/<requestId>.json` | each request as above; its `status` follows the ledger (`pending`, `done`, `cancelled`) |
+| `status.json` | every cycle: bags, `sweep` (home, realized and swept SOL, the pending request, the last 10) |
+| `events.jsonl` | `sweep_request`, `sweep_done`, `sweep_cancelled`, `sweep_held`, `sweep_balance_unreadable`, plus the exit manager's events |
 
 ## Known limits
 
-- **Only the canonical PumpSwap pool.** A pump.fun coin is priced on the pool it migrated to; other pools of the same
-  coin are not read. Mayhem-mode PumpSwap pools and coins quoted in anything but SOL are not priced (not adopted).
-- **Inner calls.** The known-program check reads a transaction's top-level calls; a token's own hook is caught by the
-  mint check instead. With the embedded wallet Candle signs inside the build, so the check cannot run there.
-- **Other bots' ledgers** must be candle-bots ledgers (`ledger.sqlite`). Anything else: use `adoption.exclude`.
-- **Cost from history** is the average cost of the buys found in the last `historyPages` pages, not the cost of the
-  exact tokens held.
+- **It never sends.** Someone has to move the funds and close the request.
+- **Cost basis** comes from adoption: given buy signatures, a cost by hand, or the wallet's own buys found on chain. A
+  bag with no basis is not counted as profit. With `noBasis: "mark"` the price at adoption is the basis.
+- **Profit is the ledger's.** SOL that arrives in the wallet any other way (a deposit, an airdrop) is not profit and is
+  never asked for.
 - **Solana only.**
-
-## Development
-
-From the repo root: `npm run typecheck`, `npm run build`. Adoption, the venue readers, the trail and the controls are
-candle-bot-core's (`adopt/adopter`, `market/pump`, `market/mint`, `strategies/trail`); this package is the config
-sections (`adoption`, `manager`), the per-coin exits (`src/manager.ts`) and the command line.
 
 ## License
 

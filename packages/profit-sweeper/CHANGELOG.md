@@ -1,17 +1,16 @@
-# Changelog: candle-exit-manager
+# Changelog: candle-profit-sweeper
 
 ## 0.1.0
 
 First release, on candle-bot-core 0.5.0 (pinned exactly).
 
-- Adopts bags already in the wallet (`adoption.mode`: a list of coins, or the whole wallet less `exclude`, other bots'
-  open coins from `excludeStateDirs`, dust, junk mints, frozen accounts and anything it cannot price) and runs exits
-  on them. It never buys (a `buy` section is refused).
-- Venues read from chain per coin: Candle's curve and DAMM v2 pool, pump.fun curves, PumpSwap.
-- Cost basis from given buy signatures, a cost entered by hand, or the wallet's own buys on chain; `noBasis` for exits
-  that need one.
-- Exits from the core, `trail` included, one per coin if set (`manager.exits`).
-- Commands `run`, `status` (each bag: venue, basis, strategy, next exit), `sell`, `adopt`, `release`. Controls `STOP`
-  and `PAUSE_SELLS`.
-- TEE wallet: a build calling a program outside the known set is never signed (`manager.checkPrograms`,
-  `extraPrograms`).
+- Sells the wallet's bags at targets (the core's exits, one per coin if set, on bags adopted as candle-exit-manager
+  does) and asks for the realized profit to be sent to a home address. It never moves funds and never buys.
+- `sweep.home` is required, a full address, never the bot's own wallet; there is no default.
+- One sweep request at a time: recorded in the ledger before anything else, written to `sweeps/<requestId>.json`,
+  alerted, and re-announced until it is closed. A restart never makes a second request for the same profit.
+- `swept <requestId> --signature <sig>` closes it once the chain shows that transaction paid home from the wallet
+  (the amount home received is recorded); `--unverified` closes it at the requested amount; `cancel` closes it
+  uncounted.
+- Realized profit: proceeds, less the cost of the tokens sold or written off, less network fees, over positions with
+  a cost basis. The request never asks for more than the balance less `sweep.reserveSol`.
