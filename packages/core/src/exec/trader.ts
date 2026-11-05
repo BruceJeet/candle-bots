@@ -241,6 +241,8 @@ export class CandleCliSignerStore implements SecretStore {
       if (!stored) return null;
       const pem = toPem(stored);
       addSecret(stored);
+      // Every PEM line too (as the env store does): a line quoted alone in an error is masked as well.
+      for (const line of pem.split(/\s+/)) if (line.length >= 16 && !line.startsWith("-----")) addSecret(line);
       const spki = createPublicKey(pem).export({ type: "spki", format: "der" });
       if (createHash("sha256").update(spki).digest("hex") !== mine[0].spkiSha256) throw new Error("key signer in the keychain does not match the CLI's index");
       return pem;
@@ -248,7 +250,9 @@ export class CandleCliSignerStore implements SecretStore {
     const stored = await this.read(`wallet_signer_${walletRef}`);
     if (!stored) return null;
     addSecret(stored);
-    return toPem(stored);
+    const pem = toPem(stored);
+    for (const line of pem.split(/\s+/)) if (line.length >= 16 && !line.startsWith("-----")) addSecret(line);
+    return pem;
   }
 
   async set(): Promise<void> {
