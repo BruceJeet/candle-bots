@@ -8,8 +8,10 @@
  * Once per event:
  *   - priceCrash, liquidityPull: after a firing the window starts again from the value then, so the next firing needs
  *     a new fall of dropPct from there. Samples live in memory: after a restart the window starts empty.
- *   - devDump: each part (sold, floor) fires once per position. The creator's highest holding is kept in the ledger.
- *   - holderExit: once per wallet per position.
+ *   - devDump: each part (sold, floor) fires once per position. The creator's highest holding since the position was
+ *     watched is kept in the ledger (per position: a coin watched again later starts again).
+ *   - holderExit: once per wallet per position, confirmed by a read of the wallet's whole balance before it fires.
+ * One of our own sells filling restarts the price and pool windows (its own impact is not a crash).
  */
 import type { Alerter, Logger } from "candle-bot-core";
 import type { Ledger, PositionRow } from "candle-bot-core/ledger";
@@ -25,7 +27,10 @@ create table if not exists rug_events (
   unique (position_id, key)
 );
 create table if not exists rug_creators (
-  mint text primary key, creator text not null, source text not null, max_raw text not null, updated_at integer not null
+  mint text primary key, creator text not null, source text not null, updated_at integer not null
+);
+create table if not exists rug_dev (
+  position_id integer primary key, mint text not null, max_raw text not null, updated_at integer not null
 );
 `;
 
@@ -63,6 +68,8 @@ export interface WatchDeps {
   market: (mint: string) => Readonly<MarketRead> | undefined;
   sellsPaused: () => boolean;
   now?: () => number;
+  /** Elapsed-time clock for the poll budget (default performance.now). */
+  clock?: () => number;
 }
 
 interface CoinState {
@@ -73,6 +80,10 @@ interface CoinState {
   holders: HolderSample[];
   nextPollAt: number;
   holderFails: number;
+  /** Filled sells of the position seen at the last sample (-1: not counted yet). */
+  filledSells: number;
+  /** Where the next poll starts its direct reads (they rotate, so no wallet is starved). */
+  rot: number;
 }
 
 export class RugWatch {
@@ -80,17 +91,20 @@ export class RugWatch {
   private now: () => number;
   private coins = new Map<number, CoinState>();
   private creatorMiss = new Map<string, number>();
+  /** Real elapsed time (ms) for the poll budget. */
+  private clock: () => number;
 
   constructor(d: WatchDeps) {
     this.d = d;
     this.now = d.now ?? Date.now;
+    this.clock = d.clock ?? (() => performance.now());
     d.ledger.db.exec(TABLES);
   }
 
   private state(positionId: number): CoinState {
     let s = this.coins.get(positionId);
     if (!s) {
-      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0 };
+      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0 };
       this.coins.set(positionId, s);
     }
     return s;
@@ -107,6 +121,7 @@ export class RugWatch {
       this.d.log.error("rug_observe_failed", { error: String((e as Error)?.message ?? e) });
       return;
     }
+    this.settleEvents();
     const live = new Set(open.map((p) => p.id));
     for (const id of this.coins.keys()) if (!live.has(id)) this.coins.delete(id);
     for (const p of open) {
@@ -122,6 +137,13 @@ export class RugWatch {
       const st = this.state(p.id);
       if (m.nowMs === st.lastAt) return;
       st.lastAt = m.nowMs;
+      const filled = this.d.ledger.ordersFor(p.id).filter((o) => o.side === "sell" && o.status === "filled").length;
+      if (st.filledSells >= 0 && filled !== st.filledSells) {
+        // One of our sells filled since the last sample: its impact on price and pool is ours, not a rug.
+        st.price = [];
+        st.liq = [];
+      }
+      st.filledSells = filled;
       if (m.problem) return;
       if (m.venue !== st.venue) {
         // A migration moves the SOL from the curve to a pool: not a pull. Both windows start again on a new venue.
@@ -163,14 +185,22 @@ export class RugWatch {
       .filter((x) => x.st.nextPollAt <= now)
       .sort((a, b) => a.st.nextPollAt - b.st.nextPollAt)
       .slice(0, this.d.cfg.watch.maxCoinsPerPoll);
+    const t0 = this.clock();
     for (const { p, st } of due) {
       if (shouldStop()) return;
+      // A time budget per poll: the coins left keep their place (they are due first next cycle).
+      if (this.clock() - t0 > this.d.cfg.watch.pollBudgetMs) {
+        this.d.log.info("rug_poll_budget", { left: due.length - due.findIndex((x) => x.p.id === p.id) });
+        return;
+      }
       st.nextPollAt = now + this.d.cfg.watch.holdersPollMs;
       try {
         await this.pollOne(p, st);
         st.holderFails = 0;
       } catch (e) {
         st.holderFails++;
+        // Back off a failing coin (2x, 4x ... up to 16x the interval): a rate-limited RPC is not hammered.
+        st.nextPollAt = now + this.d.cfg.watch.holdersPollMs * Math.min(2 ** st.holderFails, 16);
         const why = String((e as Error)?.message ?? e).slice(0, 160);
         this.d.log.warn("rug_holders_unreadable", { position: p.id, mint: p.mint, error: why, inARow: st.holderFails });
         if (st.holderFails >= HOLDER_FAIL_ALERT) this.d.alerter.raise(`rug:${p.id}:holders_unreadable`, `rug watcher: holders of ${p.mint} (position ${p.id}) unreadable ${st.holderFails} polls in a row (${why}); the dev and holder rules cannot see this coin`);
@@ -185,10 +215,12 @@ export class RugWatch {
     if (r.devDump && creator) {
       const held = await this.d.holders.balanceOf(creator, p.mint);
       if (held !== null) {
-        const row = this.d.ledger.db.prepare("select max_raw from rug_creators where mint = ?").get(p.mint) as { max_raw: string } | undefined;
+        const row = this.d.ledger.db.prepare("select max_raw from rug_dev where position_id = ?").get(p.id) as { max_raw: string } | undefined;
         const prevMax = row ? BigInt(row.max_raw) : 0n;
         const max = held > prevMax ? held : prevMax;
-        if (max !== prevMax) this.d.ledger.db.prepare("update rug_creators set max_raw = ?, updated_at = ? where mint = ?").run(max.toString(), this.now(), p.mint);
+        if (!row || max !== prevMax) this.d.ledger.db.prepare("insert into rug_dev (position_id, mint, max_raw, updated_at) values (?, ?, ?, ?) on conflict(position_id) do update set max_raw = excluded.max_raw, updated_at = excluded.updated_at").run(p.id, p.mint, max.toString(), this.now());
+        // A creator that holds none of the coin when first read: the dev rule can only fire if it buys. Said once.
+        if (!row && held === 0n) this.d.alerter.raise(`rug:${p.id}:creator_empty`, `rug watcher: the creator found for ${p.mint} (${creator}) holds none of it; the dev rule fires only if it buys some. If that is the wrong wallet, name the right one in rules.devDump.creators`);
         for (const t of devTrips(r.devDump, { maxRaw: max }, held, snap.supply, p.decimals)) this.fire(p, "devDump", `dev:${t.part}`, { ...t.trip, numbers: { creator, ...t.trip.numbers } }, r.devDump);
       }
     }
@@ -200,7 +232,10 @@ export class RugWatch {
       st.holders = [...st.holders, sample].filter((s) => s.at >= snap.atMs - rule.windowSec * 1000);
       const nowAmounts = new Map<string, bigint | null>();
       let direct = 0;
-      for (const owner of watchedHolders(st.holders)) {
+      const watched = [...watchedHolders(st.holders)];
+      const start = watched.length ? st.rot % watched.length : 0;
+      st.rot++;
+      for (const owner of [...watched.slice(start), ...watched.slice(0, start)]) {
         const a = sample.amounts.get(owner);
         if (a !== undefined) nowAmounts.set(owner, a);
         else if (direct < rule.topN) {
@@ -209,7 +244,15 @@ export class RugWatch {
           nowAmounts.set(owner, await this.d.holders.balanceOf(owner, p.mint));
         }
       }
-      for (const t of holderTrips(rule, st.holders, nowAmounts, snap.supply, p.decimals)) this.fire(p, "holderExit", `holder:${t.owner}`, t.trip, rule);
+      for (const t of holderTrips(rule, st.holders, nowAmounts, snap.supply, p.decimals)) {
+        // The largest-accounts list shows only some of a wallet's accounts: confirm on the wallet's whole balance
+        // (all its accounts) before firing. Unreadable: unknown, no firing this poll.
+        const full = await this.d.holders.balanceOf(t.owner, p.mint);
+        if (full === null) continue;
+        const ok = holderTrips(rule, st.holders, new Map([[t.owner, full]]), snap.supply, p.decimals)[0];
+        if (ok) this.fire(p, "holderExit", `holder:${t.owner}`, ok.trip, rule);
+        else this.d.log.info("rug_holder_unconfirmed", { position: p.id, mint: p.mint, owner: t.owner, wholeBalanceRaw: full.toString() });
+      }
     }
   }
 
@@ -218,7 +261,11 @@ export class RugWatch {
     const given = this.d.cfg.rules.devDump?.creators[mint];
     const row = this.d.ledger.db.prepare("select creator, source from rug_creators where mint = ?").get(mint) as { creator: string; source: string } | undefined;
     if (given) {
-      if (!row || row.creator !== given) this.d.ledger.db.prepare("insert into rug_creators (mint, creator, source, max_raw, updated_at) values (?, ?, 'config', '0', ?) on conflict(mint) do update set creator = excluded.creator, source = 'config', max_raw = '0', updated_at = excluded.updated_at").run(mint, given, this.now());
+      if (!row || row.creator !== given) {
+        this.d.ledger.db.prepare("insert into rug_creators (mint, creator, source, updated_at) values (?, ?, 'config', ?) on conflict(mint) do update set creator = excluded.creator, source = 'config', updated_at = excluded.updated_at").run(mint, given, this.now());
+        // Another wallet: the highs kept for the old one do not apply.
+        if (row) this.d.ledger.db.prepare("delete from rug_dev where mint = ?").run(mint);
+      }
       return given;
     }
     if (row) return row.creator;
@@ -229,7 +276,7 @@ export class RugWatch {
       this.d.alerter.raise(`rug:creator_unknown:${mint}`, `rug watcher: no creator found on chain for ${mint}; the dev rule does not run for it (set rules.devDump.creators to name one)`);
       return null;
     }
-    this.d.ledger.db.prepare("insert or ignore into rug_creators (mint, creator, source, max_raw, updated_at) values (?, ?, ?, '0', ?)").run(mint, found.creator, found.source, this.now());
+    this.d.ledger.db.prepare("insert or ignore into rug_creators (mint, creator, source, updated_at) values (?, ?, ?, ?)").run(mint, found.creator, found.source, this.now());
     this.d.log.info("rug_creator", { mint, creator: found.creator, source: found.source });
     return found.creator;
   }
@@ -262,8 +309,31 @@ export class RugWatch {
       : this.d.ledger.db.prepare("select * from rug_events where position_id = ? order by id desc").all(positionId)) as unknown as EventRow[];
   }
 
-  creatorRow(mint: string): { creator: string; source: string; max_raw: string } | undefined {
-    return this.d.ledger.db.prepare("select creator, source, max_raw from rug_creators where mint = ?").get(mint) as any;
+  creatorRow(mint: string): { creator: string; source: string } | undefined {
+    return this.d.ledger.db.prepare("select creator, source from rug_creators where mint = ?").get(mint) as any;
+  }
+
+  /** The creator's highest holding while this position was watched (raw), or null before the first read. */
+  devHigh(positionId: number): string | null {
+    const r = this.d.ledger.db.prepare("select max_raw from rug_dev where position_id = ?").get(positionId) as { max_raw: string } | undefined;
+    return r ? r.max_raw : null;
+  }
+
+  /** Whether a sell with this event's reason filled. */
+  soldFor(e: EventRow): boolean {
+    return this.d.ledger.ordersFor(e.position_id).some((o) => o.side === "sell" && o.status === "filled" && o.reason === `rug:${e.rule}#${e.id}`);
+  }
+
+  /**
+   * Events that owe nothing more: their sell filled, or their position is no longer watched (closed by that sell or
+   * another, or released). Marked done.
+   */
+  settleEvents(): void {
+    const rows = this.d.ledger.db.prepare("select * from rug_events where alert_only = 0 and done_at is null").all() as unknown as EventRow[];
+    for (const e of rows) {
+      const p = this.d.ledger.position(e.position_id);
+      if (this.soldFor(e) || !p || (p.status !== "open" && p.status !== "exit_stuck" && p.status !== "opening")) this.d.ledger.db.prepare("update rug_events set done_at = ? where id = ?").run(this.now(), e.id);
+    }
   }
 
   /**

@@ -5,7 +5,7 @@
  */
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { parseConfig as parseCore, ConfigError, isObj, only, bool, num, strList, asAddress, type Config as CoreConfig, type Obj, type SectionParser } from "candle-bot-core";
+import { parseConfig as parseCore, ConfigError, isObj, only, bool, num, strList, asAddress, ENV_NAME, type Config as CoreConfig, type Obj, type SectionParser } from "candle-bot-core";
 import { parseAdoption, type AdoptionConfig } from "candle-bot-core/adopt/adopter";
 
 export { ConfigError } from "candle-bot-core/config";
@@ -33,6 +33,10 @@ export interface Watch {
   holdersPollMs: number;
   /** Coins whose holders are read in one poll at most (the rest in the next). */
   maxCoinsPerPoll: number;
+  /** Longest one holder poll runs before the coins left wait for the next cycle (ms). */
+  pollBudgetMs: number;
+  /** An env var with a separate RPC URL for holder reads (they are heavy; keeps them off the trading RPC). */
+  holdersRpcUrlEnv?: string;
   checkPrograms: boolean;
   extraPrograms: string[];
   sellFloorMarginBps: number;
@@ -101,10 +105,14 @@ const parseRules: SectionParser<Rules> = (raw) => {
 const parseWatch: SectionParser<Watch> = (raw) => {
   const r = raw === undefined ? {} : raw;
   if (!isObj(r)) throw new ConfigError("config.watch: must be an object");
-  only(r, ["holdersPollMs", "maxCoinsPerPoll", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], "config.watch");
+  only(r, ["holdersPollMs", "maxCoinsPerPoll", "pollBudgetMs", "holdersRpcUrlEnv", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], "config.watch");
+  const env = r.holdersRpcUrlEnv;
+  if (env !== undefined && (typeof env !== "string" || !ENV_NAME.test(env))) throw new ConfigError("config.watch.holdersRpcUrlEnv: an environment variable name");
   return {
     holdersPollMs: num(r, "holdersPollMs", "config.watch", { min: 2_000, int: true, def: 15_000 }),
     maxCoinsPerPoll: num(r, "maxCoinsPerPoll", "config.watch", { min: 1, max: 100, int: true, def: 10 }),
+    pollBudgetMs: num(r, "pollBudgetMs", "config.watch", { min: 200, max: 60_000, int: true, def: 3_000 }),
+    ...(env !== undefined ? { holdersRpcUrlEnv: env as string } : {}),
     checkPrograms: bool(r, "checkPrograms", "config.watch", true),
     extraPrograms: strList(r, "extraPrograms", "config.watch", { def: [], address: true })!,
     sellFloorMarginBps: num(r, "sellFloorMarginBps", "config.watch", { min: 0, max: 10_000, int: true, def: 200 }),

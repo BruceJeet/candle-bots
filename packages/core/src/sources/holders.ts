@@ -67,6 +67,8 @@ export class HolderPoller implements HolderSource {
     // A malformed answer is a failed read (unknown), never "nobody holds it": the rules would read every holder as gone.
     if (!Array.isArray(largest?.value)) throw new Error("holder largest accounts: bad response");
     const rows: Array<{ address: string; amount: string }> = largest.value;
+    // Bounded: a long run over many coins does not grow the cache forever (owners are read again after a clear).
+    if (this.owners.size > 50_000) this.owners.clear();
     const unknown = rows.map((r) => r.address).filter((a) => typeof a === "string" && !this.owners.has(a));
     if (unknown.length) {
       const r = await this.rpc.call<any>("getMultipleAccounts", [unknown, { encoding: "jsonParsed", commitment: "confirmed" }]);

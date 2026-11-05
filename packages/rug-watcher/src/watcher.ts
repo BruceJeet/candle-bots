@@ -11,6 +11,7 @@ import { KNOWN_PROGRAMS } from "candle-bot-core/exec/trader";
 import { dryPricer, sellFloor, type MarketRead, type ReadOptions } from "candle-bot-core/market/reader";
 import { HolderPoller, creatorOf, type HolderSource } from "candle-bot-core/sources/holders";
 import { parts, type Ctx as CoreCtx } from "candle-bot-core/runtime";
+import { httpRpc } from "candle-bot-core/solana/rpc";
 import type { Ledger } from "candle-bot-core/ledger";
 import { ConfigError, type Config } from "./config.ts";
 import { RugWatch } from "./watch.ts";
@@ -76,9 +77,9 @@ export class WatcherTrigger implements Trigger {
       return {
         position: p.id, mint: p.mint, status: p.status, venue: m?.venue ?? null, lastPriceSol: p.last_price,
         poolSol: typeof m?.quoteLiquidityLamports === "bigint" ? Number(m.quoteLiquidityLamports) / 1e9 : null,
-        creator: c ? { wallet: c.creator, source: c.source, maxHeldRaw: c.max_raw } : null,
+        creator: c ? { wallet: c.creator, source: c.source, maxHeldRaw: w.devHigh(p.id) } : null,
         remainingRaw: p.remaining_raw, basis: r.basis_source,
-        fired: w.events(p.id).map((e) => ({ event: e.id, rule: e.rule, key: e.key, at: new Date(e.fired_at).toISOString(), alertOnly: !!e.alert_only, sell: e.sell, sold: e.done_at !== null, numbers: JSON.parse(e.numbers) })),
+        fired: w.events(p.id).map((e) => ({ event: e.id, rule: e.rule, key: e.key, at: new Date(e.fired_at).toISOString(), alertOnly: !!e.alert_only, sell: e.sell, sold: w.soldFor(e), numbers: JSON.parse(e.numbers) })),
       };
     });
     return { watched, rules: Object.keys(this.cfg.rules), adoption: { mode: this.cfg.adoption.mode, skipped: a.skips }, sellsPaused: this.engine?.sellsPaused() ?? false };
@@ -107,6 +108,13 @@ export function checkExcludeDirs(cfg: Config): void {
 export async function makeWatcher(ctx: Ctx, ledger: Ledger): Promise<Built> {
   const cfg = ctx.cfg;
   checkExcludeDirs(cfg);
+  // Holder reads on their own RPC when one is named (they are heavy, and a rate limit on them must not reach sells).
+  let holdersRpc = ctx.rpc;
+  if (cfg.watch.holdersRpcUrlEnv) {
+    const url = process.env[cfg.watch.holdersRpcUrlEnv];
+    if (!url) throw new ConfigError(`config.watch.holdersRpcUrlEnv: ${cfg.watch.holdersRpcUrlEnv} is not set`);
+    holdersRpc = httpRpc(url);
+  }
   const fallback = await loadStrategy(cfg.exit, cfg.configDir);
   const known = knownProgramsFor(cfg);
   const decimalsOf = (m: string) => ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6;
@@ -114,11 +122,11 @@ export async function makeWatcher(ctx: Ctx, ledger: Ledger): Promise<Built> {
     maxBuyImpactBps: 0,
     executor: (d) => new Executor({ ...d, dry: dryPricer(ctx.rpc, ctx.client, decimalsOf, { pump: true }), ...(known ? { knownPrograms: known } : {}), ...(cfg.payer === "linked" ? { sellFloor: sellFloor(ctx.rpc, cfg.sell.maxSlippageBps, cfg.watch.sellFloorMarginBps) } : {}) }),
   });
-  return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, fallback });
+  return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, fallback, holders: new HolderPoller(holdersRpc), holdersRpc });
 }
 
 /** The adopter, watcher, trigger and engine around an executor (a library user, or a test, brings its own parts). */
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log: Ctx["log"]; alerter: Alerter; executor: Executor; fallback: ExitStrategy; holders?: HolderSource; now?: () => number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log: Ctx["log"]; alerter: Alerter; executor: Executor; fallback: ExitStrategy; holders?: HolderSource; holdersRpc?: Ctx["rpc"]; now?: () => number; clock?: () => number }): Built {
   const { cfg, ledger } = d;
   const adopter = new Adopter({
     cfg, adoption: cfg.adoption, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, venues: VENUES, now: d.now,
@@ -127,9 +135,9 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
   });
   let engine: Engine | null = null;
   const watch = new RugWatch({
-    cfg, ledger, log: d.log, alerter: d.alerter, now: d.now,
-    holders: d.holders ?? new HolderPoller(d.rpc, d.now),
-    creatorOf: (mint) => creatorOf(d.rpc, mint),
+    cfg, ledger, log: d.log, alerter: d.alerter, now: d.now, clock: d.clock,
+    holders: d.holders ?? new HolderPoller(d.holdersRpc ?? d.rpc, d.now),
+    creatorOf: (mint) => creatorOf(d.holdersRpc ?? d.rpc, mint),
     managed: () => adopter.managed().map((r) => r.position),
     market: (mint) => engine?.market(mint),
     sellsPaused: () => engine?.sellsPaused() ?? false,
