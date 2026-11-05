@@ -13,7 +13,8 @@ export type { PositionRow, OrderRow, PositionStatus, OrderStatus, Side, QtySourc
 export { Executor, errorInfo } from "./exec/executor.ts";
 export type { ExecutorDeps, DryPricer, ErrorInfo } from "./exec/executor.ts";
 export type { TradeRail } from "./exec/trader.ts";
-export { programIdsOf, KNOWN_PROGRAMS } from "./exec/trader.ts";
+export { programIdsOf, KNOWN_PROGRAMS, CandleCliSignerStore, cliConfigDir } from "./exec/trader.ts";
+export { readCliEntry, cliStoreRefs, cliFingerprint, CliStoreError, CLI_STORE_FORMAT } from "./exec/cliStore.ts";
 export { Alerter, makeAlerter } from "./alerts.ts";
 export type { AlertSink, AlertConfig } from "./alerts.ts";
 export { makeLogger, memoryLogger } from "./log.ts";

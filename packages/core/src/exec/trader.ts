@@ -22,6 +22,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { b58encode } from "../solana/base58.ts";
 import { addSecret } from "../redact.ts";
+import { readCliEntry } from "./cliStore.ts";
 import type { Config } from "../config.ts";
 
 export interface TradeRail {
@@ -190,16 +191,21 @@ export function toPem(stored: string): string {
  *  - an imported linked wallet signs with its own wallet signer: account `wallet_signer_<linkedWalletId>`.
  * get(linkedWalletId) returns the key signer when the wallet is the resolved TEE wallet, else the wallet signer.
  * The stored key's public key is checked against the index's spkiSha256. Nothing secret is ever logged.
+ *
+ * (0.5.0) `file`: the same entries read from the CLI's encrypted file store (credentials.enc; exec/cliStore.ts), with
+ * the CLI's keyring passphrase, for a machine with no OS keychain. Read-only, as the keychain backends.
  */
 export class CandleCliSignerStore implements SecretStore {
   private exec: ExecFn;
-  private backend: "security" | "secret-tool";
+  private backend: "security" | "secret-tool" | "file";
   private configPath: string;
+  private file: { credentialsPath: string; passphrase: string } | null;
   private keySigner: { linkedWalletId: string; keyPrefix: string; quorumId: string | null } | null = null;
 
-  constructor(opts: { exec?: ExecFn; backend?: "security" | "secret-tool"; configPath?: string } = {}) {
+  constructor(opts: { exec?: ExecFn; backend?: "security" | "secret-tool"; configPath?: string; file?: { credentialsPath: string; passphrase: string } } = {}) {
     this.exec = opts.exec ?? execFile;
-    this.backend = opts.backend ?? (process.platform === "darwin" ? "security" : "secret-tool");
+    this.file = opts.file ?? null;
+    this.backend = this.file ? "file" : opts.backend ?? (process.platform === "darwin" ? "security" : "secret-tool");
     this.configPath = opts.configPath ?? join(homedir(), ".config", "candle", "config.json");
   }
 
@@ -209,6 +215,10 @@ export class CandleCliSignerStore implements SecretStore {
   }
 
   private async read(account: string): Promise<string | null> {
+    if (this.backend === "file") {
+      const v = await readCliEntry(this.file!.credentialsPath, this.file!.passphrase, account);
+      return v && v.trim() ? v.trim() : null;
+    }
     const r = this.backend === "security"
       ? await this.exec("security", ["find-generic-password", "-s", "tv.candle.cli", "-a", account, "-w"])
       : await this.exec("secret-tool", ["lookup", "service", "tv.candle.cli", "account", account]);
@@ -250,10 +260,22 @@ export class CandleCliSignerStore implements SecretStore {
   }
 }
 
+/** The Candle CLI's config folder for a `candle-cli` signer: configDir, else $CANDLE_CONFIG_DIR, else ~/.config/candle. */
+export function cliConfigDir(s: { configDir?: string }, env: NodeJS.ProcessEnv = process.env): string {
+  return s.configDir ?? (env.CANDLE_CONFIG_DIR?.trim() || join(homedir(), ".config", "candle"));
+}
+
 export async function makeSecretStore(cfg: Config, w: ResolvedWallet, env: NodeJS.ProcessEnv = process.env): Promise<SecretStore> {
   const s = cfg.signer;
   if (!s) throw new Error("config.signer is required to trade");
   if (s.store === "keychain") return new CandleCliSignerStore().forTeeWallet(w.linkedWalletId, w.keyPrefix, w.signerQuorumId);
+  if (s.store === "candle-cli") {
+    const pass = env[s.passphraseEnv];
+    if (!pass) throw new Error(`signer.passphraseEnv: ${s.passphraseEnv} is not set`);
+    addSecret(pass);
+    const dir = cliConfigDir(s, env);
+    return new CandleCliSignerStore({ configPath: join(dir, "config.json"), file: { credentialsPath: join(dir, "credentials.enc"), passphrase: pass } }).forTeeWallet(w.linkedWalletId, w.keyPrefix, w.signerQuorumId);
+  }
   if (s.store === "file") {
     const pass = env[s.passphraseEnv];
     if (!pass) throw new Error(`signer.passphraseEnv: ${s.passphraseEnv} is not set`);

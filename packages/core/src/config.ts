@@ -14,7 +14,13 @@ export type Mode = "dry" | "live";
 export type SignerConfig =
   | { store: "keychain" }
   | { store: "file"; path: string; passphraseEnv: string }
-  | { store: "env"; pemEnv: string };
+  | { store: "env"; pemEnv: string }
+  /**
+   * (0.5.0) The Candle CLI's own encrypted file store (credentials.enc, where the CLI keeps signers on a machine with no
+   * OS keychain), read-only, with the CLI's keyring passphrase from `passphraseEnv`. `configDir`: the CLI's config
+   * folder (default $CANDLE_CONFIG_DIR, else ~/.config/candle).
+   */
+  | { store: "candle-cli"; passphraseEnv: string; configDir?: string };
 
 export type Payer = "linked" | "embedded";
 
@@ -177,7 +183,12 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
     } else if (store === "env") {
       only(s, ["store", "pemEnv"], "config.signer");
       signer = { store, pemEnv: str(s, "pemEnv", "config.signer", { re: ENV_NAME })! };
-    } else throw new ConfigError('config.signer.store: "keychain", "file" or "env"');
+    } else if (store === "candle-cli") {
+      only(s, ["store", "passphraseEnv", "configDir"], "config.signer");
+      const configDir = str(s, "configDir", "config.signer", { optional: true });
+      if (configDir !== undefined && configDir.startsWith("~")) throw new ConfigError("config.signer.configDir: an absolute or config-relative path (a leading ~ is not expanded)");
+      signer = { store, passphraseEnv: str(s, "passphraseEnv", "config.signer", { re: ENV_NAME })!, ...(configDir !== undefined ? { configDir: resolve(baseDir, configDir) } : {}) };
+    } else throw new ConfigError('config.signer.store: "keychain", "file", "env" or "candle-cli"');
   }
   const payer = str(raw, "payer", "config", { def: "linked" }) as Payer;
   if (payer !== "linked" && payer !== "embedded") throw new ConfigError('config.payer: "linked" (TEE wallet, local signer) or "embedded" (Candle signs)');
