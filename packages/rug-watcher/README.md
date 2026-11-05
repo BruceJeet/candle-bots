@@ -166,7 +166,7 @@ candle-exit-manager's), a `buy` section is refused.
 
 | File | What |
 |---|---|
-| `ledger.sqlite` | positions, orders, attempts, `adoptions`, `rug_events` (every firing: rule, numbers, sell share, when its sell filled), `rug_creators` (each coin's creator, its source, its highest holding) |
+| `ledger.sqlite` | positions, orders, attempts, `adoptions`, `rug_events` (every firing: rule, numbers, sell share, when it was settled and why: sold, position closed, dismissed), `rug_creators` (each coin's creator and its source), `rug_dev` (the creator's highest holding, per position) |
 | `status.json` | every cycle: `watched` (each coin's venue, pool SOL, creator, rules fired), `rules`, `adoption.skipped`, `sellsPaused` |
 | `events.jsonl` | one JSON line per event: `rug_rule` (with its numbers), `rug_creator`, `rug_holders_unreadable`, adoption events, sells and fills |
 
