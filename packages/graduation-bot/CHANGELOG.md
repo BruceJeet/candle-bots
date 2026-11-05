@@ -1,5 +1,12 @@
 # Changelog: candle-graduation-bot
 
+## 0.1.1
+
+- On candle-bot-core 0.5.0 (pinned exactly). Same CLI, config, state dir, ledger, `status.json` fields, events and
+  order handling: every 0.5.0 core addition is opt-in and this bot turns none on. One core fix reaches it: a signed
+  transaction of version 1 or later is refused before submit instead of being read as a wrong signature (legacy and
+  v0 transactions, which Candle builds today, read as before).
+
 ## 0.1.0
 
 First release, on candle-bot-core 0.4.0 (pinned exactly).

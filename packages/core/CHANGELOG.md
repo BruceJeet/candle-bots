@@ -1,5 +1,35 @@
 # Changelog: candle-bot-core
 
+## 0.5.0
+
+New API for bots that manage bags they did not buy, and for pump.fun venues. Everything is opt-in: a 0.4.x bot works as
+is, its reads, ledger and orders unchanged.
+
+- **pump.fun venue readers (money path), `market/pump`.** Bonding curve, canonical PumpSwap pool (with its signed
+  virtual quote reserve), token accounts and pump's fee tiers decoded; `pumpCurveSell` and `pumpPoolSell` give a sell's
+  SOL out after fees. Reproduced to the lamport on eight real mainnet sells. Refused, never guessed: a non-SOL quote, a
+  mayhem PumpSwap pool, a pool whose base is not the coin.
+- **`readMarkets(..., { pump, reserves })`**: venue found per mint from chain (`pump-curve`, `pumpswap`, `migrating`,
+  `no_venue` besides Candle's curve and DAMM v2); real SOL per venue; `expectedSellOut`. `MarketView.venue` gains
+  `pump-curve` and `pumpswap`. `dryPricer(..., { pump })` prices dry sells by the venue's math. Without options the
+  read is 0.4.0's.
+- **Mint checks, `market/mint`**: `decodeMint` (SPL Token, Token-2022 extensions) and `junkReason`.
+- **Adoption, `adopt/adopter`**: `Adopter`, `parseAdoption` (list or whole wallet, `exclude`, `excludeStateDirs` read
+  read-only every step, dust floor, transfer-fee cap, `noBasis`); basis from signatures, by hand, from the wallet's
+  history, or none; bags followed as they grow or shrink outside the bot; `released` positions; `adopt` / `release`
+  request files. Tables `adoptions`, `adoption_sigs`, created only by an Adopter.
+- **Engine**: `EngineDeps.venues`, `.adopter` (its step in each full cycle; no surplus alert with one; its sell check
+  before each sell of an adopted bag), `.pauseSells` (`PAUSE_SELLS` file). The engine's expected SOL out is recorded on
+  pump-venue sells.
+- **`trail` exit** with the mark kept in the ledger (`trail_marks`, created on first use); `ExitStrategy.needsBasis`,
+  `.trailMark`; `Decision.resetTrail`; `PositionView.trailPeakSol`. Built-in strategies say whether they need a basis.
+- **`ExecutorDeps.knownPrograms`**: a linked-payer build calling a program outside the set, or unreadable, is never
+  signed (`UNKNOWN_PROGRAM` / `UNREADABLE_TX`). `programIdsOf`, `KNOWN_PROGRAMS` in `exec/trader`.
+- **Fix:** `signatureOfSigned` and `blockhashOfSigned` refuse a v1+ signed transaction (version byte first) instead of
+  reading a wrong signature from it. Legacy and v0 transactions read as before.
+- PDAs: `pumpCurve`, `pumpPoolAuthority`, `pumpSwapPool`, `pumpFeeConfig`; program ids `PUMP_PROGRAM`,
+  `PUMP_AMM_PROGRAM`, `PUMP_FEE_PROGRAM`.
+
 ## 0.4.0
 
 New API for bots that buy graduated coins or watch Candle launches. A 0.3.x bot works as is: none of its paths change.

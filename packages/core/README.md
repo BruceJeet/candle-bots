@@ -175,7 +175,8 @@ and creates its tables in the constructor (`create table if not exists`); the co
 ## The exit interface
 
 Built in: `hold`, `tpsl` (take profit, stop loss, optional trailing stop), `time` (sell after a time), `ladder`
-(sell parts at multiples, keep a core), `preGrad` (sell before graduation). Pick one with `"exit": { "strategy": ... }`,
+(sell parts at multiples, keep a core), `preGrad` (sell before graduation), `trail` (a trailing stop from a high-water
+mark the ledger keeps; see below). Pick one with `"exit": { "strategy": ... }`,
 or write one file:
 
 ```js
@@ -195,8 +196,11 @@ export function create(params) {
 
 `onTick(position, market)` runs once per cycle for each open position with no exit order in flight. `position`:
 `mint, openedAtMs, qtyRaw, remainingRaw, decimals, entryPriceSol, peakPriceSol, soldFraction`. `market`: `priceSol`
-(null if unreadable), `progress` (0..1), `migrated`, `venue` (`curve` / `damm`), `nowMs`. Return `{ action: "hold" }`
-or `{ action: "sell", fraction, reason }`, `fraction` a share of what remains. Types: `ExitStrategy`, `PositionView`,
+(null if unreadable), `progress` (0..1), `migrated`, `venue` (`curve` / `damm`, and `pump-curve` / `pumpswap` for a
+bot that reads pump.fun venues), `nowMs`. Return `{ action: "hold" }` or `{ action: "sell", fraction, reason }`,
+`fraction` a share of what remains. Two optional flags on the strategy: `needsBasis` (it reads the entry price; a bag
+adopted without a cost basis cannot use it; unset counts as true) and `trailMark` (the engine keeps
+`position.trailPeakSol` for it; a sell decision with `resetTrail: true` restarts the mark at the price then). Types: `ExitStrategy`, `PositionView`,
 `MarketView`, `Decision`. A strategy gets its own copy of its params (it may keep state in them). A strategy that
 throws on a position three ticks in a row raises an alert (`position:<id>:strategy_error`): that position does not
 exit by itself until it is fixed.
@@ -268,6 +272,105 @@ adoption cap uses it). The column is added only when a drift check is on (an Exe
 set or `dammBuys`): a ledger whose bot never turns one on is never migrated. An order booked before the column existed
 is held to its `expected_out_raw`.
 
+## pump.fun venues (opt-in)
+
+`market/pump` decodes pump.fun's bonding curve, the canonical PumpSwap pool a coin migrates to, a token account and
+pump's fee config, and gives the SOL a sell of `n` raw tokens brings: `pumpCurveSell`, `pumpPoolSell` (pure, no I/O).
+The layouts are the programs' own on-chain IDLs; the math was reproduced to the lamport on real sells (five on curves,
+legacy, v0 and v1 transactions; three on a PumpSwap pool):
+
+- curve: `out = n * vq / (vt + n)` on the virtual reserves, less the protocol and creator fees, each
+  `ceil(out * bps / 10_000)`;
+- PumpSwap: the quote reserve is the SOL vault **plus the pool's signed `virtual_quote_reserves`** (i128 at byte 245;
+  boosted pools carry about 17.5 SOL there, so the raw vault ratio is off), the base reserve is the coin vault; lp,
+  protocol and coin-creator fees as above;
+- the fee tier is the last one at or under the market cap (`vq * supply / vt` on the curve, `Q * supply / B` on the
+  pool), from pump's fee program config.
+
+Refused rather than guessed: a quote other than SOL, a mayhem-mode PumpSwap pool, a pool whose base is not the coin.
+A mayhem-mode curve's ordinary sell follows the same math. On a cashback coin the expected out leaves the cashback fee
+out (it overstates by those bps).
+
+`readMarkets(rpc, coins, nowMs, { pump: true })` finds each coin's venue from chain (which accounts exist): a Candle
+curve or its DAMM v2 pool first, then a pump curve not complete (`pump-curve`), then the canonical PumpSwap pool
+(`pumpswap`); a complete pump curve without its pool is `migrating`, nothing at all is `no_venue`. One batched read per
+coin set (5 keys a coin, plus the two fee configs) and a second for the PumpSwap vaults. `{ reserves: true }` adds each
+venue's real SOL (`quoteLiquidityLamports`). Without options the read is exactly 0.4.0's. `expectedSellOut(read, raw)`
+answers for the pump venues. A bot turns it on with `EngineDeps.venues`; the engine then records its own expected SOL
+out on each pump-venue sell (`orders.decision_out_raw` when the column exists; Candle's build still sets the floor).
+Buy-side math for these venues is not here yet (a buy needs the inverse and the fees on the input).
+
+## Adopting bags already in the wallet (opt-in)
+
+`adopt/adopter` lets a bot manage tokens it did not buy. Config section (`parseAdoption`):
+
+```jsonc
+"adoption": {
+  "mode": "wallet",                  // or "list": only the mints below
+  "mints": [ "Mint…", { "mint": "Mint…", "signatures": ["…"] }, { "mint": "Mint…", "costSol": 0.2 }, { "mint": "Mint…", "basis": "mark" } ],
+  "exclude": [ "Mint…" ],            // never adopted (WSOL never is)
+  "excludeStateDirs": [ "../other-bot/state" ],  // any mint open there is never adopted, checked every step
+  "minValueSol": 0.001,              // dust below this
+  "maxTransferFeeBps": 0,            // a token-2022 transfer fee over this refuses the mint
+  "noBasis": "skip",                 // or "mark": what an exit that needs a basis gets when none is found
+  "historyPages": 3,                 // pages of 100 signatures per token account for the basis from chain
+  "everyMs": 15000
+}
+```
+
+Pass an `Adopter` as `EngineDeps.adopter`: its step runs in each full cycle, it replaces the surplus alert (it follows
+the wallet itself), and its `sellCheck` must pass before any sell of an adopted bag is booked.
+
+- **Quantity** is always the wallet's balance (`qty_source: "wallet"`).
+- **Basis**, in order: the given signatures (each a buy of the coin by this wallet, read from chain); `costSol`; the
+  wallet's own buys in its history (tokens in and SOL out; transfers and airdrops are not buys), their average cost per
+  token times the tokens held; else none. The source is on the `adoptions` row and in the position's entry.
+- **Never adopted:** a frozen token account; a mint that fails the junk check (below); a coin with no venue the core
+  can price; dust; a coin open in another bot's ledger; an excluded mint; a coin this bot managed before (closed or
+  released) unless an `adopt` request names it. Each skip is logged with its reason and looked at again after 10 min.
+- **Other bots' ledgers** are opened read-only with a 250 ms busy timeout, read with one query, and closed. SQLite in
+  WAL mode never blocks a writer for a reader, and no lock is held between steps. One that cannot be read stops new
+  adoptions and growth for that step and is alerted. A mint that turns up open there after it was adopted here is
+  released: no longer managed, nothing sold.
+- **Bags that change outside the bot** (seen on two reads at least 60 s apart, with no order of the coin in flight):
+  more tokens grow the position, at the cost of a buy found in the history since adoption, else at the position's
+  average entry (a transfer never lowers it); fewer tokens shrink it and the difference is written down (never booked
+  as a sell, never sold); at zero it closes. Both are alerted.
+- `adopt()` is public: batch 4's wallet mirror books a copied buy through it (list mode, the buy's signature as basis).
+
+**Mint checks** (`market/mint`): `decodeMint` reads SPL Token and Token-2022 mints and their extensions; `junkReason`
+refuses a transfer hook with a program set, a permanent delegate, non-transferable, a frozen default account state, a
+paused mint, confidential transfers, a transfer fee over the cap, and any extension it does not know. Metadata, group,
+close-authority, interest-bearing and scaled-UI extensions pass (they never change who controls a transfer). An
+adopted bag's mint is checked again before each sell (at most a minute old).
+
+## Trailing stop
+
+`"exit": { "strategy": "trail", "trailBps": 2000, "activate": 1.5, "sell": 0.5 }` sells when the price falls
+`trailBps` under the highest price since entry or adoption. `activate` (optional, needs a basis) arms it only once the
+high reached that multiple of the entry. `sell` (default 1) is the share of what remains each hit sells; after a
+partial hit the mark restarts at the price then, so the next hit needs another full fall from a new high. The mark is
+kept in the ledger (`trail_marks`, created on first use), so a restart does not reset it. A gap through the trail sells
+at the price then, like any stop.
+
+## PAUSE_SELLS (opt-in)
+
+With `EngineDeps.pauseSells`, a `PAUSE_SELLS` file in the state folder holds every exit the strategy would take; reads,
+prices, peaks and trail marks go on. `sell` by hand still works. Remove the file and the next tick decides again.
+
+## Only known programs are signed (opt-in, linked payer)
+
+With `ExecutorDeps.knownPrograms`, a built transaction is parsed before signing: if a top-level instruction calls a
+program outside the set (`exec/trader` `KNOWN_PROGRAMS`: System, compute budget, both token programs, ATA, memo,
+Jupiter v6, DFlow, pump.fun, PumpSwap, Candle's curve, DAMM v2), or the transaction cannot be read, it is never signed:
+the order ends `rejected` (`UNKNOWN_PROGRAM` / `UNREADABLE_TX`) and is alerted. Inner calls are not visible this way: a
+token's transfer hook is caught by the mint check instead. The embedded wallet cannot be checked: Candle signs inside
+the build.
+
+Signed transactions of version 1 and later (their first byte is the version, not the signature count) are refused by
+`signatureOfSigned` and `blockhashOfSigned` rather than read as a wrong signature: such an attempt fails before submit
+and is retried.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;
@@ -296,7 +399,7 @@ is held to its `expected_out_raw`.
 
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
-`/exec/fills`, `/market/reader`, `/market/curve`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
+`/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
 `/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/alerts`, `/log`, `/redact`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
