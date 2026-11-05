@@ -10,9 +10,14 @@
  * DAMM v2 (cp-amm 1.3.4 `Pool`): token_a_mint @168, token_b_mint @200, token_a_vault @232, token_b_vault @264,
  * sqrt_min_price u128 @424, sqrt_price u128 @456, creator @648. Price comes from sqrt_price, never from the
  * vaults (they also hold fees). sqrt_price is token B per token A; the coin may be either side.
+ * (0.4.0, for the expected fill of a buy on the pool) pool_fees @8: base fee cliff_fee_numerator u64 @8,
+ * fee_scheduler_mode u8 @16, number_of_period u16 @22, period_frequency u64 @24, reduction_factor u64 @32; dynamic
+ * fee `initialized` u8 @56. liquidity u128 @360, sqrt_max_price u128 @440, pool_status u8 @481, collect_fee_mode u8
+ * @484. Fee numerators are over 1e9. Checked on mainnet pools of graduated Candle coins: token A's vault equals
+ * L * (max - s) / (s * max) to the raw unit, and a real buy's output is reproduced exactly (fixtures in the tests).
  */
 import { b58encode } from "../solana/base58.ts";
-import { CANDLE_CURVE_PROGRAM, DAMM_V2_PROGRAM } from "../solana/pda.ts";
+import { CANDLE_CURVE_PROGRAM, DAMM_V2_PROGRAM, WSOL as WSOL_MINT } from "../solana/pda.ts";
 
 /** Anchor discriminator of `account:Pool` (shared with pump-amm's Pool). */
 const POOL_DISCRIMINATOR = Uint8Array.from([0xf1, 0x9a, 0x6d, 0x04, 0x11, 0xb1, 0x6d, 0xbc]);
@@ -176,6 +181,15 @@ export interface DammPool {
   sqrtMinPrice: bigint;
   sqrtPrice: bigint;
   creator: string;
+  /** (0.4.0) The fields the buy math reads. */
+  sqrtMaxPrice: bigint;
+  liquidity: bigint;
+  /** 0 = enabled. */
+  status: number;
+  /** 0 = fees on the output token, 1 = fees in token B (on the input when B is paid in). */
+  collectFeeMode: number;
+  baseFee: { cliffNumerator: bigint; schedulerMode: number; periods: number; periodFrequency: bigint; reductionFactor: bigint };
+  dynamicFee: boolean;
 }
 
 export function decodeDamm(v: AccountValue | null | undefined): DammPool {
@@ -186,7 +200,81 @@ export function decodeDamm(v: AccountValue | null | undefined): DammPool {
     sqrtMinPrice: u128(b, 424),
     sqrtPrice: u128(b, 456),
     creator: key(b, 648),
+    sqrtMaxPrice: u128(b, 440),
+    liquidity: u128(b, 360),
+    status: b[481],
+    collectFeeMode: b[484],
+    baseFee: { cliffNumerator: u64(b, 8), schedulerMode: b[16], periods: u16(b, 22), periodFrequency: u64(b, 24), reductionFactor: u64(b, 32) },
+    dynamicFee: b[56] !== 0,
   };
+}
+
+const FEE_DENOMINATOR = 1_000_000_000n;
+const MAX_FEE_NUMERATOR = 990_000_000n;
+
+/**
+ * The lowest trading fee the pool's base fee can charge (numerator over 1e9): a flat fee as is; a linear or exponential
+ * schedule at its last period; any other mode its cliff. The dynamic fee is left out: it only ever adds. So a buy's
+ * output computed with it is an upper bound (exact on a flat-fee pool with no dynamic fee, as Candle's are).
+ */
+export function dammMinFeeNumerator(p: DammPool): bigint {
+  const f = p.baseFee;
+  let n = f.cliffNumerator;
+  if (f.periods > 0 && f.schedulerMode === 0) {
+    n = f.cliffNumerator - BigInt(f.periods) * f.reductionFactor;
+    if (n < 0n) n = 0n;
+  } else if (f.periods > 0 && f.schedulerMode === 1) {
+    // cliff * (1 - reduction / 10_000) ^ periods, in 1e18 fixed point (rounded down: a lower fee, a larger bound).
+    const ONE = 10n ** 18n;
+    const k = ONE - (f.reductionFactor * ONE) / 10_000n;
+    let r = ONE;
+    for (let i = 0; i < f.periods && r > 0n; i++) r = (r * (k < 0n ? 0n : k)) / ONE;
+    n = (f.cliffNumerator * r) / ONE;
+  }
+  return n > MAX_FEE_NUMERATOR ? MAX_FEE_NUMERATOR : n;
+}
+
+/**
+ * A buy of `lamports` of `quoteMint` for `mint` on a DAMM v2 pool now (pure). One liquidity range [sqrt_min, sqrt_max]:
+ * paying in token B moves sqrt up by in * 2^128 / L and gives L * ds / (s0 * s1) of token A; paying in token A moves it
+ * down to L * s0 / (L + in * s0) and gives L * ds / 2^128 of token B (cp-amm's rounding: price moves toward the payer,
+ * output rounds down). The fee follows collect_fee_mode: on the input only when it is paid in token B under mode 1,
+ * else on the output; it is ceil(amount * fee / 1e9), at the pool's lowest base fee (see dammMinFeeNumerator).
+ * `impactBps` is the swap's average price over spot, fee apart, as buyImpact on the curve. Throws `pool_disabled`,
+ * `pool_mismatch` (the coin is not on the pool), `pool_not_quote` (the other side is not quoteMint), `pool_reserves`,
+ * `buy_past_range` (the buy would leave the liquidity range).
+ */
+export function dammBuy(p: DammPool, mint: string, lamports: bigint, quoteMint = WSOL_MINT): BuyImpact {
+  if (p.status !== 0) throw new DecodeError("pool_disabled");
+  const coinIsA = p.tokenA === mint;
+  if (!coinIsA && p.tokenB !== mint) throw new DecodeError("pool_mismatch");
+  if ((coinIsA ? p.tokenB : p.tokenA) !== quoteMint) throw new DecodeError("pool_not_quote");
+  const L = p.liquidity;
+  const s0 = p.sqrtPrice;
+  if (L === 0n || s0 === 0n || lamports <= 0n) throw new DecodeError("pool_reserves");
+  const feeN = dammMinFeeNumerator(p);
+  const feeOf = (x: bigint) => (x * feeN + FEE_DENOMINATOR - 1n) / FEE_DENOMINATOR;
+  // Paying in token B (coin is A) under mode 1: the fee comes off the input. Every other case: off the output.
+  const feeOnInput = coinIsA && p.collectFeeMode === 1;
+  const inNet = feeOnInput ? lamports - feeOf(lamports) : lamports;
+  let s1: bigint;
+  let gross: bigint;
+  if (coinIsA) {
+    s1 = s0 + (inNet << 128n) / L;
+    if (s1 > p.sqrtMaxPrice) throw new DecodeError("buy_past_range");
+    gross = (L * (s1 - s0)) / (s0 * s1);
+  } else {
+    const prod = inNet * s0;
+    s1 = (L * s0 + (L + prod) - 1n) / (L + prod);
+    if (s1 < p.sqrtMinPrice) throw new DecodeError("buy_past_range");
+    gross = (L * (s0 - s1)) >> 128n;
+  }
+  const out = feeOnInput ? gross : gross - feeOf(gross);
+  if (out <= 0n) throw new DecodeError("pool_reserves");
+  // The average price over spot of the swap itself (the fee apart, as buyImpact on the curve): s1/s0 - 1 for coin A,
+  // s0/s1 - 1 for coin B (its price is the inverse).
+  const impact = coinIsA ? Number(s1) / Number(s0) - 1 : Number(s0) / Number(s1) - 1;
+  return { impact, impactBps: Math.round(impact * 10_000), feeBps: Number((feeN * 10_000n) / FEE_DENOMINATOR), expectedOutRaw: out };
 }
 
 /** Quote per whole coin from a DAMM v2 pool, whichever side the coin is on. */

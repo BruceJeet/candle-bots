@@ -21,8 +21,8 @@ import { Ledger, type OrderRow, type PositionRow, type QtySource } from "../ledg
 import type { Alerter } from "../alerts.ts";
 import { errorJson } from "../redact.ts";
 import { blockhashValid, getTransaction, signatureStatus, tokenAccounts, tokenBalance, type Rpc } from "../solana/rpc.ts";
-import { candleCurve, WSOL } from "../solana/pda.ts";
-import { buyImpact, decodeCandleCurve } from "../market/curve.ts";
+import { candleCurve, dammPool, WSOL } from "../solana/pda.ts";
+import { buyImpact, dammBuy, decodeCandleCurve, decodeDamm } from "../market/curve.ts";
 import { fillFromTx, type Fill } from "./fills.ts";
 import { blockhashOfSigned, signatureOfSigned, type TradeRail } from "./trader.ts";
 
@@ -74,6 +74,11 @@ export interface ExecutorDeps {
    * never chases a pump past the entry decision. Required: the bot supplies it (the launch bot: filters.maxImpactBps).
    */
   maxBuyImpactBps: number;
+  /**
+   * (0.4.0) Buys of graduated coins (their DAMM v2 pool): the retry recheck reads the pool and applies maxBuyImpactBps to
+   * the pool buy. Default false: a buy whose coin has graduated is refused on retry (CURVE), as before.
+   */
+  dammBuys?: boolean;
 }
 
 type Outcome =
@@ -582,11 +587,31 @@ export class Executor {
     try {
       const c = decodeCandleCurve(v);
       if (c.quoteMint !== WSOL) return { kind: "rejected", code: "QUOTE_MINT", detail: "curve is not SOL-quoted" };
+      if (c.migrated && this.d.dammBuys) return await this.recheckDammBuy(o, pos, c.authority);
       const bps = buyImpact(c, BigInt(o.amount_raw)).impactBps;
       if (bps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${bps} bps on retry` };
       return null;
     } catch (e) {
       return { kind: "rejected", code: "CURVE", detail: String((e as Error).message) };
+    }
+  }
+
+  /** (0.4.0, dammBuys) The recheck of a graduated coin's buy: its pool (creator = the curve's authority) and the impact there. */
+  private async recheckDammBuy(o: OrderRow, pos: PositionRow, authority: string): Promise<Outcome | null> {
+    let v: any;
+    try {
+      v = (await this.d.rpc.call<any>("getAccountInfo", [dammPool(pos.mint), { encoding: "base64", commitment: "confirmed" }]))?.value;
+    } catch (e) {
+      return this.readFailed(o, pos, errorInfo(e).code, "pool read failed");
+    }
+    try {
+      const p = decodeDamm(v);
+      if (p.creator !== authority) return { kind: "rejected", code: "POOL", detail: "pool_mismatch" };
+      const bps = dammBuy(p, pos.mint, BigInt(o.amount_raw)).impactBps;
+      if (bps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${bps} bps on retry (pool)` };
+      return null;
+    } catch (e) {
+      return { kind: "rejected", code: "POOL", detail: String((e as Error).message) };
     }
   }
 

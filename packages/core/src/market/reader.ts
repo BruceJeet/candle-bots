@@ -1,13 +1,15 @@
 /** Market reads for a set of coins in one RPC round trip: the Candle curve, and the DAMM v2 pool once migrated. */
 import { candleCurve, dammPool } from "../solana/pda.ts";
 import { getAccounts, type Rpc } from "../solana/rpc.ts";
-import { buyImpact, curveProgress, dammPrice, dammRoomAboveFloor, decodeCandleCurve, decodeDamm, priceFromSqrt, type CandleCurve } from "./curve.ts";
+import { buyImpact, curveProgress, dammBuy, dammPrice, dammRoomAboveFloor, decodeCandleCurve, decodeDamm, priceFromSqrt, type CandleCurve, type DammPool } from "./curve.ts";
 import type { MarketView } from "../strategies/types.ts";
 import type { DryPricer } from "../exec/executor.ts";
 
 export interface MarketRead extends MarketView {
   mint: string;
   curve: CandleCurve | null;
+  /** (0.4.0) The graduated coin's DAMM v2 pool as read (its creator checked against the curve's authority). */
+  pool?: DammPool | null;
   roomAboveFloor: number | null;
   problem?: string;
 }
@@ -53,6 +55,7 @@ export async function readMarkets(rpc: Rpc, coins: CoinRef[], nowMs: number): Pr
         const pool = decodeDamm(pv);
         if (pool.creator !== curve.authority) throw new Error("pool_mismatch");
         base.venue = "damm";
+        base.pool = pool;
         base.priceSol = dammPrice(pool, c.mint, c.decimals);
         base.roomAboveFloor = dammRoomAboveFloor(pool);
       } else {
@@ -96,6 +99,8 @@ export function dryPricer(rpc: Rpc, quotes: QuoteSource | null, decimalsOf: (min
       }
       const m = (await readMarkets(rpc, [{ mint, decimals: decimalsOf(mint) }], Date.now())).get(mint)!;
       if (!m.curve) throw Object.assign(new Error("no curve"), { code: "NO_MARKET" });
+      // (0.4.0) A graduated coin: the pool's own buy math.
+      if (m.curve.migrated && m.pool) return dammBuy(m.pool, mint, lamports).expectedOutRaw;
       return buyImpact(m.curve, lamports).expectedOutRaw;
     },
     async sellOut(mint, raw, decimals) {

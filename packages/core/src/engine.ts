@@ -21,8 +21,8 @@ import type { Alerter } from "./alerts.ts";
 import type { BuyVerdict, Candidate, CurveRead, EntryCaps, LedgerView, PendingInfo, Trigger, TriggerContext, Verdict } from "./trigger.ts";
 import { deepFreeze } from "./config.ts";
 import { asAddress } from "./solana/base58.ts";
-import { buyImpact, decodeCandleCurve } from "./market/curve.ts";
-import { candleCurve as curveOf } from "./solana/pda.ts";
+import { buyImpact, dammBuy, decodeCandleCurve, decodeDamm } from "./market/curve.ts";
+import { candleCurve as curveOf, dammPool } from "./solana/pda.ts";
 
 export interface EngineDeps {
   cfg: Config;
@@ -1103,15 +1103,33 @@ export class Engine {
       } catch {
         mine = null;
       }
+    } else if (r.status === "ok" && r.curve.baseMint === mint && r.curve.migrated) {
+      mine = await this.dammExpectedOut(mint, r.curve.authority, lamports);
     }
     // No curve read: keep the trigger's value rather than none. With none, an uncertain buy whose transaction is not
     // found could adopt nothing and `sell` could not reach its tokens (0.1.3 always had a cap). The adoption still
     // counts only tokens received for SOL since the order, inside its attempt windows. Logged.
     if (mine === null) {
-      if (fromTrigger !== null) this.d.log.warn("expected_fill_unverified", { mint, expectedOutRaw: fromTrigger, why: "curve not readable at the buy" });
+      if (fromTrigger !== null) this.d.log.warn("expected_fill_unverified", { mint, expectedOutRaw: fromTrigger, why: r.status === "ok" && r.curve.migrated ? "pool not readable at the buy" : "curve not readable at the buy" });
       return fromTrigger;
     }
     return fromTrigger !== null && fromTrigger < mine ? fromTrigger : mine;
+  }
+
+  /**
+   * (0.4.0) A graduated coin's buy fills on its DAMM v2 pool: the engine's own read of the pool (the PDA Candle's keeper
+   * creates, whose creator must be the curve's authority, as the market reader checks), and dammBuy's fill. Null when the
+   * pool cannot be read or the buy cannot fill there (the caller then keeps the trigger's value, logged).
+   */
+  private async dammExpectedOut(mint: string, authority: string, lamports: bigint): Promise<bigint | null> {
+    try {
+      const v = (await this.d.rpc.call<any>("getAccountInfo", [dammPool(mint), { encoding: "base64", commitment: "confirmed" }]))?.value;
+      const pool = decodeDamm(v);
+      if (pool.creator !== authority) return null;
+      return dammBuy(pool, mint, lamports).expectedOutRaw;
+    } catch {
+      return null;
+    }
   }
 
   /**
