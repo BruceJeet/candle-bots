@@ -25,8 +25,12 @@ is, its reads, ledger and orders unchanged.
   `.trailMark`; `Decision.resetTrail`; `PositionView.trailPeakSol`. Built-in strategies say whether they need a basis.
 - **`ExecutorDeps.knownPrograms`**: a linked-payer build calling a program outside the set, or unreadable, is never
   signed (`UNKNOWN_PROGRAM` / `UNREADABLE_TX`). `programIdsOf`, `KNOWN_PROGRAMS` in `exec/trader`.
-- **Fix:** `signatureOfSigned` and `blockhashOfSigned` refuse a v1+ signed transaction (version byte first) instead of
-  reading a wrong signature from it. Legacy and v0 transactions read as before.
+- **`ExecutorDeps.sellFloor`** (linked payer, sells): Candle's floor is checked against the venue's own price read just
+  before signing (`SELL_FLOOR`). `sellFloor()` in `market/reader`.
+- **Fix:** a build of a transaction version 1 or later is never signed (`TX_VERSION`, alerted; any bot, linked payer),
+  and `signatureOfSigned` / `blockhashOfSigned` refuse such bytes instead of reading a wrong signature. Legacy and v0
+  transactions, which Candle builds today, read as before.
+- `Engine.market(mint)`: the last exit tick's read of a coin.
 - PDAs: `pumpCurve`, `pumpPoolAuthority`, `pumpSwapPool`, `pumpFeeConfig`; program ids `PUMP_PROGRAM`,
   `PUMP_AMM_PROGRAM`, `PUMP_FEE_PROGRAM`.
 

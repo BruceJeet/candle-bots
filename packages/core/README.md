@@ -322,16 +322,21 @@ Pass an `Adopter` as `EngineDeps.adopter`: its step runs in each full cycle, it 
 the wallet itself), and its `sellCheck` must pass before any sell of an adopted bag is booked.
 
 - **Quantity** is always the wallet's balance (`qty_source: "wallet"`).
-- **Basis**, in order: the given signatures (each a buy of the coin by this wallet, read from chain); `costSol`; the
+- **Basis**, in order: the given signatures (each a buy of the coin by this wallet, read from chain; their average
+  cost per token, for every token held); `costSol`; the
   wallet's own buys in its history (tokens in and SOL out; transfers and airdrops are not buys), their average cost per
   token times the tokens held; else none. The source is on the `adoptions` row and in the position's entry.
 - **Never adopted:** a frozen token account; a mint that fails the junk check (below); a coin with no venue the core
-  can price; dust; a coin open in another bot's ledger; an excluded mint; a coin this bot managed before (closed or
-  released) unless an `adopt` request names it. Each skip is logged with its reason and looked at again after 10 min.
+  can price; dust; a coin open in another bot's ledger, or one whose buy there failed but may have landed (that bot's
+  `sell` can still reopen it); an excluded mint; a coin this bot managed before (closed or released) unless an `adopt`
+  request names it. Each skip is logged with its reason and looked at again after 10 min; a read that failed (an RPC
+  error, a rate limit) after 1 min, and is not taken as a verdict on the coin. One step looks at 20 coins at most
+  (least recently looked at first), so a wallet full of airdropped junk is worked through over several steps.
 - **Other bots' ledgers** are opened read-only with a 250 ms busy timeout, read with one query, and closed. SQLite in
   WAL mode never blocks a writer for a reader, and no lock is held between steps. One that cannot be read stops new
-  adoptions and growth for that step and is alerted. A mint that turns up open there after it was adopted here is
-  released: no longer managed, nothing sold.
+  adoptions and growth for that step and is alerted. A sell of an adopted bag uses the last good read for up to 5 min
+  when a fresh one fails (a busy moment never holds a stop); past that the sell is held and `adoption:exits_blocked` is
+  alerted. A mint that turns up open there after it was adopted here is released: no longer managed, nothing sold.
 - **Bags that change outside the bot** (seen on two reads at least 60 s apart, with no order of the coin in flight):
   more tokens grow the position, at the cost of a buy found in the history since adoption, else at the position's
   average entry (a transfer never lowers it); fewer tokens shrink it and the difference is written down (never booked
@@ -349,14 +354,16 @@ adopted bag's mint is checked again before each sell (at most a minute old).
 `"exit": { "strategy": "trail", "trailBps": 2000, "activate": 1.5, "sell": 0.5 }` sells when the price falls
 `trailBps` under the highest price since entry or adoption. `activate` (optional, needs a basis) arms it only once the
 high reached that multiple of the entry. `sell` (default 1) is the share of what remains each hit sells; after a
-partial hit the mark restarts at the price then, so the next hit needs another full fall from a new high. The mark is
+partial hit that fills, the mark restarts at the price of the hit, so the next hit needs another full fall from a new
+high. A partial sell that ends without filling (refused, reverted, out of attempts) leaves the mark where it was. The mark is
 kept in the ledger (`trail_marks`, created on first use), so a restart does not reset it. A gap through the trail sells
 at the price then, like any stop.
 
 ## PAUSE_SELLS (opt-in)
 
 With `EngineDeps.pauseSells`, a `PAUSE_SELLS` file in the state folder holds every exit the strategy would take; reads,
-prices, peaks and trail marks go on. `sell` by hand still works. Remove the file and the next tick decides again.
+prices, peaks and trail marks go on. `sell` by hand still works, and a sell order already booked before the file
+appeared keeps going (it may be in flight). Remove the file and the next tick decides again.
 
 ## Only known programs are signed (opt-in, linked payer)
 
@@ -367,9 +374,17 @@ the order ends `rejected` (`UNKNOWN_PROGRAM` / `UNREADABLE_TX`) and is alerted. 
 token's transfer hook is caught by the mint check instead. The embedded wallet cannot be checked: Candle signs inside
 the build.
 
-Signed transactions of version 1 and later (their first byte is the version, not the signature count) are refused by
-`signatureOfSigned` and `blockhashOfSigned` rather than read as a wrong signature: such an attempt fails before submit
-and is retried.
+**Transaction versions.** A linked-payer build of version 1 or later (its first byte is the version, not the signature
+count) is never signed: the order ends `rejected` (`TX_VERSION`) and is alerted, because its signature could not be
+saved before submit. `signatureOfSigned` and `blockhashOfSigned` refuse such bytes too. Legacy and v0 read as before.
+
+## A floor on sells (opt-in, linked payer)
+
+`ExecutorDeps.sellFloor` (`market/reader` `sellFloor(rpc, slippageBps, marginBps)`): before a linked-payer sell is
+signed, the coin's venue is read again and its own expected out computed (pump.fun venues). If Candle's floor
+(`minOutRaw`) sits more than the slippage plus the margin under it, the sell is not signed (`SELL_FLOOR`, alerted); the
+next exit is a new order. A read that fails, or a venue without the math (Candle's curve, DAMM v2), means no check:
+Candle's own floor still applies. The embedded wallet executes inside the build, so this cannot run there.
 
 ## How money is handled
 

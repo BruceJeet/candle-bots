@@ -63,8 +63,9 @@ candle-exit-manager run --config bot.json
 If another bot trades from the same wallet, list its state dir in `adoption.excludeStateDirs`. Every cycle the manager
 opens that bot's `ledger.sqlite` read-only (one short query, then closed; a SQLite reader never blocks the other
 bot) and never adopts a coin it holds open. If the other bot opens a position in a coin the manager already manages,
-the manager releases that coin (stops managing it, sells nothing) and alerts. If a listed ledger cannot be read, the
-manager adopts nothing new and grows nothing until it can, and alerts; a sell of an adopted bag is refused too.
+the manager releases that coin (stops managing it, sells nothing) and alerts. A listed dir with no `ledger.sqlite`
+refuses to start. If a listed ledger cannot be read while running, the manager adopts nothing new and grows nothing
+until it can, and alerts; sells use the last good read for up to 5 minutes, then are held and alerted.
 
 A bot that keeps its ledger in another format cannot be read: put its coins in `adoption.exclude` instead.
 
@@ -73,7 +74,8 @@ A bot that keeps its ledger in another format cannot be read: put its coins in `
 Files in the state dir, read every cycle:
 
 - `STOP`: finish the cycle, write status, exit 0. The file stays until you remove it.
-- `PAUSE_SELLS`: every exit is held; prices, peaks and trail marks keep updating. Remove it and the next tick decides.
+- `PAUSE_SELLS`: every new exit is held; prices, peaks and trail marks keep updating. A sell already booked keeps going.
+  Remove it and the next tick decides.
 - `candle-exit-manager sell <mint> [--fraction 0.5]`: a manual sell through the same order path (works under
   `PAUSE_SELLS`).
 - `candle-exit-manager adopt <mint> [--signatures s1,s2 | --cost-sol 0.2 | --basis mark]`: adopt one coin now (list
@@ -146,6 +148,7 @@ Both are alerted.
 | `manager.exits` | a coin's own exit, instead of `exit` |
 | `manager.checkPrograms` | TEE wallet: refuse to sign a build that calls a program outside the known set (default true) |
 | `manager.extraPrograms` | programs to add to that set |
+| `manager.sellFloorMarginBps` | TEE wallet, pump.fun venues: a sell is not signed when Candle's floor sits more than `sell.maxSlippageBps` plus this under the venue's own price (default 200) |
 | `exit` | the default exit. `trail`: `trailBps` (sell this far under the high), `activate` (arm at this multiple of the entry; needs a basis), `sell` (share of the rest per hit) |
 
 ## How the money paths work
@@ -159,8 +162,9 @@ per order, refusals read from their structure, uncertain orders recovered from c
   (reproduced to the lamport on real sells, fees included) and records it on the order; Candle's build sets the
   slippage floor (`sell.maxSlippageBps`).
 - **Checks before every sell of an adopted bag:** the mint passes the junk filter again (read at most a minute
-  before), no other bot holds the coin, and with a TEE wallet the built transaction calls only known programs. Any of
-  these failing holds the sell and alerts.
+  before), no other bot holds the coin, and with a TEE wallet the built transaction calls only known programs and its
+  floor is not far under the venue's own price (`manager.sellFloorMarginBps`). Any of these failing holds the sell and
+  alerts.
 
 ## Known limits
 
