@@ -44,6 +44,10 @@ export const ATTEMPT_LAND_SEC = 150;
 
 type Ending = { status: "failed" | "rejected"; code: string; detail?: string; at?: number };
 
+/** (0.3.1) Candle's profile stop: an error code, never message text. */
+export const RISK_LIMIT = "RISK_LIMIT_REACHED";
+export const RISK_LIMIT_KEY = "profile_risk_limit";
+
 export interface DryPricer {
   /** Tokens out (raw) for spending `lamports` on the coin now. */
   buyOut(mint: string, lamports: bigint): Promise<bigint>;
@@ -515,6 +519,7 @@ export class Executor {
       this.d.ledger.endAttempt(att, this.now(), "error:" + phase, info.code, ej);
       this.d.ledger.updateOrder(o.id, { last_error_code: info.code, last_error: ej, updated_at: this.now() });
       this.d.log.warn("order_attempt_error", { order: o.id, side: o.side, mint: pos.mint, attempt: n, phase, code: info.code, status: info.status, stage: info.stage, reason: info.reason, logs: info.logs });
+      if (info.code === RISK_LIMIT) this.riskLimit(o, pos);
       const fresh = this.d.ledger.order(o.id)!;
       return this.apply(fresh, pos, await this.classify(fresh, pos, info, phase, n, att), e);
     }
@@ -560,6 +565,7 @@ export class Executor {
       this.d.ledger.endAttempt(att, this.now(), "probe:error", info.code, errorJson(e));
       if (info.signature) this.d.ledger.updateOrder(o.id, { signature: info.signature, signed_at: o.signed_at ?? this.now() });
       this.d.log.info("built_probe", { order: o.id, code: info.code, stage: info.stage, signature: info.signature ?? null });
+      if (info.code === RISK_LIMIT) this.riskLimit(o, pos);
     }
     this.alert(`order:${o.id}:built_probe`, `order ${o.id} ${o.side} ${pos.mint}: Candle's job stayed built; probed once under the same id`);
     return this.apply(o, pos, { kind: "wait", untilMs: this.now() + 30_000, why: "probed a long-built job" });
@@ -1075,6 +1081,19 @@ export class Executor {
 
   private alert(key: string, message: string): void {
     this.d.alerter.raise(key, message);
+  }
+
+  /**
+   * (0.3.1) Candle stopped the profile: every order is refused until an account owner clears it. One key for the
+   * profile (deduped across coins, re-announced on alerts.renotifyMs while refusals keep coming). Alert only: the
+   * order is classified and retried exactly as before, and an alerter fault never reaches it.
+   */
+  private riskLimit(o: OrderRow, pos: PositionRow): void {
+    try {
+      this.alert(RISK_LIMIT_KEY, `Candle stopped the profile (${RISK_LIMIT}) on a ${o.side} of ${pos.mint} (order ${o.id}): every order is refused until an account owner clears it`);
+    } catch {
+      /* the ledger and the log keep the error; the alert never changes the order */
+    }
   }
 }
 

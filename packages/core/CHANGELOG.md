@@ -1,5 +1,16 @@
 # Changelog: candle-bot-core
 
+## 0.3.1
+
+An alert, nothing else. A 0.3.0 config and trigger work as is.
+
+- **`profile_risk_limit` alert.** When Candle answers an order attempt with `RISK_LIMIT_REACHED` (it has stopped the
+  profile: every order is refused until an account owner clears it), the executor raises the alert key
+  `profile_risk_limit` through the configured sinks (command, webhook), with the side, the mint and the order. One key
+  for the profile: deduped across coins and re-announced on `alerts.renotifyMs` while refusals keep coming. The order is
+  classified and retried exactly as in 0.3.0, and an alerter fault never reaches it. `RISK_LIMIT` and `RISK_LIMIT_KEY`
+  are exported from `candle-bot-core/exec/executor`.
+
 ## 0.3.0
 
 Order attempts run outside the money lock. The money rules are unchanged. A 0.1.0 or 0.2.0 trigger works as is.

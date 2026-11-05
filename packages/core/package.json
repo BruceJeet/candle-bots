@@ -1,6 +1,6 @@
 {
   "name": "candle-bot-core",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "The shared core of Candle trading bots: ledger, order executor, exit strategies, controls and the engine loop. A bot adds a trigger and a config section.",
   "type": "module",
   "license": "MIT",
