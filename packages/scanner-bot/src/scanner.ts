@@ -48,7 +48,7 @@ export function evaluate(cfg: Config, mint: string, series: SeriesSource, feed: 
   if (r.feedVolume && feed) {
     const c = feed.coin(mint);
     const vol = c?.volume5m ?? null;
-    if (c && vol && !feed.isStale(vol) && vol.value >= r.feedVolume.minVolume5mUsd) out.push({ mint, rule: "feedVolume", text: `Candle feed: ${Math.round(vol.value).toLocaleString("en-US")} USD traded in its rolling 5 min (feed value, observed ${new Date(vol.observedAt).toISOString()})`, numbers: { volume5mUsd: Math.round(vol.value), observedAt: new Date(vol.observedAt).toISOString(), source: "candle-feed", complete: false } });
+    if (c && vol && !feed.isStale(vol) && vol.value >= r.feedVolume.minVolume5mUsd) out.push({ mint, rule: "feedVolume", text: `Candle feed: ${Math.round(vol.value).toLocaleString("en-US")} USD traded in its rolling 5 min (feed value, observed ${new Date(vol.observedAt!).toISOString()})`, numbers: { volume5mUsd: Math.round(vol.value), observedAt: new Date(vol.observedAt!).toISOString(), source: "candle-feed", complete: false } });
   }
   return out;
 }

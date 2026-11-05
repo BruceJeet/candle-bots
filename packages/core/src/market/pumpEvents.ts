@@ -11,10 +11,19 @@
  *    pool reserves, quote amount, fees, pool, user, … The event names the POOL, not the coin: the caller maps the pool
  *    to its base mint from the pool account (never from the event).
  *
+ * Trust: a `Program data:` line is accepted only while the innermost running program (from the log's `Program X invoke
+ * [n]` / `Program X success|failed` lines) is the program that owns that event: pump for TradeEvent, PumpSwap for
+ * Buy/SellEvent. Any program can log bytes that look like an event; only these programs' own frames count. A stack the
+ * log cannot account for (an invoke depth that does not match, a return that is not the running program, `Log
+ * truncated`) stops reading for the rest of that transaction. Pump also emits each event through a self-CPI (an inner
+ * instruction); this reader uses the log copy only (a logs subscription carries no inner instructions), and the
+ * self-CPI copy is ignored, so an event is never counted twice.
+ *
  * Volume convention: the SOL (quote) that traded against the venue, fees excluded: the curve's `sol_amount`; the
  * pool's `quote_amount_in` (buy) or `quote_amount_out` (sell).
  */
 import { b58encode } from "../solana/base58.ts";
+import { PUMP_PROGRAM, PUMP_AMM_PROGRAM } from "../solana/pda.ts";
 
 export const PUMP_TRADE_EVENT = Uint8Array.from([189, 219, 127, 211, 78, 230, 97, 238]);
 export const PUMPSWAP_BUY_EVENT = Uint8Array.from([103, 244, 82, 31, 44, 245, 119, 119]);
@@ -27,7 +36,7 @@ export interface CurveTrade {
   side: "buy" | "sell";
   /** SOL (lamports) to or from the curve, fees excluded. */
   quoteAmount: bigint;
-  /** The quote mint: WSOL for SOL coins (and every event too old to say). */
+  /** The quote mint: WSOL for SOL coins (and every event too old to say); "" when the tail cannot be read (unknown). */
   quoteMint: string;
   tokenAmount: bigint;
   user: string;
@@ -124,11 +133,11 @@ export function decodeCurveTrade(b: Uint8Array): CurveTrade | null {
     try {
       r.skip(32 + 8 + 8 + 32 + 8 + 8 + 1 + 8 + 8 + 8 + 8);
       const nameLen = r.u32();
-      if (nameLen > 64) return t;
+      if (nameLen > 64) return { ...t, quoteMint: "" }; // a layout this reader does not know: the quote is unknown
       r.skip(nameLen);
       r.skip(1 + 8 + 8 + 8 + 8);
       const holders = r.u32();
-      if (holders > 64) return t;
+      if (holders > 64) return { ...t, quoteMint: "" };
       r.skip(holders * 34);
       const quoteMint = r.key();
       const quoteAmount = r.u64();
@@ -172,19 +181,41 @@ export function decodePoolTrade(b: Uint8Array): PoolTrade | null {
   }
 }
 
-/** Every pump curve and PumpSwap trade event in a transaction's logs (a failed transaction gives none). */
+const INVOKE = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) invoke \[(\d+)\]$/;
+const RETURN = /^Program ([1-9A-HJ-NP-Za-km-z]{32,44}) (success|failed)/;
+
+/**
+ * Every pump curve and PumpSwap trade event in a transaction's logs, each from its own program's frame (a failed
+ * transaction gives none; a forged line from any other frame is ignored).
+ */
 export function tradesFromLogs(logs: string[], err: unknown = null): PumpTrade[] {
   if (err) return [];
   const out: PumpTrade[] = [];
+  const stack: string[] = [];
   for (const l of logs) {
+    const inv = INVOKE.exec(l);
+    if (inv) {
+      stack.push(inv[1]);
+      if (stack.length !== Number(inv[2])) return out; // the depth the log claims is not the depth it shows
+      continue;
+    }
+    const ret = RETURN.exec(l);
+    if (ret) {
+      if (stack[stack.length - 1] !== ret[1]) return out; // a return from a program that is not running
+      stack.pop();
+      continue;
+    }
+    if (l.startsWith("Log truncated")) return out;
     if (!l.startsWith("Program data: ")) continue;
+    const top = stack[stack.length - 1];
+    if (top !== PUMP_PROGRAM && top !== PUMP_AMM_PROGRAM) continue;
     let b: Uint8Array;
     try {
       b = new Uint8Array(Buffer.from(l.slice(14), "base64"));
     } catch {
       continue;
     }
-    const t = decodeCurveTrade(b) ?? decodePoolTrade(b);
+    const t = top === PUMP_PROGRAM ? decodeCurveTrade(b) : decodePoolTrade(b);
     if (t) out.push(t);
   }
   return out;

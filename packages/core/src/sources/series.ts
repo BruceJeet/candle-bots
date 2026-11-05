@@ -182,7 +182,7 @@ export class SeriesStore {
       if (mint !== null && m !== mint) continue;
       if (c.gaps.some((g) => g.to === null && g.reason === reason)) continue;
       c.gaps.push({ from: at, to: null, reason });
-      if (c.gaps.length > this.maxGaps) c.gaps.splice(0, c.gaps.length - this.maxGaps);
+      this.trimGaps(c);
     }
   }
 
@@ -199,7 +199,18 @@ export class SeriesStore {
     for (const [m, c] of this.coins) {
       if (mint !== null && m !== mint) continue;
       c.gaps.push({ from, to, reason });
-      if (c.gaps.length > this.maxGaps) c.gaps.splice(0, c.gaps.length - this.maxGaps);
+      this.trimGaps(c);
+    }
+  }
+
+  /** Past maxGaps: drop the oldest CLOSED gaps (an open gap is never dropped), and any gap older than the bars. */
+  private trimGaps(c: Coin): void {
+    const oldest = this.slot(this.now()) - (this.maxBars - 1) * this.barMs;
+    c.gaps = c.gaps.filter((g) => g.to === null || g.to > oldest);
+    while (c.gaps.length > this.maxGaps) {
+      const i = c.gaps.findIndex((g) => g.to !== null);
+      if (i < 0) break;
+      c.gaps.splice(i, 1);
     }
   }
 

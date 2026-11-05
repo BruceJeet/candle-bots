@@ -68,6 +68,8 @@ export class LogsSeries implements SeriesSource {
   private inflight: Promise<void> | null = null;
   /** Coins with no trade-log source (venue -> why), alerted as one summary when the set changes. */
   private noSource = new Map<string, string>();
+  /** Coins subscribed and not yet resolved (resolved on the next poll, without re-reading every coin's venue). */
+  private fresh = new Set<string>();
   private noSourceAlerted = "";
   /** The chain's slot as last read, and when; the socket's lag state. */
   private chainSlot: { slot: number; at: number } | null = null;
@@ -91,6 +93,10 @@ export class LogsSeries implements SeriesSource {
       onGapEnd: (a, at) => {
         const m = this.mintOf.get(a);
         if (m) for (const r of SOCKET_REASONS) this.store.gapEnd(m, r, at);
+      },
+      onTrouble: (a, tries, why) => {
+        const m = this.mintOf.get(a);
+        this.d.alerter.raise(`series:sub_trouble:${a}`, `series: the trade-log subscription for ${m ?? a} failed ${tries} times in a row (${why}); its volume is unknown while it keeps retrying`);
       },
       onState: (up, why) => {
         if (!up && this.wanted.length) this.d.alerter.raise("series:logs_down", `trade-log socket down (${why ?? "?"}): ${this.wanted.length} coins have a gap until it reconnects`);
@@ -124,9 +130,16 @@ export class LogsSeries implements SeriesSource {
     const next = [...new Set([...this.wanted, ...mints])];
     this.wanted = next;
     for (const m of mints) {
-      if (!this.store.watch(m, "logs")) this.d.alerter.raise(`series:coin_cap:${m}`, `series: the coin cap (${this.o.maxCoins}) leaves ${m} unwatched`);
+      if (!this.store.watch(m, "logs")) {
+        this.d.alerter.raise(`series:coin_cap:${m}`, `series: the coin cap (${this.o.maxCoins}) leaves ${m} unwatched`);
+        continue;
+      }
+      // Until its address is known, a coin's minutes are a gap (a failed read must not leave them as true zeros).
+      if (!this.addrOf.has(m)) this.store.gapStart(m, "resolving");
+      this.fresh.add(m);
     }
-    void this.tick(true);
+    // Only the new coins are resolved now; the others keep their own schedule.
+    void this.tick();
   }
 
   unsubscribe(mints: string[]): void {
@@ -135,9 +148,16 @@ export class LogsSeries implements SeriesSource {
     for (const m of mints) {
       this.store.unwatch(m);
       const a = this.addrOf.get(m);
-      if (a) this.mintOf.delete(a);
+      if (a) {
+        this.mintOf.delete(a);
+        this.poolMint.delete(a);
+      }
       this.addrOf.delete(m);
       this.seen.delete(m);
+      this.venueOf.delete(m);
+      this.venueAt.delete(m);
+      this.noSource.delete(m);
+      this.fresh.delete(m);
     }
     this.applySockets();
   }
@@ -162,7 +182,7 @@ export class LogsSeries implements SeriesSource {
         const r = markets.get(m);
         if (!r) continue;
         if (r.priceSol !== null && !r.problem) this.store.price(m, r.nowMs, r.priceSol);
-        if (force || !this.venueAt.has(m) || this.now() - (this.venueAt.get(m) ?? 0) >= this.o.venueEveryMs || this.venueOf.get(m) !== r.venue) this.resolve(m, r);
+        if (force || this.fresh.has(m) || !this.venueAt.has(m) || this.now() - (this.venueAt.get(m) ?? 0) >= this.o.venueEveryMs || this.venueOf.get(m) !== r.venue) this.resolve(m, r);
       }
       this.applySockets();
       this.alertNoSource();
@@ -173,6 +193,9 @@ export class LogsSeries implements SeriesSource {
 
   /** The address a coin's trade logs come from, from its market read (venue found on chain). */
   private resolve(mint: string, r: MarketRead): void {
+    this.fresh.delete(mint);
+    // The venue is known now: the "resolving" gap ends (a missing log source keeps its own gap below).
+    this.store.gapEnd(mint, "resolving");
     this.venueAt.set(mint, this.now());
     const prev = this.venueOf.get(mint);
     this.venueOf.set(mint, r.venue);
@@ -277,7 +300,7 @@ export class LogsSeries implements SeriesSource {
       if (t.kind === "pump-curve") {
         if (t.mint !== mint) continue;
         if (t.quoteMint !== WSOL_MINT) {
-          this.store.gapStart(mint, "not quoted in SOL");
+          this.store.gapStart(mint, t.quoteMint === "" ? "trade quote unreadable" : "not quoted in SOL");
           continue;
         }
         this.store.trade(mint, { at, volume: Number(t.quoteAmount) / 1e9, side: t.side, price: curveTradePrice(t, this.d.decimalsOf?.(mint) ?? 6) });

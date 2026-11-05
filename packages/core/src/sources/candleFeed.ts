@@ -22,8 +22,11 @@ export type FeedBucket = (typeof FEED_BUCKETS)[number];
 
 export interface RollingValue {
   value: number;
-  /** When the feed says this window was observed (ms), else when this poll saw it. */
-  observedAt: number;
+  /**
+   * When the feed says this window was observed (ms): its own marketObservedAt, else the row's updatedAt. Null when the
+   * feed gave neither (unknown time: never stale-checked as fresh, never used to fire).
+   */
+  observedAt: number | null;
 }
 
 export interface FeedCoin {
@@ -103,7 +106,7 @@ export class CandleFeed {
 
   /** Whether a value is older than staleMs. */
   isStale(v: RollingValue | null): boolean {
-    return !v || this.now() - v.observedAt > this.o.staleMs;
+    return !v || v.observedAt === null || this.now() - v.observedAt > this.o.staleMs;
   }
 
   /** One poll of every bucket (incremental after the first), on its own clock. Never throws. */
@@ -149,7 +152,8 @@ export class CandleFeed {
     for (const t of body.tokens) {
       if (!t || t.chain !== "solana" || typeof t.address !== "string") continue;
       const obs = (t.marketObservedAt && typeof t.marketObservedAt === "object" ? t.marketObservedAt : {}) as Record<string, number>;
-      const upd = typeof t.updatedAt === "number" ? t.updatedAt : now;
+      // The feed's own times only, never this poll's: the window's marketObservedAt, else the row's updatedAt.
+      const upd = typeof t.updatedAt === "number" ? t.updatedAt : null;
       const rv = (k: string, obsKey = k): RollingValue | null => (typeof t[k] === "number" && Number.isFinite(t[k]) ? { value: t[k], observedAt: typeof obs[obsKey] === "number" ? obs[obsKey] : upd } : null);
       const prev = held.get(t.address);
       const merged: FeedCoin = {
@@ -174,6 +178,11 @@ export class CandleFeed {
       held.set(t.address, merged);
     }
     if (typeof body.cursor === "string") this.cursors.set(b, body.cursor);
+    // A full page may have left rows out: read the bucket in full next time, and say so.
+    if (body.tokens.length >= 500) {
+      this.cursors.delete(b);
+      this.d.alerter.raise(`series:candle_feed_full_page:${b}`, `Candle feed: bucket ${b} answered a full page (500 rows); some rows may be missing until the next full read`);
+    }
   }
 
   status(): Record<string, unknown> {

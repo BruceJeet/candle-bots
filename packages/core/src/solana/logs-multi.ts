@@ -26,6 +26,8 @@ export interface MultiLogsHandlers {
   /** The address's subscription is confirmed (again): its gap, if any, ends here. */
   onGapEnd?: (address: string, at: number) => void;
   onState?: (up: boolean, why?: string) => void;
+  /** An address's subscription has failed (refused or unconfirmed) this many times in a row; it keeps retrying. */
+  onTrouble?: (address: string, tries: number, why: string) => void;
 }
 
 export interface MultiLogsOptions {
@@ -38,6 +40,8 @@ export interface MultiLogsOptions {
   confirmMs?: number;
   /** Gap between subscribe requests, ms (polite pacing). */
   paceMs?: number;
+  /** Failed subscriptions in a row before onTrouble (default 3). */
+  troubleAfter?: number;
   now?: () => number;
 }
 
@@ -59,6 +63,19 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
   const stallMs = o.stallMs ?? 90_000;
   const confirmMs = o.confirmMs ?? 15_000;
   const paceMs = o.paceMs ?? 100;
+  const troubleAfter = o.troubleAfter ?? 3;
+  /** Failed subscription attempts per address (refused or unconfirmed), and when the next try is due. */
+  const tries = new Map<string, { n: number; nextAt: number }>();
+  /** Requests we stopped waiting for: a late answer is accepted if still wanted, else unsubscribed. */
+  const late = new Map<number, string>();
+  const failed = (a: string, why: string) => {
+    const t = tries.get(a) ?? { n: 0, nextAt: 0 };
+    t.n++;
+    t.nextAt = now() + Math.min(60_000, 2_000 * 2 ** Math.min(t.n, 5));
+    tries.set(a, t);
+    openGap(a, why);
+    if (t.n >= troubleAfter) h.onTrouble?.(a, t.n, why);
+  };
   let want: string[] = [];
   /** address -> server subscription id (confirmed on this socket). */
   const subId = new Map<string, number>();
@@ -83,10 +100,10 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       h.onState?.(v, why);
     }
   };
-  const openGap = (a: string, reason: string) => {
+  const openGap = (a: string, reason: string, at = now()) => {
     if (gapOpen.has(a)) return;
     gapOpen.add(a);
-    h.onGapStart?.(a, reason, now());
+    h.onGapStart?.(a, reason, at);
   };
   const closeGap = (a: string) => {
     if (!gapOpen.delete(a)) return;
@@ -120,6 +137,8 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
     subId.clear();
     bySub.clear();
     pendingReq.clear();
+    late.clear();
+    for (const t of tries.values()) t.nextAt = 0;
     try {
       ws = new WS(url);
     } catch (e) {
@@ -138,15 +157,22 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
         // Unconfirmed subscriptions past confirmMs: a gap for that address (retried on the next connect).
         for (const [id, p] of pendingReq) if (t - p.at > confirmMs) {
           pendingReq.delete(id);
-          openGap(p.address, "subscription not confirmed");
+          late.set(id, p.address);
+          if (late.size > 1000) late.delete(late.keys().next().value as number);
+          failed(p.address, "subscription not confirmed");
+        }
+        // Retry, with backoff, what is wanted but not subscribed (refused, unconfirmed) while the socket stays up.
+        const pendingAddrs = new Set([...pendingReq.values()].map((p) => p.address));
+        const retry = want.filter((a) => !subId.has(a) && !pendingAddrs.has(a) && !queue.includes(a) && (tries.get(a)?.nextAt ?? Infinity) <= t);
+        if (retry.length) {
+          queue.push(...retry);
+          void pumpQueue();
         }
         if (t - lastMsg > stallMs) {
-          setUp(false, "stalled");
-          try {
-            ws?.close();
-          } catch {
-            /* closing */
-          }
+          // A stalled socket heard nothing since lastMsg: the gap starts there, not now. Torn down at once (a
+          // half-open connection's onclose can come minutes late, or never) and reconnected.
+          for (const a of want) openGap(a, "stalled", lastMsg);
+          teardown("stalled");
           return;
         }
         try {
@@ -170,8 +196,29 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
         if (typeof msg.result === "number" && want.includes(p.address)) {
           subId.set(p.address, msg.result);
           bySub.set(msg.result, p.address);
+          tries.delete(p.address);
           closeGap(p.address);
-        } else openGap(p.address, `subscription refused${msg.error ? `: ${String(msg.error.message ?? "").slice(0, 80)}` : ""}`);
+        } else failed(p.address, `subscription refused${msg.error ? `: ${String(msg.error.message ?? "").slice(0, 80)}` : ""}`);
+        return;
+      }
+      if (typeof msg.id === "number" && late.has(msg.id)) {
+        // An answer after we stopped waiting: kept if the address is still wanted and unsubscribed, else released.
+        const a = late.get(msg.id)!;
+        late.delete(msg.id);
+        if (typeof msg.result === "number") {
+          if (want.includes(a) && !subId.has(a)) {
+            subId.set(a, msg.result);
+            bySub.set(msg.result, a);
+            tries.delete(a);
+            closeGap(a);
+          } else {
+            try {
+              ws?.send(JSON.stringify({ jsonrpc: "2.0", id: ++reqId, method: "logsUnsubscribe", params: [msg.result] }));
+            } catch {
+              /* closing */
+            }
+          }
+        }
         return;
       }
       if (msg.method === "logsNotification") {
@@ -189,9 +236,31 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       if (ping) clearInterval(ping);
       ping = null;
       setUp(false, "closed");
-      for (const a of want) openGap(a, "reconnect");
+      // Nothing was heard after lastMsg: the gap starts there.
+      for (const a of want) openGap(a, "reconnect", lastMsg);
       schedule("closed");
     };
+  };
+
+  /** Drop this socket without waiting for its onclose (detached), then reconnect. */
+  const teardown = (why: string) => {
+    if (ping) clearInterval(ping);
+    ping = null;
+    const old = ws;
+    ws = null;
+    if (old) {
+      old.onopen = null;
+      old.onmessage = null;
+      old.onerror = null;
+      old.onclose = null;
+      try {
+        old.close();
+      } catch {
+        /* closing */
+      }
+    }
+    setUp(false, why);
+    schedule(why);
   };
 
   const schedule = (why: string) => {
