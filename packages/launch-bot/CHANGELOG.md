@@ -2,9 +2,12 @@
 
 ## 0.4.2
 
+- New optional config key `retry.maxPriceDriftBps` (from candle-bot-core 0.4.0), unset by default: a buy's retry
+  must still buy the order's expected fill less that many bps, so it cannot rebuild into a pump. Unset, nothing
+  changes.
 - On candle-bot-core 0.4.0 (pinned exactly). The launch detector moved into the core (`candle-bot-core/sources/
-  candleLaunches`); `src/detect/detector.ts` re-exports it. No behavior change: same CLI, config, state dir, ledger,
-  `status.json` fields, events and order handling.
+  candleLaunches`); `src/detect/detector.ts` re-exports it. With `retry.maxPriceDriftBps` unset, no behavior change:
+  same CLI, config, state dir, ledger, `status.json` fields, events and order handling.
 
 ## 0.4.1
 

@@ -25,13 +25,15 @@ export interface LaunchSpec {
   minDevBuyOutRaw?: bigint;
   /** Alert when a sent launch is still unresolved after this many minutes. */
   unresolvedAlertMin: number;
+  /** Launch even when the account already launched a token with this name and symbol (default false: refused). */
+  newLaunch: boolean;
 }
 
 export type Config = CoreConfig & { launch: LaunchSpec };
 
 const parseLaunch: SectionParser<LaunchSpec> = (raw, core) => {
   if (!isObj(raw)) throw new ConfigError("config.launch: required object (name, symbol, imageUrl, devBuySol, ...)");
-  only(raw, ["name", "symbol", "imageUrl", "description", "website", "twitter", "telegram", "mode", "devBuySol", "minDevBuyOutRaw", "unresolvedAlertMin"], "config.launch");
+  only(raw, ["name", "symbol", "imageUrl", "description", "website", "twitter", "telegram", "mode", "devBuySol", "minDevBuyOutRaw", "unresolvedAlertMin", "newLaunch"], "config.launch");
   const name = str(raw, "name", "config.launch")!;
   const symbol = str(raw, "symbol", "config.launch")!;
   const imageUrl = str(raw, "imageUrl", "config.launch")!;
@@ -53,14 +55,25 @@ const parseLaunch: SectionParser<LaunchSpec> = (raw, core) => {
     twitter: str(raw, "twitter", "config.launch", { optional: true }),
     telegram: str(raw, "telegram", "config.launch", { optional: true }),
     unresolvedAlertMin: num(raw, "unresolvedAlertMin", "config.launch", { min: 1, def: 10 }),
+    newLaunch: bool(raw, "newLaunch"),
   };
 };
+
+function bool(o: Record<string, unknown>, k: string): boolean {
+  const v = o[k];
+  if (v === undefined) return false;
+  if (typeof v !== "boolean") throw new ConfigError(`config.launch.${k}: true or false`);
+  return v;
+}
 
 export const SECTIONS = { launch: parseLaunch };
 
 function check(cfg: Config): Config {
   if (cfg.payer !== "embedded")
     throw new ConfigError('config.payer: the launch helper launches from the account\'s main wallet through Candle\'s atomic route; set "payer": "embedded" (Candle refuses a TEE wallet on that route)');
+  // The live run's pre-flight refuses too (a --mode live override is checked there).
+  if (cfg.mode === "live" && cfg.launch.minDevBuyOutRaw === undefined)
+    throw new ConfigError("config.launch.minDevBuyOutRaw: required in live mode (the dev buy's on-chain minimum is 0 inside the bundle; `plan` previews Candle's fill to set it from)");
   return cfg;
 }
 

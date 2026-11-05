@@ -152,7 +152,11 @@ export async function run<L extends Ledger>(ctx: Ctx, openLedger: () => L, make:
     // Full cycles every loopMs, fast entry lanes on a wake in between (Engine.run).
     await engine.run(ctx.cfg.loopMs);
   } finally {
-    trigger.stop?.();
+    try {
+      await trigger.stop?.();
+    } catch (e) {
+      ctx.log.error("trigger_stop_failed", { error: String((e as Error)?.message ?? e).slice(0, 500) });
+    }
     engine.writeStatus();
     ledger.close();
     lock.release();

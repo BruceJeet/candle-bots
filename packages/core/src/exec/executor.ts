@@ -118,6 +118,13 @@ function logsOf(x: any): string[] | undefined {
 /** Transport-level codes (Node fetch/undici, sockets, DNS): the request may or may not have arrived. */
 const TRANSPORT = /^(E[A-Z]+|UND_ERR_[A-Z_]+|ABORT_ERR|ERR_[A-Z_]+)$/;
 
+/** The order's expected fill (the decision's, or Candle's build quote), when it is a positive integer; else null. */
+function expectedOf(o: OrderRow): bigint | null {
+  if (!o.expected_out_raw || !/^\d+$/.test(o.expected_out_raw)) return null;
+  const v = BigInt(o.expected_out_raw);
+  return v > 0n ? v : null;
+}
+
 /** Read an error's structure. Only a CandleApiError can be a definite refusal; everything else is retryable. */
 export function errorInfo(e: unknown): ErrorInfo {
   const x = e as any;
@@ -590,8 +597,18 @@ export class Executor {
       const c = decodeCandleCurve(v);
       if (c.quoteMint !== WSOL) return { kind: "rejected", code: "QUOTE_MINT", detail: "curve is not SOL-quoted" };
       if (c.migrated && this.d.dammBuys) return await this.recheckDammBuy(o, pos, c.authority);
-      const bps = buyImpact(c, BigInt(o.amount_raw)).impactBps;
+      const bi = buyImpact(c, BigInt(o.amount_raw));
+      const bps = bi.impactBps;
       if (bps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${bps} bps on retry` };
+      // (0.4.0, opt-in retry.maxPriceDriftBps) The impact above falls as the price rises: with the limit set, the
+      // ticket must still buy at least the order's expected fill less that many bps. Unset: 0.3.1 behavior.
+      const drift = this.d.cfg.retry.maxPriceDriftBps;
+      if (drift !== undefined) {
+        const booked = expectedOf(o);
+        if (booked === null) return { kind: "rejected", code: "IMPACT", detail: "retry.maxPriceDriftBps is set and the order has no expected fill to hold the retry to" };
+        if (bi.expectedOutRaw < (booked * BigInt(10_000 - Math.min(10_000, drift))) / 10_000n)
+          return { kind: "rejected", code: "IMPACT", detail: `price moved up on retry: ${bi.expectedOutRaw} < ${booked} less ${drift} bps` };
+      }
       return null;
     } catch (e) {
       return { kind: "rejected", code: "CURVE", detail: String((e as Error).message) };
@@ -614,8 +631,9 @@ export class Executor {
       // The ticket's own impact falls as the price rises, so it alone does not stop a rebuild into a pump: the ticket
       // must still buy at least the expected fill on the order (the decision's, or Candle's build quote) less
       // maxBuyImpactBps.
-      const booked = o.expected_out_raw && /^\d+$/.test(o.expected_out_raw) ? BigInt(o.expected_out_raw) : null;
-      if (booked !== null && booked > 0n && r.expectedOutRaw < (booked * BigInt(10_000 - Math.min(10_000, Math.round(this.d.maxBuyImpactBps)))) / 10_000n)
+      const booked = expectedOf(o);
+      if (booked === null) return { kind: "rejected", code: "POOL", detail: "no expected fill on the order to hold the retry to (dammBuys refuses a pool retry without one)" };
+      if (r.expectedOutRaw < (booked * BigInt(10_000 - Math.min(10_000, Math.round(this.d.maxBuyImpactBps)))) / 10_000n)
         return { kind: "rejected", code: "IMPACT", detail: `price moved up on retry (pool): ${r.expectedOutRaw} < ${booked} less ${this.d.maxBuyImpactBps} bps` };
       return null;
     } catch (e) {

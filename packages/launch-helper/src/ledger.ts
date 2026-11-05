@@ -5,7 +5,7 @@
  */
 import { Ledger as CoreLedger } from "candle-bot-core/ledger";
 
-export type LaunchState = "new" | "built" | "submitting" | "unresolved" | "landed" | "open" | "failed" | "refused";
+export type LaunchState = "new" | "building" | "built" | "submitting" | "unresolved" | "landed" | "open" | "failed" | "refused";
 
 export interface LaunchRow {
   id: number;

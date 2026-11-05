@@ -4,9 +4,17 @@
 
 First release, on candle-bot-core 0.4.0 (pinned exactly).
 
-- One Candle launch per state dir through the atomic route (payer main): build, the dev buy's expected fill checked,
+- One Candle launch per spec through the atomic route (payer main): build, the dev buy's expected fill checked,
   submit within 45 s; the dev buy as the bundle's first buy.
 - `clientLaunchId` saved before the first build, never replaced; every state saved before its call; restarts,
-  timeouts and errors reconcile from Candle's launch job; failed or refused launches wait for `RETRY_LAUNCH` (same id).
+  timeouts and errors reconcile from Candle's launch job (`building` saved before the build: a restart never builds).
+- `RETRY_LAUNCH` builds once more under the same id only after a job read says `failed` or `JOB_NOT_FOUND`, and not
+  under `PAUSE_BUYS` or `STOP`; otherwise it is ignored with why.
+- Before the first build: `minDevBuyOutRaw` required (live), the dev buy within `lifetimeSol` and `maxOpen`, `wallet`
+  the key's embedded wallet, and no earlier launch by the account with the same name and symbol (`launch.newLaunch`
+  overrides).
 - The dev bag becomes a core position from its transaction on chain (core `openFromFill`); exits, `sell`, `STOP`,
-  `PAUSE_BUYS` as every bot. Dry mode calls nothing. `plan`, `run`, `status`, `sell`.
+  `PAUSE_BUYS` as every bot. A missing or wrong dev-buy signature is found in the wallet's history for the mint;
+  `adopt <signature>` books it by hand. `run` waits for a launch call in flight before closing on STOP or SIGTERM.
+- Dry mode calls nothing. `plan` (with the API key: Candle's `dryRunAtomicLaunch` preview of the dev buy's fill),
+  `run`, `status`, `sell`, `adopt`.

@@ -233,13 +233,32 @@ rechecks the pool (the ticket's impact, and the price move since the decision) r
 
 ## Opening a position from a fill the engine did not place
 
-`engine.openFromFill({ mint, signature, decimals, reason, entry?, expectedQtyRaw? })` books a position from a
-transaction on chain: the wallet's token gain is the quantity, its SOL spent (network fee and rent apart) the cost.
-It answers `{ ok: true, positionId, qtyRaw, costLamports }`, or `{ ok: false, reason }` (`tx_not_found`: read again
-later; `tx_failed`; `no_tokens`; `dry`) and books nothing. An API's number (`expectedQtyRaw`) is only compared: the
-chain wins. The position gets a filled buy order `fill-<signature>` (idempotent), so `maxPerCoin`, `maxOpen` and
-`lifetimeSol` count it and the strategy, the sell clamp and `sell` treat it as any other. candle-launch-helper opens
-its dev bag with it.
+`engine.openFromFill({ mint, signature, decimals?, reason, entry?, expectedQtyRaw? })` books a position from a
+transaction on chain: the wallet's token gain is the quantity, and the cost basis is the wallet's SOL delta less the
+network fee and its own token-account rent for that mint. Everything else the wallet paid in that transaction counts
+as cost: a transaction that launched a coin and bought it in one would carry the launch's costs too (Candle's atomic
+launch puts the dev buy in its own transaction, so its cost is the buy). The decimals come from the transaction's
+token balances (a caller's value must agree).
+
+It answers `{ ok: true, positionId, qtyRaw, costLamports }`, or `{ ok: false, reason }` and books nothing:
+`tx_not_found` (read again later), `tx_failed`, `no_tokens`, `no_spend` (tokens that cost no SOL: a transfer or
+airdrop never opens a cost-0 position), `already_booked` (any order already carries this signature, as its own or as a
+double execution's extra), `signature_other_mint`, `decimals_disagree`, `decimals_unknown`, `mint_busy` (an attempt
+or a reservation holds the coin: try again), `dry`. The whole call holds the coin (`Executor.reserveMint`), as the
+uncertain-buy scan does, so the two never adopt one transaction at once, and the booking re-checks the signature inside
+its database transaction; a lost race answers `ok: false`, never throws. An API's number (`expectedQtyRaw`) is only
+compared: the chain wins. The position gets a filled buy order `fill-<signature>` (idempotent for the same mint), so
+`maxPerCoin`, `maxOpen` and `lifetimeSol` count it and the strategy, the sell clamp and `sell` treat it as any other.
+candle-launch-helper opens its dev bag with it.
+
+## Retry price drift (opt-in)
+
+A buy rebuilt after a failed attempt is rechecked against `maxBuyImpactBps`: the ticket's own impact on the curve.
+That impact falls as the price rises, so on its own it lets a retry rebuild into a pump. `retry.maxPriceDriftBps`
+(config, unset by default) adds the price check: the retry must still buy at least the order's expected fill (the
+decision's, or Candle's build quote) less that many bps, or it ends `IMPACT`; an order with no expected fill ends too.
+Unset, a curve retry is checked exactly as in 0.3.1. A graduated coin's retry under `dammBuys` always has this check,
+at `maxBuyImpactBps`, and refuses (`POOL`) an order with no expected fill.
 
 ## How money is handled
 

@@ -13,6 +13,9 @@ Built by [Bruce Jeet](https://github.com/BruceJeet).
 - **Detection:** coins come from Candle's public token list and the launch-curve program on chain (the same source as
   candle-launch-bot); their curves are read together every `detect.curvePollMs`. The graduation time is the block time
   of the pool's activation slot.
+- **Coverage:** the coins in Candle's token list (the newest `detect.apiLimit` rows, read every poll) plus every launch
+  seen on chain while the bot runs. A coin older than that list's window that was launched before the bot started is
+  not watched.
 - **Filters** (all optional): seconds since graduation, time from launch to graduation, price impact of your ticket on
   the pool, room above the pool's price floor, creator allow and deny lists. Plus the core's caps (ticket size, open
   positions, lifetime spend, entries per coin). A coin launched by your own wallet is never bought.

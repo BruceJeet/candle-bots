@@ -47,7 +47,13 @@ export interface Config {
   };
   sell: { maxSlippageBps: number; maxPriorityFeeLamports?: number };
   exit: { strategy: string; [param: string]: unknown };
-  retry: { maxAttempts: number; baseDelayMs: number; maxDelayMs: number; maxExitOrders: number; stuckRetryMs: number; builtProbeMs: number; builtHoldMs: number };
+  retry: { maxAttempts: number; baseDelayMs: number; maxDelayMs: number; maxExitOrders: number; stuckRetryMs: number; builtProbeMs: number; builtHoldMs: number;
+    /**
+     * (0.4.0) Opt-in: a curve buy rebuilt after a failed attempt must still buy at least the order's expected fill
+     * less this many bps (the ticket's own impact falls as the price rises, so the impact limit alone lets a retry
+     * chase a pump). Unset: no such check (0.3.1 behavior). Graduated (DAMM) buys use maxBuyImpactBps for this.
+     */
+    maxPriceDriftBps?: number };
   alerts: { command?: string[]; commandEnv?: string[]; webhookEnv?: string; renotifyMs: number; holdAlertMs: number };
   /** The folder of the config file: relative paths in it (stateDir, signer.path, exit.module) resolve here. */
   configDir: string;
@@ -217,7 +223,7 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
 
   const r = raw.retry === undefined ? {} : raw.retry;
   if (!isObj(r)) throw new ConfigError("config.retry: must be an object");
-  only(r, ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxExitOrders", "stuckRetryMs", "builtProbeMs", "builtHoldMs"], "config.retry");
+  only(r, ["maxAttempts", "baseDelayMs", "maxDelayMs", "maxExitOrders", "stuckRetryMs", "builtProbeMs", "builtHoldMs", "maxPriceDriftBps"], "config.retry");
   const retry = {
     maxAttempts: num(r, "maxAttempts", "config.retry", { min: 1, max: 50, int: true, def: 6 }),
     baseDelayMs: num(r, "baseDelayMs", "config.retry", { min: 100, int: true, def: 2000 }),
@@ -226,6 +232,8 @@ export function parseConfig<S extends Sections = {}>(raw: unknown, baseDir = pro
     stuckRetryMs: num(r, "stuckRetryMs", "config.retry", { min: 60_000, int: true, def: 600_000 }),
     builtProbeMs: num(r, "builtProbeMs", "config.retry", { min: 60_000, int: true, def: 600_000 }),
     builtHoldMs: num(r, "builtHoldMs", "config.retry", { min: 600_000, int: true, def: 21_600_000 }),
+    // Only present when set, so a config without it parses to exactly what 0.3.1 gave.
+    ...(r.maxPriceDriftBps === undefined ? {} : { maxPriceDriftBps: num(r, "maxPriceDriftBps", "config.retry", { min: 0, max: 10_000, int: true }) }),
   };
 
   const al = raw.alerts === undefined ? {} : raw.alerts;

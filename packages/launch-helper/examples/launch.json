@@ -1,5 +1,5 @@
 {
-  "comment": "Dry run: prints the launch it would send and calls nothing. For live: your wallet, \"mode\": \"live\", and the API key in CANDLE_API_KEY.",
+  "comment": "Dry run: prints the launch it would send and calls nothing. For live: your embedded wallet, \"mode\": \"live\", launch.minDevBuyOutRaw (see plan's preview), and the API key in CANDLE_API_KEY.",
   "mode": "dry",
   "payer": "embedded",
   "apiKeyEnv": "CANDLE_API_KEY",

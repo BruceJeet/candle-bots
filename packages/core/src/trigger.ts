@@ -158,7 +158,8 @@ export interface Trigger {
    * engine's context (0.2.0: keep it to call ctx.wake() from the source; a 0.1.0 trigger ignores it).
    */
   start?(ctx: TriggerContext): Promise<void>;
-  stop?(): void;
+  /** Called once Engine.run has ended, before the ledger closes; a promise is awaited (0.4.0). */
+  stop?(): void | Promise<void>;
   /** Candidates new since the last call (same timeout rule as decide). One already pending is replaced (its wait state starts over). */
   poll(ctx: TriggerContext): Candidate[] | Promise<Candidate[]>;
   /**

@@ -1,7 +1,7 @@
 # candle-launch-helper
 
 Fires the [Candle](https://candle.tv) launch you describe, with your dev buy in the same bundle, then manages the dev
-bag with exits and controls. One launch per state dir; a run never launches twice. Built on Candle's official SDK,
+bag with exits and controls. One launch per name and symbol; a run never launches twice. Built on Candle's official SDK,
 [`@candledottv/agent-sdk`](https://www.npmjs.com/package/@candledottv/agent-sdk) (pinned at 0.6.14), and
 [candle-bot-core](https://www.npmjs.com/package/candle-bot-core).
 
@@ -13,7 +13,8 @@ Built by [Bruce Jeet](https://github.com/BruceJeet).
 - **The bag:** once the launch lands, the dev buy is read from its transaction on chain (amount and cost) and becomes a
   position the core manages: `tpsl`, `time`, `ladder`, `preGrad`, `hold` or your own exit, `STOP`, `PAUSE_BUYS`,
   `sell`.
-- **Dry mode** calls nothing: it prints the launch it would send.
+- **Dry mode** calls nothing: it prints the launch it would send. `plan` with the API key set asks Candle for a dry-run
+  preview of the dev buy's fill (`dryRunAtomicLaunch`: the build's checks, nothing recorded, reserved or sent).
 
 ## Quick start
 
@@ -23,10 +24,11 @@ allows atomic launches, and the account's embedded wallet funded.
 ```sh
 npm install -g candle-launch-helper
 cp "$(npm root -g)/candle-launch-helper/examples/launch.json" launch.json    # your coin's details
-candle-launch-helper plan --config launch.json      # the exact launch body; calls nothing
+candle-launch-helper plan --config launch.json      # the exact launch body; with CANDLE_API_KEY set, Candle's
+                                                    # dry-run preview of the dev buy's fill (--offline: none)
 candle-launch-helper run  --config launch.json      # dry: logs the plan, runs the loop
 export CANDLE_API_KEY=cndl_live_...
-# set "mode": "live" and your wallet in launch.json, then:
+# set "mode": "live", your embedded wallet and launch.minDevBuyOutRaw (from plan's preview) in launch.json, then:
 candle-launch-helper run --config launch.json       # launches once, then manages the dev bag
 ```
 
@@ -42,19 +44,47 @@ Candle's atomic launch (`buildAtomicLaunch`, then `submitAtomicLaunch`) from the
 
 ## A run never launches twice
 
-- The `clientLaunchId` is written to the ledger **before** the first build and is never replaced, not even after a
-  failure. A state dir holds one launch; a config for another coin in the same state dir is refused (alert), nothing
-  is sent.
+- **Before the first build** a live run checks, and sends nothing unless all pass (an alert says which failed; a
+  read that failed is tried again every 30 s):
+  - `launch.minDevBuyOutRaw` is set;
+  - the dev buy fits `buy.lifetimeSol` and `buy.maxOpen`;
+  - `wallet` is the key's embedded (main) wallet, where the dev bag lands (Candle's portfolio);
+  - the account has not launched a token with the same name and symbol (Candle's list of the account's launched
+    tokens, case and spaces ignored). Another state dir with the same spec is refused. `launch.newLaunch: true`
+    launches the same name and symbol again on purpose.
+- The `clientLaunchId` is written to the ledger **before** the first build and is never replaced. A state dir holds
+  one launch; a config for another coin in the same state dir is refused (alert), nothing is sent.
 - The build is checked before the submit: the dev buy's leg carries `minAmountOut: 0` inside the bundle, so Candle's
-  `expectedFill` is the check (present, above zero, and at least `launch.minDevBuyOutRaw` if set). The submit goes
-  out within 45 s of the build (the legs share one blockhash), and only from the process that built it.
-- Every state is saved before the call it leads to. A restart after a build that was not submitted, a submit in
-  flight, a timeout or any error after a request was sent reads Candle's launch job (`getLaunchJob`) every 30 s: it
-  resumes on `confirmed`, stops on `failed`, and waits otherwise. A launch unresolved for `launch.unresolvedAlertMin`
-  minutes raises an alert with its `clientLaunchId`.
-- A launch that failed, or that was refused before it was sent, is not built again on its own. `RETRY_LAUNCH` in the
-  state dir asks for one more build under the same id.
+  `expectedFill` is the check (present, above zero, and at least `launch.minDevBuyOutRaw`). The submit goes out within
+  45 s of the build (the legs share one blockhash), and only from the process that built it.
+- Every state is saved before the call it leads to (`building` before the build). A restart during a build, after a
+  build that was not submitted, or during a submit, a timeout, or any error after a request was sent reads Candle's
+  launch job (`getLaunchJob`) every 30 s: it resumes on `confirmed`, stops on `failed`, and waits otherwise. A restart
+  never builds. A launch unresolved for `launch.unresolvedAlertMin` minutes raises an alert with its `clientLaunchId`.
+- **The bot never builds again on its own.** `RETRY_LAUNCH` in the state dir asks for one more build under the same
+  id. It acts only when a job read just then says `failed` or `JOB_NOT_FOUND` (the SDK's recovery steps), and not
+  while `PAUSE_BUYS` or `STOP` is set. Any other answer uses the file up (`RETRY_LAUNCH.ignored`) and logs and alerts
+  why. A job that says `confirmed` is taken as landed. A 409 on the rebuild (Candle still resolving the first attempt)
+  goes back to reading the job. A new `clientLaunchId` is never sent while a launch may land.
 - `PAUSE_BUYS`: no launch fires (and none is submitted after a build). Dry mode makes no call at all.
+- On `STOP` or SIGTERM the run waits for a launch call in flight (a submit can take about 160 s) before it closes the
+  ledger. Under systemd give the unit `TimeoutStopSec=200` or more; a kill in the middle is still safe (the state was
+  saved before the call, and the restart reads the job).
+
+## The dev bag
+
+Once the launch lands, the dev buy's transaction (the submit's buy-leg signature, else Candle's job) is booked from
+the chain by the core (`openFromFill`: this wallet's tokens and SOL spent, never an API's number). When Candle names no
+dev-buy transaction, or one that gave the wallet no tokens, the wallet's token-account history for the mint is read,
+oldest first, and the first transaction that bought the coin with SOL is booked. If that finds nothing, an alert asks
+for a hand booking:
+
+```sh
+candle-launch-helper adopt <signature> --config launch.json [--mint <mint>]    # with the bot stopped
+```
+
+`adopt` books the bag from that transaction through the same checks (this wallet, this mint, SOL spent, tokens
+received, not booked already) and marks the launch open.
 
 ## Config
 
@@ -80,7 +110,8 @@ The core's sections as in every candle-bot-core bot (`mode`, `payer`, `apiKeyEnv
 | `launch.description`, `website`, `twitter`, `telegram` | optional |
 | `launch.mode` | Candle launch mode (default `open`) |
 | `launch.devBuySol` | the dev buy, SOL; at most `buy.sol`; counts against `buy.lifetimeSol` |
-| `launch.minDevBuyOutRaw` | refuse to submit if Candle's expected fill is lower (raw token units, as a string) |
+| `launch.minDevBuyOutRaw` | required in live mode: refuse to submit if Candle's expected fill is lower (raw token units, as a string). `plan` previews the fill |
+| `launch.newLaunch` | `true` to launch even though the account already launched this name and symbol (default `false`: refused) |
 | `launch.unresolvedAlertMin` | alert when a sent launch stays unresolved this long (default 10) |
 
 ## State dir
@@ -89,14 +120,20 @@ The core's sections as in every candle-bot-core bot (`mode`, `payer`, `apiKeyEnv
 |---|---|
 | `ledger.sqlite` | the `launches` row (id, state, bundle, mint, signatures), the dev bag's position and its orders, alerts |
 | `status.json` | the launch's state, mint and position; the bag's value and exits |
-| `events.jsonl` | `launch_id_saved`, `launch_built`, `launch_landed`, `launch_unresolved`, `dev_bag_open`, sells |
+| `events.jsonl` | `launch_preflight_refused`, `launch_id_saved`, `launch_built`, `launch_landed`, `launch_unresolved`, `launch_retry`, `launch_retry_ignored`, `dev_buy_found_on_chain`, `dev_bag_open`, sells |
+| `RETRY_LAUNCH`, `.done`, `.ignored` | the operator's retry request, and what became of it |
 
 ## Known limits
 
 - **Embedded payer only** (the atomic route). One dev-buy leg.
 - **Image by URL.** The image must already be hosted.
-- **The dev-buy transaction** is taken from the submit's signatures (the buy leg's index) or from Candle's launch job;
-  until one is known, the bag is not managed (alert).
+- **The dev-buy transaction** is taken from the submit's signatures (the buy leg's index), Candle's launch job, or the
+  wallet's history for the mint; until one is booked, the bag is not managed (alert; `adopt` books it by hand).
+- **The same-spec check** reads up to 20 pages (1,000 tokens) of the account's launches; an account with more is
+  refused unless `launch.newLaunch` is set.
+- **A launch refused at the submit check** (expected fill under the floor) leaves a built bundle Candle never got; its
+  job may not answer `failed` or `JOB_NOT_FOUND`, so `RETRY_LAUNCH` may be ignored. Use a new state dir (with
+  `launch.newLaunch: true` only if the first launch is known not to exist).
 - **Solana only.**
 
 ## License

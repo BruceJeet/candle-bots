@@ -19,12 +19,21 @@ New API for bots that buy graduated coins or watch Candle launches. A 0.3.x bot 
   `POOL` for a pool that does not match, a read failure waits. Without it, as before, such a retry ends `CURVE`.
 - `dammBuy` refuses (`pool_layout`) a fee mode or scheduler mode it does not know, rather than guess the fee.
 - **`MarketRead.pool`**: the decoded pool for a graduated coin. Dry fills price a graduated coin's buy on its pool.
-- **`Engine.openFromFill({ mint, signature, decimals, reason, entry?, expectedQtyRaw? })`**: opens a position from a
+- **`Engine.openFromFill({ mint, signature, decimals?, reason, entry?, expectedQtyRaw? })`**: opens a position from a
   buy the engine did not place (a launch's dev buy; later, an adopted bag). Quantity and cost come from the
-  transaction on chain (the wallet's deltas, fee and rent apart), never from an API's number; a filled buy order
-  `fill-<signature>` is booked with it, so the caps count it and the exits, the clamp and `sell` treat it as any
-  position. Idempotent per signature; nothing is booked for a transaction that cannot be read, failed, or gave no
-  tokens; an `expectedQtyRaw` more than 1 % off the chain is logged and alerted (`fill_disagrees`). Live only.
+  transaction on chain (the wallet's deltas, fee and own-ATA rent apart), never from an API's number; a filled buy
+  order `fill-<signature>` is booked with it, so the caps count it and the exits, the clamp and `sell` treat it as any
+  position. Refused, nothing booked: a transaction that cannot be read, failed, gave no tokens, or cost no SOL
+  (`no_spend`: a transfer or airdrop); a signature any order already carries (`already_booked`,
+  `signature_other_mint`); decimals that disagree with the transaction's; a coin an attempt holds (`mint_busy`: the
+  call holds the coin as the uncertain-buy scan does). A booking race answers `ok: false`, never throws. An
+  `expectedQtyRaw` more than 1 % off the chain is logged and alerted (`fill_disagrees`). Live only.
+- **`retry.maxPriceDriftBps`** (config, opt-in, unset by default): a curve buy's retry must still buy at least the
+  order's expected fill less that many bps (`IMPACT` otherwise; an order with no expected fill ends too), so a retry
+  cannot rebuild into a pump. Unset: exactly 0.3.1's curve recheck. Under `dammBuys` a pool retry with no expected
+  fill on the order ends `POOL`.
+- **`Trigger.stop()` may return a promise**; `run` awaits it before the ledger closes (a trigger with a call in flight
+  finishes it). A throwing `stop` is logged (`trigger_stop_failed`) and the ledger still closes.
 - **`sources/candleLaunches`** (root export `CandleLaunches`): candle-launch-bot's launch detector (Candle's token
   list and the curve program on chain, deduped by mint, latency from block time), moved into the core unchanged so
   every bot that watches Candle launches shares it.

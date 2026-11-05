@@ -25,6 +25,17 @@ import { asAddress } from "./solana/base58.ts";
 import { buyImpact, dammBuy, decodeCandleCurve, decodeDamm } from "./market/curve.ts";
 import { candleCurve as curveOf, dammPool } from "./solana/pda.ts";
 
+class BookedRace extends Error {}
+
+/** The mint's decimals from a transaction's token balances (post first), or null when it names none. */
+function decimalsIn(tx: any, mint: string): number | null {
+  for (const r of [...(tx?.meta?.postTokenBalances ?? []), ...(tx?.meta?.preTokenBalances ?? [])]) {
+    const d = r?.mint === mint ? r?.uiTokenAmount?.decimals : undefined;
+    if (typeof d === "number" && Number.isInteger(d) && d >= 0 && d <= 18) return d;
+  }
+  return null;
+}
+
 export interface EngineDeps {
   cfg: Config;
   ledger: Ledger;
@@ -1385,19 +1396,62 @@ export class Engine {
 
   /**
    * (0.4.0) Open a position from a buy this engine did not place (a launch's dev buy; later, an adopted bag): the
-   * quantity and cost are read from the transaction on chain (the wallet's token and SOL deltas, network fee and rent
-   * apart), never from an API's number. The position is booked with a filled buy order (`fill-<signature>`) so the
-   * caps count it (maxPerCoin, maxOpen, lifetimeSol) and the exits, the clamp and `sell` treat it as any other.
-   * Idempotent per signature. Nothing is booked when the transaction cannot be read (`tx_not_found`: read again
-   * later), failed on chain, or gave the wallet no tokens. `expectedQtyRaw` (the API's word) is only compared: the
-   * chain wins, and a gap over 1 % is logged and alerted. Dry runs refuse (a dry ledger never books a real fill).
+   * quantity and cost are read from the transaction on chain, never from an API's number. Cost basis = the wallet's
+   * SOL delta less the network fee and its own token-account rent (fillFromTx's swap leg): everything else the wallet
+   * paid in that transaction counts, so a combined launch-and-buy transaction would carry launch costs too. The
+   * position is booked with a filled buy order (`fill-<signature>`) so the caps count it (maxPerCoin, maxOpen,
+   * lifetimeSol) and the exits, the clamp and `sell` treat it as any other.
+   *
+   * Idempotent per signature and mint. Refused, nothing booked:
+   *  - `mint_busy`: an attempt or a reservation holds the coin (the whole call holds it, as the uncertain-buy scan
+   *    does, so the two can never adopt one transaction at once); try again
+   *  - `already_booked` / `signature_other_mint`: another order already carries this signature
+   *  - `tx_not_found` (read again later), `tx_failed`, `no_tokens`, `no_spend` (a transfer or airdrop: it never opens
+   *    a cost-0 position), `decimals_disagree` / `decimals_unknown`
+   *  - `dry`: a dry ledger never books a real fill
+   * `decimals` comes from the transaction's token balances; a caller's value must agree. `expectedQtyRaw` (the API's
+   * word) is only compared: the chain wins, and a gap over 1 % is logged and alerted.
    */
-  async openFromFill(p: { mint: string; signature: string; decimals: number; reason: string; entry?: unknown; expectedQtyRaw?: bigint | null }): Promise<{ ok: true; positionId: number; qtyRaw: bigint; costLamports: bigint } | { ok: false; reason: string }> {
+  async openFromFill(p: { mint: string; signature: string; decimals?: number; reason: string; entry?: unknown; expectedQtyRaw?: bigint | null }): Promise<{ ok: true; positionId: number; qtyRaw: bigint; costLamports: bigint } | { ok: false; reason: string }> {
     if (this.d.cfg.mode !== "live") return { ok: false, reason: "dry" };
     if (!asAddress(p.mint)) return { ok: false, reason: "bad_mint" };
+    if (!this.d.executor.reserveMint(p.mint)) return { ok: false, reason: "mint_busy" };
+    try {
+      return await this.openFromFillHeld(p);
+    } finally {
+      this.d.executor.releaseMint(p.mint);
+    }
+  }
+
+  /** The orders that already carry this signature (as their own, or as a double execution's extra). */
+  private ordersWithSignature(sig: string): Array<{ id: number; client_trade_id: string; mint: string; pid: number; q: string; c: string }> {
+    const rows = this.d.ledger.db
+      .prepare("select o.id, o.client_trade_id, o.signature s, o.extra_signatures x, p.mint, p.id pid, p.qty_raw q, p.cost_lamports c from orders o join positions p on p.id = o.position_id where o.signature = ? or o.extra_signatures like ?")
+      .all(sig, `%${sig}%`) as Array<{ id: number; client_trade_id: string; s: string | null; x: string | null; mint: string; pid: number; q: string; c: string }>;
+    return rows.filter((r) => {
+      if (r.s === sig) return true;
+      try {
+        return (JSON.parse(r.x ?? "[]") as string[]).includes(sig);
+      } catch {
+        return true;   // unreadable list that mentions it: treat as booked
+      }
+    });
+  }
+
+  private async openFromFillHeld(p: { mint: string; signature: string; decimals?: number; reason: string; entry?: unknown; expectedQtyRaw?: bigint | null }): Promise<{ ok: true; positionId: number; qtyRaw: bigint; costLamports: bigint } | { ok: false; reason: string }> {
     const id = `fill-${p.signature}`;
-    const have = this.d.ledger.db.prepare("select o.position_id pid, p.qty_raw q, p.cost_lamports c from orders o join positions p on p.id = o.position_id where o.client_trade_id = ?").get(id) as { pid: number; q: string; c: string } | undefined;
-    if (have) return { ok: true, positionId: have.pid, qtyRaw: BigInt(have.q), costLamports: BigInt(have.c) };
+    const booked = (): { ok: true; positionId: number; qtyRaw: bigint; costLamports: bigint } | { ok: false; reason: string } | null => {
+      const rows = this.ordersWithSignature(p.signature);
+      if (rows.length === 0) return null;
+      const own = rows.find((r) => r.client_trade_id === id);
+      if (own && rows.length === 1) {
+        if (own.mint !== p.mint) return { ok: false, reason: "signature_other_mint" };
+        return { ok: true, positionId: own.pid, qtyRaw: BigInt(own.q), costLamports: BigInt(own.c) };
+      }
+      return { ok: false, reason: rows.some((r) => r.mint !== p.mint) ? "signature_other_mint" : "already_booked" };
+    };
+    const first = booked();
+    if (first) return first;
     let tx: any;
     try {
       tx = await this.d.rpc.call<any>("getTransaction", [p.signature, { encoding: "json", maxSupportedTransactionVersion: 0, commitment: "confirmed" }]);
@@ -1413,16 +1467,30 @@ export class Engine {
     }
     if (fill.err) return { ok: false, reason: "tx_failed" };
     if (fill.tokenDeltaRaw <= 0n) return { ok: false, reason: "no_tokens" };
-    const cost = fill.swapLamports < 0n ? -fill.swapLamports : 0n;
+    if (fill.swapLamports >= 0n) return { ok: false, reason: "no_spend" };
+    const txDecimals = decimalsIn(tx, p.mint);
+    if (txDecimals !== null && p.decimals !== undefined && txDecimals !== p.decimals) return { ok: false, reason: "decimals_disagree" };
+    const decimals = txDecimals ?? p.decimals;
+    if (decimals === undefined) return { ok: false, reason: "decimals_unknown" };
+    const cost = -fill.swapLamports;
     const now = this.now();
-    const pid = this.d.ledger.tx(() => {
-      const pos = this.d.ledger.createPosition({ mint: p.mint, chain: "solana", dry: false, now, decimals: p.decimals, strategy: this.d.strategy.name, entry: p.entry ?? { from: "fill", signature: p.signature } });
-      const oid = this.d.ledger.createOrder({ positionId: pos, side: "buy", clientTradeId: id, amountRaw: cost, slippageBps: 0, maxAttempts: 0, now, reason: p.reason, manual: true, expectedOutRaw: p.expectedQtyRaw ?? null });
-      this.d.ledger.updateOrder(oid, { status: "filled", signature: p.signature, qty_source: "onchain", fill_json: JSON.stringify({ fill, result: { from: "openFromFill" } }, (_k, v) => (typeof v === "bigint" ? v.toString() : v)), updated_at: now });
-      const entry = cost > 0n ? Number(cost) / 1e9 / (Number(fill.tokenDeltaRaw) / 10 ** p.decimals) : 0;
-      this.d.ledger.updatePosition(pos, { status: "open", qty_raw: fill.tokenDeltaRaw.toString(), qty_source: "onchain", remaining_raw: fill.tokenDeltaRaw.toString(), cost_lamports: cost.toString(), network_fees_lamports: fill.networkFeeLamports.toString(), rent_lamports: fill.rentLamports.toString(), peak_price: entry });
-      return pos;
-    });
+    let pid: number;
+    try {
+      pid = this.d.ledger.tx(() => {
+        // Checked again inside the booking transaction (another process on the same ledger may have booked it).
+        if (this.ordersWithSignature(p.signature).length > 0) throw new BookedRace();
+        const pos = this.d.ledger.createPosition({ mint: p.mint, chain: "solana", dry: false, now, decimals, strategy: this.d.strategy.name, entry: p.entry ?? { from: "fill", signature: p.signature } });
+        const oid = this.d.ledger.createOrder({ positionId: pos, side: "buy", clientTradeId: id, amountRaw: cost, slippageBps: 0, maxAttempts: 0, now, reason: p.reason, manual: true, expectedOutRaw: p.expectedQtyRaw ?? null });
+        this.d.ledger.updateOrder(oid, { status: "filled", signature: p.signature, qty_source: "onchain", fill_json: JSON.stringify({ fill, result: { from: "openFromFill" } }, (_k, v) => (typeof v === "bigint" ? v.toString() : v)), updated_at: now });
+        const entry = Number(cost) / 1e9 / (Number(fill.tokenDeltaRaw) / 10 ** decimals);
+        this.d.ledger.updatePosition(pos, { status: "open", qty_raw: fill.tokenDeltaRaw.toString(), qty_source: "onchain", remaining_raw: fill.tokenDeltaRaw.toString(), cost_lamports: cost.toString(), network_fees_lamports: fill.networkFeeLamports.toString(), rent_lamports: fill.rentLamports.toString(), peak_price: entry });
+        return pos;
+      });
+    } catch (e) {
+      // A race lost to another booking (our check, or the unique client_trade_id): report what is there, never throw.
+      if (e instanceof BookedRace || /UNIQUE|constraint/i.test(String((e as Error)?.message ?? e))) return booked() ?? { ok: false, reason: "already_booked" };
+      return { ok: false, reason: `book_failed: ${String((e as Error)?.message ?? e).slice(0, 120)}` };
+    }
     this.d.log.info("position_from_fill", { position: pid, mint: p.mint, signature: p.signature, qtyRaw: fill.tokenDeltaRaw, costLamports: cost, expectedQtyRaw: p.expectedQtyRaw ?? null });
     const exp = p.expectedQtyRaw;
     if (exp !== undefined && exp !== null && exp > 0n) {
