@@ -17,7 +17,12 @@ export interface Action {
 }
 export type WindowRule = Action & { dropPct: number; windowSec: number };
 /** creators: a coin's creator wallet by hand, for coins whose launch transaction does not name it (see the README). */
-export type DevRule = Action & { soldPct?: number; floorPct?: number; creators: Record<string, string> };
+/**
+ * confirmAfterMs: a trip fires only if a second read this long after the first agrees (default 5000; 0: at once).
+ * ourWallets: wallets of our own besides `wallet` (another bot's, a launch helper's): the rule is off for a coin one
+ * of them created, and they never count as large holders.
+ */
+export type DevRule = Action & { soldPct?: number; floorPct?: number; creators: Record<string, string>; confirmAfterMs: number; ourWallets: string[] };
 /** exclude: wallets never counted as large holders (an exchange, a locker that is a plain wallet). */
 export type HolderRule = Action & { topN: number; soldPctOfSupply: number; windowSec: number; exclude: string[] };
 
@@ -37,6 +42,12 @@ export interface Watch {
   pollBudgetMs: number;
   /** An env var with a separate RPC URL for holder reads (they are heavy; keeps them off the trading RPC). */
   holdersRpcUrlEnv?: string;
+  /** An env var with an RPC URL for confirming reads (a second node: one node's lagging index cannot fire alone). */
+  confirmRpcUrlEnv?: string;
+  /** Slots an answer may lag the newest seen for the coin before it is stale (pooled providers differ by a few). */
+  slotTolerance: number;
+  /** Longest the price and pool windows stay frozen while one of our sells is open (s); then sampling resumes. */
+  freezeMaxSec: number;
   checkPrograms: boolean;
   extraPrograms: string[];
   sellFloorMarginBps: number;
@@ -70,7 +81,7 @@ const parseRules: SectionParser<Rules> = (raw) => {
   if (raw.devDump !== undefined) {
     const r = raw.devDump;
     if (!isObj(r)) throw new ConfigError(`${w}.devDump: an object`);
-    only(r, ["soldPct", "floorPct", "creators", "sell", "alertOnly"], `${w}.devDump`);
+    only(r, ["soldPct", "floorPct", "creators", "confirmAfterMs", "ourWallets", "sell", "alertOnly"], `${w}.devDump`);
     const creators: Record<string, string> = {};
     const cr = r.creators === undefined ? {} : r.creators;
     if (!isObj(cr)) throw new ConfigError(`${w}.devDump.creators: an object { "<mint>": "<creator wallet>" }`);
@@ -82,7 +93,12 @@ const parseRules: SectionParser<Rules> = (raw) => {
     const soldPct = r.soldPct === undefined ? undefined : num(r, "soldPct", `${w}.devDump`, { min: 1, max: 100 });
     const floorPct = r.floorPct === undefined ? undefined : num(r, "floorPct", `${w}.devDump`, { min: 0.0001, max: 100 });
     if (soldPct === undefined && floorPct === undefined) throw new ConfigError(`${w}.devDump: set soldPct, floorPct or both`);
-    out.devDump = { ...(soldPct !== undefined ? { soldPct } : {}), ...(floorPct !== undefined ? { floorPct } : {}), creators, ...action(r, `${w}.devDump`) };
+    out.devDump = {
+      ...(soldPct !== undefined ? { soldPct } : {}), ...(floorPct !== undefined ? { floorPct } : {}), creators,
+      confirmAfterMs: num(r, "confirmAfterMs", `${w}.devDump`, { min: 0, max: 120_000, int: true, def: 5_000 }),
+      ourWallets: strList(r, "ourWallets", `${w}.devDump`, { def: [], address: true })!,
+      ...action(r, `${w}.devDump`),
+    };
     checkAction(out.devDump, `${w}.devDump`);
   }
   if (raw.holderExit !== undefined) {
@@ -105,14 +121,19 @@ const parseRules: SectionParser<Rules> = (raw) => {
 const parseWatch: SectionParser<Watch> = (raw) => {
   const r = raw === undefined ? {} : raw;
   if (!isObj(r)) throw new ConfigError("config.watch: must be an object");
-  only(r, ["holdersPollMs", "maxCoinsPerPoll", "pollBudgetMs", "holdersRpcUrlEnv", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], "config.watch");
+  only(r, ["holdersPollMs", "maxCoinsPerPoll", "pollBudgetMs", "holdersRpcUrlEnv", "confirmRpcUrlEnv", "slotTolerance", "freezeMaxSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], "config.watch");
   const env = r.holdersRpcUrlEnv;
   if (env !== undefined && (typeof env !== "string" || !ENV_NAME.test(env))) throw new ConfigError("config.watch.holdersRpcUrlEnv: an environment variable name");
+  const cenv = r.confirmRpcUrlEnv;
+  if (cenv !== undefined && (typeof cenv !== "string" || !ENV_NAME.test(cenv))) throw new ConfigError("config.watch.confirmRpcUrlEnv: an environment variable name");
   return {
     holdersPollMs: num(r, "holdersPollMs", "config.watch", { min: 2_000, int: true, def: 15_000 }),
     maxCoinsPerPoll: num(r, "maxCoinsPerPoll", "config.watch", { min: 1, max: 100, int: true, def: 10 }),
     pollBudgetMs: num(r, "pollBudgetMs", "config.watch", { min: 200, max: 60_000, int: true, def: 3_000 }),
     ...(env !== undefined ? { holdersRpcUrlEnv: env as string } : {}),
+    ...(cenv !== undefined ? { confirmRpcUrlEnv: cenv as string } : {}),
+    slotTolerance: num(r, "slotTolerance", "config.watch", { min: 0, max: 10_000, int: true, def: 5 }),
+    freezeMaxSec: num(r, "freezeMaxSec", "config.watch", { min: 5, max: 3_600, int: true, def: 120 }),
     checkPrograms: bool(r, "checkPrograms", "config.watch", true),
     extraPrograms: strList(r, "extraPrograms", "config.watch", { def: [], address: true })!,
     sellFloorMarginBps: num(r, "sellFloorMarginBps", "config.watch", { min: 0, max: 10_000, int: true, def: 200 }),

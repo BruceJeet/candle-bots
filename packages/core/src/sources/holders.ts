@@ -139,9 +139,11 @@ export class CreatorReadError extends Error {}
  * A coin's creator from chain: a pump.fun coin's curve names it (`creator`). Otherwise the fee payer of the mint's
  * oldest successful transaction (its launch), paged back through the mint's history (at most `pages` pages of 1000).
  * Null when there is none to find (no history, or one longer than the cap). A read that fails throws CreatorReadError:
- * a failed curve read never falls through to the fee-payer path.
+ * a failed curve read never falls through to the fee-payer path, and neither does a curve that does not decode (only
+ * the pump program can own that address). `expectPump` (the coin is known to be on a pump venue): a missing curve is
+ * a lagging node, an error too.
  */
-export async function creatorOf(rpc: Rpc, mint: string, pages = 10): Promise<{ creator: string; source: "pump-curve" | "first-tx" } | null> {
+export async function creatorOf(rpc: Rpc, mint: string, pages = 10, opts: { expectPump?: boolean } = {}): Promise<{ creator: string; source: "pump-curve" | "first-tx" } | null> {
   let v: any;
   try {
     v = (await rpc.call<any>("getAccountInfo", [pumpCurve(mint), { encoding: "base64", commitment: "confirmed" }]))?.value;
@@ -149,14 +151,14 @@ export async function creatorOf(rpc: Rpc, mint: string, pages = 10): Promise<{ c
     throw new CreatorReadError(`pump curve read failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
   }
   if (v) {
-    let c: ReturnType<typeof decodePumpCurve> | null = null;
+    let c: ReturnType<typeof decodePumpCurve>;
     try {
       c = decodePumpCurve(v);
-    } catch {
-      c = null; // an account at that address that is not a pump curve: the launch transaction below
+    } catch (e) {
+      throw new CreatorReadError(`pump curve unreadable: ${String((e as Error)?.message ?? e).slice(0, 80)}`);
     }
-    if (c && c.creator && c.creator !== "11111111111111111111111111111111") return { creator: c.creator, source: "pump-curve" };
-  }
+    if (c.creator && c.creator !== "11111111111111111111111111111111") return { creator: c.creator, source: "pump-curve" };
+  } else if (opts.expectPump) throw new CreatorReadError("pump curve not served (the coin is on a pump venue)");
   let before: string | undefined;
   let lastPage: any[] = [];
   let reachedStart = false;

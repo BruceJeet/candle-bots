@@ -61,6 +61,8 @@ export const HOLDER_FAIL_ALERT = 3;
 export const CREATOR_RETRY_MS = 3_600_000;
 /** Price and pool samples kept per coin at most (besides the window). */
 export const MAX_SAMPLES = 600;
+/** A creator found on chain is looked up again this often (and once per run), in case the first answer was wrong. */
+export const CREATOR_RECHECK_MS = 6 * 3_600_000;
 
 export interface WatchDeps {
   cfg: Config;
@@ -68,7 +70,9 @@ export interface WatchDeps {
   log: Logger;
   alerter: Alerter;
   holders: HolderSource;
-  creatorOf: (mint: string) => Promise<{ creator: string; source: string } | null>;
+  /** A second source for confirming reads (watch.confirmRpcUrlEnv); default: `holders`. */
+  confirmHolders?: HolderSource;
+  creatorOf: (mint: string, opts: { expectPump: boolean }) => Promise<{ creator: string; source: string } | null>;
   /** Positions watched now (the adopter's managed bags). */
   managed: () => PositionRow[];
   market: (mint: string) => Readonly<MarketRead> | undefined;
@@ -90,8 +94,17 @@ interface CoinState {
   filledSells: number;
   /** Where the next poll starts its direct reads (they rotate, so no wallet is starved). */
   rot: number;
-  /** The highest RPC slot a holder or balance read of this coin answered at: an older answer is stale. */
+  /** The highest RPC slot a holder or balance read of this coin answered at, per source: an older answer is stale. */
   lastSlot: number;
+  lastSlotConfirm: number;
+  /** A dev trip waiting for its confirming read (due at `due`). */
+  devConfirm: { due: number; parts: string[] } | null;
+  /** When the windows were frozen for one of our open sells (0: not frozen). */
+  frozenSince: number;
+  /** SOL our own fills took out of the pool since the window began: added back to pool samples. */
+  ownOutSol: number;
+  /** The position's proceeds at the last sample (-1: not read yet). */
+  proceedsSeen: bigint;
 }
 
 export class RugWatch {
@@ -99,6 +112,8 @@ export class RugWatch {
   private now: () => number;
   private coins = new Map<number, CoinState>();
   private creatorMiss = new Map<string, number>();
+  /** When a chain-found creator was last looked up again (per mint, this run). */
+  private creatorChecked = new Map<string, number>();
   /** Real elapsed time (ms) for the poll budget. */
   private clock: () => number;
 
@@ -107,12 +122,15 @@ export class RugWatch {
     this.now = d.now ?? Date.now;
     this.clock = d.clock ?? (() => performance.now());
     d.ledger.db.exec(TABLES);
+    // A ledger made before `outcome` existed (an earlier run of this version): add the column.
+    const cols = new Set((d.ledger.db.prepare("pragma table_info(rug_events)").all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has("outcome")) d.ledger.db.exec("alter table rug_events add column outcome text");
   }
 
   private state(positionId: number): CoinState {
     let s = this.coins.get(positionId);
     if (!s) {
-      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0, lastSlot: 0 };
+      s = { venue: "", lastAt: -1, price: [], liq: [], holders: [], nextPollAt: 0, holderFails: 0, filledSells: -1, rot: 0, lastSlot: 0, lastSlotConfirm: 0, devConfirm: null, frozenSince: 0, ownOutSol: 0, proceedsSeen: -1n };
       this.coins.set(positionId, s);
     }
     return s;
@@ -146,26 +164,30 @@ export class RugWatch {
       const st = this.state(p.id);
       if (m.nowMs === st.lastAt) return;
       st.lastAt = m.nowMs;
+      const row = this.d.ledger.position(p.id) ?? p;
+      const proceeds = BigInt(row.proceeds_lamports ?? "0");
       const filled = this.d.ledger.ordersFor(p.id).filter((o) => o.side === "sell" && o.status === "filled").length;
       if (st.filledSells >= 0 && filled !== st.filledSells) {
-        // One of our sells filled since the last sample: its impact on price and pool is ours, not a rug.
+        // One of our sells filled since the last sample. Price: its impact is ours, the price window starts again. Pool:
+        // the SOL it took out is added back to every later sample, so a pull around our sell still shows.
         st.price = [];
-        st.liq = [];
+        if (st.proceedsSeen >= 0n && proceeds > st.proceedsSeen) st.ownOutSol += Number(proceeds - st.proceedsSeen) / 1e9;
       }
       st.filledSells = filled;
-      // A sell of this position pending or in flight: its own impact may already show in the pool before the fill is
-      // booked. No sample now; the fill restarts the windows.
+      st.proceedsSeen = proceeds;
+      // A sell of this position pending or in flight: its impact may show before the fill is booked. The windows are
+      // frozen (no new sample, the highs kept), at most watch.freezeMaxSec; then sampling resumes.
       if (this.d.ledger.openOrderFor(p.id)) {
-        st.price = [];
-        st.liq = [];
-        return;
-      }
+        if (!st.frozenSince) st.frozenSince = m.nowMs;
+        if (m.nowMs - st.frozenSince < this.d.cfg.watch.freezeMaxSec * 1000) return;
+      } else st.frozenSince = 0;
       if (m.problem) return;
       if (m.venue !== st.venue) {
         // A migration moves the SOL from the curve to a pool: not a pull. Both windows start again on a new venue.
         st.venue = m.venue;
         st.price = [];
         st.liq = [];
+        st.ownOutSol = 0;
       }
       if (r.priceCrash && m.priceSol !== null && m.priceSol > 0) {
         st.price = prune([...st.price, { at: m.nowMs, value: m.priceSol }], m.nowMs, r.priceCrash.windowSec).slice(-MAX_SAMPLES);
@@ -177,7 +199,7 @@ export class RugWatch {
       }
       const liq = m.quoteLiquidityLamports;
       if (r.liquidityPull && POOL_VENUES.has(m.venue) && typeof liq === "bigint") {
-        st.liq = prune([...st.liq, { at: m.nowMs, value: Number(liq) / 1e9 }], m.nowMs, r.liquidityPull.windowSec).slice(-MAX_SAMPLES);
+        st.liq = prune([...st.liq, { at: m.nowMs, value: Number(liq) / 1e9 + st.ownOutSol }], m.nowMs, r.liquidityPull.windowSec).slice(-MAX_SAMPLES);
         const trip = windowDrop(st.liq, m.nowMs, r.liquidityPull, `pool SOL (${m.venue})`, fmtSol);
         if (trip) {
           this.fireSeq(p, "liquidityPull", trip, r.liquidityPull);
@@ -212,6 +234,8 @@ export class RugWatch {
       st.nextPollAt = now + this.d.cfg.watch.holdersPollMs;
       try {
         const failed = await this.pollOne(p, st);
+        // A dev trip waiting for its confirming read: poll this coin again when it is due.
+        if (st.devConfirm) st.nextPollAt = Math.min(st.nextPollAt, st.devConfirm.due);
         if (failed.length) throw new Error(failed.join("; "));
         st.holderFails = 0;
       } catch (e) {
@@ -227,16 +251,25 @@ export class RugWatch {
     }
   }
 
-  /** A balance read with its slot; a read at an older slot than this coin has seen is stale (null). */
-  private async balance(owner: string, p: PositionRow, st: CoinState): Promise<BalanceAt | null> {
-    const h = this.d.holders;
-    const r = h.balanceAt ? await h.balanceAt(owner, p.mint) : await h.balanceOf(owner, p.mint).then((a) => (a === null ? null : { amount: a, slot: null }));
-    if (!r) return null;
-    if (r.slot !== null) {
-      if (r.slot < st.lastSlot) return null;
-      st.lastSlot = r.slot;
+  /**
+   * A balance read with its slot. An answer more than watch.slotTolerance slots older than the newest this coin has
+   * seen (from that source) is stale: read once more, then "stale" (unknown: no verdict, and not a failed read).
+   */
+  private async balance(owner: string, p: PositionRow, st: CoinState, confirm = false): Promise<BalanceAt | "stale" | null> {
+    const h = confirm ? (this.d.confirmHolders ?? this.d.holders) : this.d.holders;
+    const tol = this.d.cfg.watch.slotTolerance;
+    for (let i = 0; i < 2; i++) {
+      const r = h.balanceAt ? await h.balanceAt(owner, p.mint) : await h.balanceOf(owner, p.mint).then((a) => (a === null ? null : { amount: a, slot: null }));
+      if (!r) return null;
+      if (r.slot === null) return r;
+      const last = confirm ? st.lastSlotConfirm : st.lastSlot;
+      if (r.slot < last - tol) continue;
+      if (confirm) st.lastSlotConfirm = Math.max(st.lastSlotConfirm, r.slot);
+      else st.lastSlot = Math.max(st.lastSlot, r.slot);
+      return r;
     }
-    return r;
+    this.d.log.info("rug_read_stale", { position: p.id, mint: p.mint, owner, confirm });
+    return "stale";
   }
 
   /** One coin's holder and creator reads. Returns what failed (empty: all read). */
@@ -246,10 +279,11 @@ export class RugWatch {
     const snap = await this.d.holders.snapshot(p.mint);
     let snapOk = true;
     if (typeof snap.slot === "number") {
-      if (snap.slot < st.lastSlot) {
+      if (snap.slot < st.lastSlot - this.d.cfg.watch.slotTolerance) {
+        // Stale: no verdict from it this poll (not a failure: the next poll reads again).
         snapOk = false;
-        failed.push(`holder list at slot ${snap.slot}, older than ${st.lastSlot}`);
-      } else st.lastSlot = snap.slot;
+        this.d.log.info("rug_read_stale", { position: p.id, mint: p.mint, what: "holder list", slot: snap.slot, newest: st.lastSlot });
+      } else st.lastSlot = Math.max(st.lastSlot, snap.slot);
     }
     let creator: string | null = null;
     if (r.devDump) {
@@ -257,36 +291,53 @@ export class RugWatch {
       if ("error" in c) failed.push(`creator: ${c.error}`);
       else if ("wallet" in c) creator = c.wallet;
     }
-    if (r.devDump && creator === this.d.cfg.wallet) {
-      // Our own wallet launched it: our own sells would read as the dev selling. The dev rule is off for this coin.
-      this.d.alerter.raise(`rug:${p.id}:creator_is_us`, `rug watcher: the creator of ${p.mint} is this bot's own wallet; the dev rule does not run for it (its own sells would read as the dev selling)`);
+    const ours = new Set([this.d.cfg.wallet, ...(r.devDump?.ourWallets ?? [])]);
+    if (r.devDump && creator && ours.has(creator)) {
+      // One of our own wallets launched it: our own sells would read as the dev selling. The dev rule is off for it.
+      this.d.alerter.raise(`rug:${p.id}:creator_is_us`, `rug watcher: the creator of ${p.mint} is one of our own wallets (${creator}); the dev rule does not run for it (its own sells would read as the dev selling)`);
     } else if (r.devDump && creator) {
-      const first = await this.balance(creator, p, st);
-      if (!first) failed.push("creator balance unreadable or stale");
-      else {
+      const rule = r.devDump;
+      const now = this.now();
+      const maxOf = () => {
         const row = this.d.ledger.db.prepare("select max_raw from rug_dev where position_id = ?").get(p.id) as { max_raw: string } | undefined;
-        const prevMax = row ? BigInt(row.max_raw) : 0n;
-        const max = first.amount > prevMax ? first.amount : prevMax;
-        if (!row || max !== prevMax) this.d.ledger.db.prepare("insert into rug_dev (position_id, mint, max_raw, updated_at) values (?, ?, ?, ?) on conflict(position_id) do update set max_raw = excluded.max_raw, updated_at = excluded.updated_at").run(p.id, p.mint, max.toString(), this.now());
-        // A creator that holds none of the coin when first read: the dev rule can only fire if it buys. Said once.
-        if (!row && first.amount === 0n) this.d.alerter.raise(`rug:${p.id}:creator_empty`, `rug watcher: the creator found for ${p.mint} (${creator}) holds none of it; the dev rule fires only if it buys some. If that is the wrong wallet, name the right one in rules.devDump.creators`);
-        const trips = devTrips(r.devDump, { maxRaw: max }, first.amount, snap.supply, p.decimals);
-        if (trips.length) {
-          // A single read never fires: a second read (at the same or a later slot) must show it too. An empty answer
-          // from a lagging node reads as 0; it has to say so twice.
-          const second = await this.balance(creator, p, st);
-          if (!second) failed.push("creator confirming read unreadable or stale");
-          else {
-            const again = new Set(devTrips(r.devDump, { maxRaw: max }, second.amount, snap.supply, p.decimals).map((t) => t.part));
-            for (const t of devTrips(r.devDump, { maxRaw: max }, second.amount, snap.supply, p.decimals)) if (again.has(t.part) && trips.some((x) => x.part === t.part)) this.fire(p, "devDump", `dev:${t.part}`, { ...t.trip, numbers: { creator, ...t.trip.numbers } }, r.devDump);
-            if (!trips.every((t) => again.has(t.part))) this.d.log.info("rug_dev_unconfirmed", { position: p.id, mint: p.mint, creator, firstRaw: first.amount.toString(), secondRaw: second.amount.toString() });
-          }
+        return row ? BigInt(row.max_raw) : null;
+      };
+      const raise = (amount: bigint, prev: bigint | null) => {
+        const max = prev === null || amount > prev ? amount : prev;
+        if (prev === null || max !== prev) this.d.ledger.db.prepare("insert into rug_dev (position_id, mint, max_raw, updated_at) values (?, ?, ?, ?) on conflict(position_id) do update set max_raw = excluded.max_raw, updated_at = excluded.updated_at").run(p.id, p.mint, max.toString(), this.now());
+        return max;
+      };
+      const confirmNow = async (want: string[]) => {
+        // The confirming read: later than the first, on the confirm RPC when one is set. Only parts both reads show fire.
+        const second = await this.balance(creator, p, st, true);
+        if (second === null) return void failed.push("creator confirming read unreadable");
+        if (second === "stale") return; // read again at the next poll
+        st.devConfirm = null;
+        const max = raise(second.amount, maxOf());
+        const trips = devTrips(rule, { maxRaw: max }, second.amount, snap.supply, p.decimals);
+        for (const t of trips) if (want.includes(t.part)) this.fire(p, "devDump", `dev:${t.part}`, { ...t.trip, numbers: { creator, ...t.trip.numbers } }, rule);
+        if (!want.every((x) => trips.some((t) => t.part === x))) this.d.log.info("rug_dev_unconfirmed", { position: p.id, mint: p.mint, creator, parts: want, secondRaw: second.amount.toString() });
+      };
+      if (st.devConfirm && now >= st.devConfirm.due) await confirmNow(st.devConfirm.parts);
+      else if (!st.devConfirm) {
+        const first = await this.balance(creator, p, st);
+        if (first === null) failed.push("creator balance unreadable");
+        else if (first !== "stale") {
+          const prev = maxOf();
+          const max = raise(first.amount, prev);
+          // A creator that holds none of the coin when first read: the dev rule can only fire if it buys. Said once.
+          if (prev === null && first.amount === 0n) this.d.alerter.raise(`rug:${p.id}:creator_empty`, `rug watcher: the creator found for ${p.mint} (${creator}) holds none of it; the dev rule fires only if it buys some. If that is the wrong wallet, name the right one in rules.devDump.creators`);
+          const trips = devTrips(rule, { maxRaw: max }, first.amount, snap.supply, p.decimals);
+          // A single read never fires: a second read, rules.devDump.confirmAfterMs later (on the confirm RPC when one is
+          // set), must show it too. A node whose index misses the account answers 0; it has to do so twice, apart.
+          if (trips.length) st.devConfirm = { due: now + rule.confirmAfterMs, parts: trips.map((t) => t.part) };
+          if (trips.length && rule.confirmAfterMs === 0) await confirmNow(st.devConfirm!.parts);
         }
       }
     }
     if (r.holderExit && snapOk) {
       const rule = r.holderExit;
-      const skip = new Set([this.d.cfg.wallet, ...rule.exclude, ...(r.devDump && creator ? [creator] : [])]);
+      const skip = new Set([...ours, ...rule.exclude, ...(r.devDump && creator ? [creator] : [])]);
       const list = snap.holders.filter((h) => !skip.has(h.owner));
       const sample: HolderSample = { at: snap.atMs, amounts: new Map(list.map((h) => [h.owner, h.amount])), top: list.slice(0, rule.topN).map((h) => h.owner) };
       st.holders = [...st.holders, sample].filter((s) => s.at >= snap.atMs - rule.windowSec * 1000).slice(-MAX_SAMPLES);
@@ -302,18 +353,16 @@ export class RugWatch {
           // Out of the largest accounts now: its balance is read directly (unknown on a failed read, never zero).
           direct++;
           const b = await this.balance(owner, p, st);
-          if (!b) failed.push(`balance of ${owner} unreadable or stale`);
-          nowAmounts.set(owner, b ? b.amount : null);
+          if (b === null) failed.push(`balance of ${owner} unreadable`);
+          nowAmounts.set(owner, b && b !== "stale" ? b.amount : null);
         }
       }
       for (const t of holderTrips(rule, st.holders, nowAmounts, snap.supply, p.decimals)) {
         // The largest-accounts list shows only some of a wallet's accounts: confirm on the wallet's whole balance
         // (all its accounts) before firing. Unreadable: unknown, no firing this poll.
-        const full = await this.balance(t.owner, p, st);
-        if (!full) {
-          failed.push(`confirming read of ${t.owner} unreadable or stale`);
-          continue;
-        }
+        const full = await this.balance(t.owner, p, st, true);
+        if (full === null) failed.push(`confirming read of ${t.owner} unreadable`);
+        if (!full || full === "stale") continue;
         const ok = holderTrips(rule, st.holders, new Map([[t.owner, full.amount]]), snap.supply, p.decimals)[0];
         if (ok) this.fire(p, "holderExit", `holder:${t.owner}`, ok.trip, rule);
         else this.d.log.info("rug_holder_unconfirmed", { position: p.id, mint: p.mint, owner: t.owner, wholeBalanceRaw: full.amount.toString() });
@@ -337,14 +386,26 @@ export class RugWatch {
       }
       return { wallet: given };
     }
-    if (row && row.source !== "config") return { wallet: row.creator };
-    if ((this.creatorMiss.get(mint) ?? 0) > this.now()) return { none: true };
+    // A creator found on chain is looked up again once per run and every CREATOR_RECHECK_MS: a wrong first answer
+    // (a lagging node) is not kept for good. A failed re-check keeps the stored one.
+    const recheck = row && row.source !== "config" && (this.creatorChecked.get(mint) ?? -Infinity) + CREATOR_RECHECK_MS <= this.now();
+    if (row && row.source !== "config" && !recheck) return { wallet: row.creator };
+    if (!row && (this.creatorMiss.get(mint) ?? 0) > this.now()) return { none: true };
+    const v = this.d.market(mint)?.venue;
     let found: { creator: string; source: string } | null;
     try {
-      found = await this.d.creatorOf(mint);
+      // On a pump venue the curve must be there: a missing curve is a lagging node, not a coin of another kind.
+      found = await this.d.creatorOf(mint, { expectPump: v === "pump-curve" || v === "pumpswap" });
     } catch (e) {
       const why = e instanceof CreatorReadError ? e.message : String((e as Error)?.message ?? e).slice(0, 160);
+      if (row) return { wallet: row.creator };
       return { error: why };
+    }
+    this.creatorChecked.set(mint, this.now());
+    if (row && row.source !== "config") {
+      if (!found || found.creator === row.creator) return { wallet: row.creator };
+      this.d.alerter.raise(`rug:creator_changed:${mint}`, `rug watcher: the creator of ${mint} read again is ${found.creator}, not ${row.creator} as first read; using the new one, and its high starts again`);
+      this.d.ledger.db.prepare("delete from rug_dev where mint = ?").run(mint);
     }
     if (!found) {
       this.creatorMiss.set(mint, this.now() + CREATOR_RETRY_MS);
@@ -455,7 +516,11 @@ export class RugWatch {
   dismiss(eventId: number): string {
     const e = this.d.ledger.db.prepare("select * from rug_events where id = ?").get(eventId) as unknown as EventRow | undefined;
     if (!e) return `no event ${eventId}`;
-    if (e.done_at !== null) return `event ${eventId} is already settled (${e.outcome ?? "done"})`;
+    if (e.done_at === null && this.soldFor(e)) this.settle(eventId, "sold"); // its sell filled since the last cycle
+    const cur = this.d.ledger.db.prepare("select done_at, outcome from rug_events where id = ?").get(eventId) as { done_at: number | null; outcome: string | null };
+    if (cur.done_at !== null) return `event ${eventId} is already settled (${cur.outcome ?? "done"})`;
+    const open = this.d.ledger.ordersFor(e.position_id).find((o) => o.side === "sell" && o.reason === `rug:${e.rule}#${e.id}` && (o.status === "pending" || o.status === "inflight"));
+    if (open) return `event ${eventId} has its sell in flight (order ${open.id}); it is not cancelled by a dismiss. It finishes on its own; dismiss after it ends, or let it settle`;
     this.settle(eventId, "dismissed by hand");
     this.d.log.info("rug_event_dismissed", { event: eventId, position: e.position_id, why: "by hand" });
     return `dismissed event ${eventId}`;

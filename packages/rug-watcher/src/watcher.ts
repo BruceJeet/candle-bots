@@ -115,6 +115,13 @@ export async function makeWatcher(ctx: Ctx, ledger: Ledger): Promise<Built> {
     if (!url) throw new ConfigError(`config.watch.holdersRpcUrlEnv: ${cfg.watch.holdersRpcUrlEnv} is not set`);
     holdersRpc = httpRpc(url);
   }
+  // Confirming reads on a second node when one is named (one node's lagging index cannot fire a rule alone).
+  let confirmHolders: HolderSource | undefined;
+  if (cfg.watch.confirmRpcUrlEnv) {
+    const url = process.env[cfg.watch.confirmRpcUrlEnv];
+    if (!url) throw new ConfigError(`config.watch.confirmRpcUrlEnv: ${cfg.watch.confirmRpcUrlEnv} is not set`);
+    confirmHolders = new HolderPoller(httpRpc(url));
+  }
   const fallback = await loadStrategy(cfg.exit, cfg.configDir);
   const known = knownProgramsFor(cfg);
   const decimalsOf = (m: string) => ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6;
@@ -122,11 +129,11 @@ export async function makeWatcher(ctx: Ctx, ledger: Ledger): Promise<Built> {
     maxBuyImpactBps: 0,
     executor: (d) => new Executor({ ...d, dry: dryPricer(ctx.rpc, ctx.client, decimalsOf, { pump: true }), ...(known ? { knownPrograms: known } : {}), ...(cfg.payer === "linked" ? { sellFloor: sellFloor(ctx.rpc, cfg.sell.maxSlippageBps, cfg.watch.sellFloorMarginBps) } : {}) }),
   });
-  return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, fallback, holders: new HolderPoller(holdersRpc), holdersRpc });
+  return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, fallback, holders: new HolderPoller(holdersRpc), holdersRpc, ...(confirmHolders ? { confirmHolders } : {}) });
 }
 
 /** The adopter, watcher, trigger and engine around an executor (a library user, or a test, brings its own parts). */
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log: Ctx["log"]; alerter: Alerter; executor: Executor; fallback: ExitStrategy; holders?: HolderSource; holdersRpc?: Ctx["rpc"]; now?: () => number; clock?: () => number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log: Ctx["log"]; alerter: Alerter; executor: Executor; fallback: ExitStrategy; holders?: HolderSource; confirmHolders?: HolderSource; holdersRpc?: Ctx["rpc"]; now?: () => number; clock?: () => number }): Built {
   const { cfg, ledger } = d;
   const adopter = new Adopter({
     cfg, adoption: cfg.adoption, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, venues: VENUES, now: d.now,
@@ -137,7 +144,8 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
   const watch = new RugWatch({
     cfg, ledger, log: d.log, alerter: d.alerter, now: d.now, clock: d.clock,
     holders: d.holders ?? new HolderPoller(d.holdersRpc ?? d.rpc, d.now),
-    creatorOf: (mint) => creatorOf(d.holdersRpc ?? d.rpc, mint),
+    creatorOf: (mint, o) => creatorOf(d.holdersRpc ?? d.rpc, mint, 10, o),
+    ...(d.confirmHolders ? { confirmHolders: d.confirmHolders } : {}),
     managed: () => adopter.managed().map((r) => r.position),
     market: (mint) => engine?.market(mint),
     sellsPaused: () => engine?.sellsPaused() ?? false,

@@ -69,13 +69,24 @@ details, and the section on sharing a wallet with other bots applies here word f
   released and adopted again starts from the creator's holding then.
 - `holderExit`: once per wallet per position. Before it fires, the wallet's whole balance (all its token accounts) is
   read: the largest-accounts list can show only some of them.
-- One of the watcher's own sells (a rule's, or the `exit` strategy's): while it is pending or in flight, price and pool
-  are not sampled. Once it fills, both windows start again, so the crash and pull rules measure from the price after
-  that fill, and the sell's own impact on a thin pool is not read as a crash or a pull.
-- `devDump` fires only when two creator reads in a row agree (a lagging node's empty answer reads as 0 once). A read
-  answered at an older slot than one already seen for the coin is stale and ignored.
-- If the creator is this bot's own wallet (a coin it launched), the dev rule is off for that coin and alerted once:
-  its own sells would read as the dev selling.
+- **The watcher's own sells** (a rule's, or the `exit` strategy's):
+  - While one is pending or in flight, both windows are frozen: no new sample, the highs kept. The freeze lasts at
+    most `watch.freezeMaxSec` (default 120 s); after that, sampling resumes.
+  - Once it fills, the price window starts again, so the crash rule measures from the price after that fill.
+  - The pool window carries on, with the SOL our sells took out added back to every later sample (their proceeds,
+    after fees, so a little less than they took). A pull during or around our own sell still shows; our sell alone
+    does not.
+- **`devDump` never fires on one read.** A second read, `rules.devDump.confirmAfterMs` later (default 5 s), must
+  agree. With `watch.confirmRpcUrlEnv` set, it is made on that second node. A node whose index misses the account
+  answers 0, and it has to be confirmed by a later read, ideally from another node.
+- **Stale answers.** An answer more than `watch.slotTolerance` slots (default 5) older than the newest seen for the
+  coin is stale. It is read once more. If it is still stale it gives no verdict this poll, and it does not count as a
+  failed poll.
+- **Our own wallets.** If the creator is this bot's wallet, or one listed in `rules.devDump.ourWallets` (another bot's,
+  a launch helper's), the dev rule is off for that coin and alerted once, because their own sells would read as the
+  dev selling. Those wallets never count as large holders either.
+- **The creator is looked up again** once per run and every 6 hours when it came from chain. A changed answer is used,
+  alerted, and its high starts again.
 
 Firings are kept in the ledger (`rug_events`): a restart never fires the same event again. A selling firing stays owed
 until a sell with its reason (`rug:<rule>#<event>`) has filled; a refused sell is retried on the engine's clock (and
@@ -84,7 +95,9 @@ remains.
 
 An owed sell is checked against the rules as they are when it would sell: if the rule has since been turned off or
 set to `alertOnly`, the event is dismissed and nothing is sold, and the share sold is the rule's current `sell`.
-`candle-rug-watcher dismiss <event>` settles one event by hand (the coin stays watched). An owed share that rounds to
+`candle-rug-watcher dismiss <event>` settles one event by hand (the coin stays watched). It is refused while that
+event's sell is pending or in flight: a dismiss does not cancel a sell already sent. A dismissed `dev:sold`,
+`dev:floor` or `holder:<wallet>` event cannot fire again for that position (each fires once per position). An owed share that rounds to
 nothing of what remains is settled, so it never holds back the `exit` strategy.
 
 ## Controls
@@ -141,10 +154,10 @@ candle-exit-manager's), a `buy` section is refused.
 "rules": {
   "liquidityPull": { "dropPct": 40, "windowSec": 120, "sell": 1 },
   "priceCrash":    { "dropPct": 50, "windowSec": 300, "sell": 0.5 },
-  "devDump":       { "soldPct": 50, "floorPct": 1, "creators": { "Mint…": "Wallet…" } },
+  "devDump":       { "soldPct": 50, "floorPct": 1, "confirmAfterMs": 5000, "ourWallets": [], "creators": { "Mint…": "Wallet…" } },
   "holderExit":    { "topN": 10, "soldPctOfSupply": 3, "windowSec": 600, "exclude": [], "alertOnly": true }
 },
-"watch": { "holdersPollMs": 15000, "maxCoinsPerPoll": 10, "pollBudgetMs": 3000, "holdersRpcUrlEnv": "HOLDERS_RPC_URL", "checkPrograms": true, "extraPrograms": [], "sellFloorMarginBps": 200 },
+"watch": { "holdersPollMs": 15000, "maxCoinsPerPoll": 10, "pollBudgetMs": 3000, "holdersRpcUrlEnv": "HOLDERS_RPC_URL", "confirmRpcUrlEnv": "CONFIRM_RPC_URL", "slotTolerance": 5, "freezeMaxSec": 120, "checkPrograms": true, "extraPrograms": [], "sellFloorMarginBps": 200 },
 "exit": { "strategy": "hold" }
 ```
 
@@ -153,12 +166,15 @@ candle-exit-manager's), a `buy` section is refused.
 | `rules.*.sell` | share of what remains to sell when the rule fires (0 to 1, default 1) |
 | `rules.*.alertOnly` | alert, never sell (default false) |
 | `liquidityPull`, `priceCrash` | `dropPct` (1 to 99), `windowSec` (5 to 86400) |
-| `devDump` | `soldPct` and/or `floorPct` (% of supply); `creators` by hand |
+| `devDump` | `soldPct` and/or `floorPct` (% of supply); `creators` by hand; `confirmAfterMs` (0 to 120000, default 5000); `ourWallets` |
 | `holderExit` | `topN` (1 to 20, default 10), `soldPctOfSupply`, `windowSec` (default 600), `exclude` |
 | `watch.holdersPollMs` | how often each coin's holders are read (min 2000, default 15000) |
 | `watch.maxCoinsPerPoll` | coins read in one poll (default 10); the rest wait for the next |
 | `watch.pollBudgetMs` | longest one poll runs (default 3000) |
 | `watch.holdersRpcUrlEnv` | an env var with an RPC URL for holder and creator reads (default: the bot's RPC) |
+| `watch.confirmRpcUrlEnv` | an env var with a second RPC URL for confirming reads (dev and holder rules) |
+| `watch.slotTolerance` | slots an answer may lag the newest seen before it is stale (default 5) |
+| `watch.freezeMaxSec` | longest the windows stay frozen while one of our sells is open (default 120) |
 | `watch.checkPrograms`, `extraPrograms`, `sellFloorMarginBps` | TEE wallet signing checks, as candle-exit-manager's `manager.*` |
 | `exit` | the exit strategy for everything the rules do not sell (default `hold`; a `trail` works too) |
 
