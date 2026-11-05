@@ -21,6 +21,9 @@ Built by [Bruce Jeet](https://github.com/BruceJeet).
   | `devDump` | the creator's wallet holds `soldPct` % less than the most it held while watched, or falls under `floorPct` % of supply |
   | `holderExit` | a wallet that was among the `topN` holders in the window now holds `soldPctOfSupply` % of supply less than its high in the window |
 
+- **A balance drop is not always a sale.** The dev and holder rules see a wallet hold less. They cannot tell a sale
+  from tokens locked in a locker, burned, added to a pool as liquidity, or moved to the same person's other wallet.
+  All of these fire the rule. Use `alertOnly` on those rules if you would rather look before selling.
 - **Every firing alerts** (the core's sinks: Telegram, webhook, a command) with the numbers that tripped it, whether
   or not it sells.
 - **Sells** go through the same order path as every candle-bot-core bot: fills booked from the transaction, clamped to
@@ -66,13 +69,23 @@ details, and the section on sharing a wallet with other bots applies here word f
   released and adopted again starts from the creator's holding then.
 - `holderExit`: once per wallet per position. Before it fires, the wallet's whole balance (all its token accounts) is
   read: the largest-accounts list can show only some of them.
-- One of the watcher's own sells filling (a rule's, or the `exit` strategy's) restarts the price and pool windows, so
-  its own impact on a thin pool is not read as a crash or a pull.
+- One of the watcher's own sells (a rule's, or the `exit` strategy's): while it is pending or in flight, price and pool
+  are not sampled. Once it fills, both windows start again, so the crash and pull rules measure from the price after
+  that fill, and the sell's own impact on a thin pool is not read as a crash or a pull.
+- `devDump` fires only when two creator reads in a row agree (a lagging node's empty answer reads as 0 once). A read
+  answered at an older slot than one already seen for the coin is stale and ignored.
+- If the creator is this bot's own wallet (a coin it launched), the dev rule is off for that coin and alerted once:
+  its own sells would read as the dev selling.
 
 Firings are kept in the ledger (`rug_events`): a restart never fires the same event again. A selling firing stays owed
 until a sell with its reason (`rug:<rule>#<event>`) has filled; a refused sell is retried on the engine's clock (and
 goes `exit_stuck`, then the slow retry, like any exit). Two rules firing together each sell their share of what
 remains.
+
+An owed sell is checked against the rules as they are when it would sell: if the rule has since been turned off or
+set to `alertOnly`, the event is dismissed and nothing is sold, and the share sold is the rule's current `sell`.
+`candle-rug-watcher dismiss <event>` settles one event by hand (the coin stays watched). An owed share that rounds to
+nothing of what remains is settled, so it never holds back the `exit` strategy.
 
 ## Controls
 
@@ -82,6 +95,7 @@ Files in the state dir, read every cycle:
 - `PAUSE_SELLS`: rules keep running and alerting; their sells (and the `exit` strategy's) are held. Lift it and what is
   owed sells on the next tick.
 - `candle-rug-watcher sell <mint> [--fraction 0.5]`, `adopt <mint>`, `release <mint>`: as candle-exit-manager.
+- `candle-rug-watcher dismiss <event>`: the firing owes no sell (event ids are in `status.json`, `watched[].fired`).
 
 ## Who is the creator
 
@@ -89,7 +103,9 @@ Files in the state dir, read every cycle:
 - **Other coins:** the fee payer of the mint's oldest transaction, found by paging the mint's history (at most 10
   pages of 1000). On Candle that is often a payer wallet, not the person who launched the coin. Name the creator by
   hand where you know it: `rules.devDump.creators: { "<mint>": "<wallet>" }`.
-- A coin with no creator found is alerted once; the dev rule does not run for it, and the lookup is retried hourly.
+- A coin with no creator found on chain is alerted once; the dev rule does not run for it, and the lookup is retried
+  hourly. A read that fails on the way (a rate limit) is not "no creator": nothing is kept, it counts as a failed
+  poll, and it is tried again at the next poll.
 - The dev rule watches the creator's wallet. Tokens moved to another wallet first and sold from there look like a
   dump of the creator's holding (it holds less), not like a sale of that other wallet.
 
@@ -106,9 +122,11 @@ A poll, not a stream: every `watch.holdersPollMs` (default 15 s), at most `watch
   large holders.
 - Lag: the poll interval plus about a second (confirmed commitment). A wallet outside the 20 largest accounts is not
   seen until it is in them.
-- A failed read is unknown, never a sale. A failing coin is polled less often (2x, 4x, up to 16x the interval), and
-  three failed polls in a row are alerted.
-- One poll stops after `watch.pollBudgetMs` (default 3 s); the coins left are due first next cycle. Set
+- A failed read is unknown, never a sale. Any failed read in a coin's poll (the holder list, the creator, its
+  balance, a direct or a confirming read) makes the poll a failure: a failing coin is polled less often (2x, 4x, up
+  to 16x the interval), and three failed polls in a row are alerted.
+- The poll budget (`watch.pollBudgetMs`, default 3 s) is checked between coins: once it has passed, the coins left
+  are due first next cycle. A coin's own reads are not cut short (each RPC call has its own 15 s timeout). Set
   `watch.holdersRpcUrlEnv` to read holders through their own RPC, so a rate limit on these heavy calls never reaches
   the balance read before a sell.
 - A creator found on chain that holds none of the coin at the first read is alerted once (it may be the wrong
@@ -155,7 +173,8 @@ candle-exit-manager's), a `buy` section is refused.
 ## Known limits
 
 - **Price and pool SOL** are sampled on the engine's market reads (every `exitMs` while it watches, every `loopMs` at
-  least), held in memory: after a restart the windows start empty.
+  least; one cycle later under `PAUSE_SELLS` or while a sell is open), held in memory. After a restart the price,
+  pool and holder windows all start empty. Fired events, creators and the creator's high are in the ledger.
 - **Holders are polled** (above). A fast dump between two polls is seen at the next one. A wallet fires once per
   position: its second dump is not a new event.
 - **Gaps:** a crash that happens while the watcher is stopped, or while reads fail, for longer than `windowSec` is
