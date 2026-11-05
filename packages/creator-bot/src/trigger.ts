@@ -174,7 +174,7 @@ export class CreatorTrigger implements Trigger {
     if (caps.lifetimeLamports + lamports > lamportsOf(this.d.cfg.buy.lifetimeSol)) return { verdict: "skip", reason: `lifetimeSol ${this.d.cfg.buy.lifetimeSol}` };
     const cv = onCurve(f, l, curve, lamports);
     if (cv.verdict !== "buy") return cv;
-    // The creator's own dev buy: its wallet (or the launch's signer) holds the coin. Read at most every 2 s.
+    // The creator's own dev buy: the listed wallet holds the coin. Read at most every 2 s.
     if (f.requireDevBuy && !s.devBuy) {
       if (s.devCheckedAt === undefined || this.now() - s.devCheckedAt >= DEV_BUY_CHECK_MS) {
         s.devCheckedAt = this.now();
@@ -208,16 +208,14 @@ export class CreatorTrigger implements Trigger {
     };
   }
 
+  /** The listed creator's own wallet holds the coin (not the launch's signer, which is often a payer wallet). */
   private async devBought(l: Launch, who: Creator): Promise<boolean> {
-    for (const owner of new Set([who.address, l.creator, l.signer].filter(Boolean) as string[])) {
-      try {
-        const b = await tokenBalance(this.d.rpc, owner, l.mint);
-        if (b !== null && b > 0n) return true;
-      } catch {
-        /* unread: not proven */
-      }
+    try {
+      const b = await tokenBalance(this.d.rpc, who.address, l.mint);
+      return b !== null && b > 0n;
+    } catch {
+      return false; // unread: not proven
     }
-    return false;
   }
 
   private readMarket(mint: string): Promise<any> {

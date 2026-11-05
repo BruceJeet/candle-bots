@@ -78,7 +78,7 @@ The core's sections (`mode`, `payer`, `apiKeyEnv`, `rpcUrlEnv`, `wallet`, `signe
 | `follow.maxAgeSec` | buy only this soon after the launch (default 60); no order is built after it |
 | `follow.maxImpactBps` | impact of the creator's ticket on the curve (default 300); also the buy-retry limit |
 | `follow.inferModeFromCurve` | decide a chain-first launch's mode from its curve (only the full `open` preset) instead of waiting for Candle's list |
-| `follow.requireDevBuy` | buy only once the creator's wallet (or the launch's signer) holds the coin |
+| `follow.requireDevBuy` | buy only once the listed creator's own wallet holds the coin |
 | `detect.*` | the launch source, as candle-launch-bot's |
 
 ## Controls
@@ -104,9 +104,9 @@ the ledger, the creators' caps included.
 
 - **Creator unknown waits.** A launch seen on chain first carries only its signer; if the signer is not on the list,
   the bot waits for Candle's token list to name the creator, up to `follow.maxAgeSec`.
-- **Dev buy check.** `requireDevBuy` reads the creator's (and signer's) token balance in the coin, at most every 2 s:
-  it sees a dev buy in the launch transaction and one in the same block after it, and it cannot tell a dev buy from a
-  later buy by the same wallet.
+- **Dev buy check.** `requireDevBuy` reads the listed creator's token balance in the coin, at most every 2 s. It
+  measures a holding, not a buy: it sees a dev buy in the launch transaction and one in the same block after it, and it
+  cannot tell a dev buy from a later buy, or from tokens handed to the creator's wallet at launch.
 - **One entry per coin.** `buy.maxPerCoin` is 1.
 - **Solana only.**
 

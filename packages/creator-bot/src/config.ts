@@ -66,6 +66,13 @@ const parseFollow: SectionParser<Follow> = (raw, core) => {
       maxSol: c.maxSol === undefined ? undefined : num(c, "maxSol", where, { min: 0.000001 }),
     };
   });
+  for (const [i, c] of creators.entries()) {
+    if (c.maxSol !== undefined && c.maxSol < c.sol) throw new ConfigError(`config.follow.creators[${i}].maxSol: ${c.maxSol} is below its ticket ${c.sol}; it could never buy`);
+  }
+  return finish(creators, raw);
+};
+
+function finish(creators: Creator[], raw: Record<string, unknown>): Follow {
   const launchModes = strList(raw, "launchModes", "config.follow", { def: DEFAULT_MODES })!;
   if (!launchModes.length) throw new ConfigError("config.follow.launchModes: at least one mode");
   for (const m of launchModes) if (!LAUNCH_MODES.includes(m)) throw new ConfigError(`config.follow.launchModes: "${m}" is not a Candle launch mode (${LAUNCH_MODES.join(", ")})`);
