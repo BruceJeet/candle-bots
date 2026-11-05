@@ -196,7 +196,10 @@ export class RugWatch {
       }
       // After a freeze, for one window length, the window reaches back to what it held when the freeze began: a pull
       // inside a long freeze still has its reference.
-      const reach = (windowSec: number) => (st.lastFreeze && m.nowMs - st.lastFreeze.end < windowSec * 1000 ? st.lastFreeze.start - windowSec * 1000 : undefined);
+      // A freeze still running (sampling resumed past freezeMaxSec) reaches back from its own start too.
+      const reach = (windowSec: number) =>
+        st.frozenSince ? st.frozenSince - windowSec * 1000
+        : st.lastFreeze && m.nowMs - st.lastFreeze.end < windowSec * 1000 ? st.lastFreeze.start - windowSec * 1000 : undefined;
       if (m.problem) return;
       if (m.venue !== st.venue) {
         // A migration moves the SOL from the curve to a pool: not a pull. Both windows start again on a new venue.
