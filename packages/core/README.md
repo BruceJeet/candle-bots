@@ -447,6 +447,9 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
     30 s, puts every coin in a gap until notifications catch up.
   - A coin is in a `resolving` gap until its venue is read.
   - A refused or unconfirmed subscription is retried with backoff and alerted after 3 failures in a row.
+  - A socket that does not open within 15 s is dropped and replaced.
+  - A transaction whose log cannot be read to its end (truncated, or an unaccounted invoke stack) makes that minute a
+    gap, counted (`partialLogs`) and alerted.
 - **Times:** a trade is placed in the bar of the moment it was received, not its block time (usually seconds apart,
   more under a lag, which is then a gap). While a coin moves from its curve to its pool, the market read says
   `migrating` and the coin has no log source (a gap) until the pool is found.
@@ -466,8 +469,9 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
 - **Sources:** a fixed list (never dropped), coins a bot pushes for a while, and a feed bucket (by 5 m volume), within
   one cap.
 - A feed coin leaves after `dropAfterMs` out of the feed.
-- **Hysteresis:** a feed coin enters within the top `maxFeedCoins`, and stays while it ranks within
-  `maxFeedCoins + feedMargin`, or for `minHoldMs`.
+- **Hysteresis:** coins already watched rank by their 5 m volume times `feedStickiness` (default 1.25). A
+  newcomer takes a place only by trading 25 % more than the coin it displaces, so coins at the cut do not churn,
+  and a much hotter coin gets in at once.
 - The cap is alerted when it leaves coins out.
 
 `market/indicators` (pure, on ended bars, each with `complete`): `fallFromHigh`, `riseFromLow`, `volumeVsBaseline`
