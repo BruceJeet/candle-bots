@@ -1,5 +1,11 @@
 # Changelog: candle-launch-bot
 
+## 0.4.2
+
+- On candle-bot-core 0.4.0 (pinned exactly). The launch detector moved into the core (`candle-bot-core/sources/
+  candleLaunches`); `src/detect/detector.ts` re-exports it. No behavior change: same CLI, config, state dir, ledger,
+  `status.json` fields, events and order handling.
+
 ## 0.4.1
 
 - On candle-bot-core 0.3.1 (pinned exactly): when Candle stops the profile and answers an order `RISK_LIMIT_REACHED`

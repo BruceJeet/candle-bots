@@ -1,5 +1,26 @@
 # Changelog: candle-bot-core
 
+## 0.4.0
+
+New API for bots that buy graduated coins or watch Candle launches. A 0.3.x bot works as is: none of its paths change.
+
+- **DAMM v2 expected fill (money path).** `decodeDamm` also reads the pool's liquidity, max price, status, fee mode
+  and base and dynamic fee fields; `dammBuy(pool, mint, lamports)` (pure) gives the fill and impact of a buy on the
+  pool, the coin on either side. The fee is the pool's lowest base fee (exact on a flat-fee pool with no dynamic fee,
+  as Candle's are; otherwise an upper bound on the fill). Checked against mainnet pools: token A's vault equals the
+  reserve math to the raw unit, and a real buy's output is reproduced exactly.
+- **The engine's expected fill on a graduated coin.** When the coin's curve is migrated, the engine reads its DAMM v2
+  pool (the keeper's PDA, its creator checked against the curve's authority) and the expected fill is the smaller of
+  the trigger's and `dammBuy`'s, as on the curve. An unreadable pool keeps the trigger's (logged
+  `expected_fill_unverified`, why `pool not readable at the buy`). Before, a graduated coin always kept the trigger's.
+- **`ExecutorDeps.dammBuys`** (default false): a graduated coin's buy retry rechecks its impact on the pool against
+  `maxBuyImpactBps` (`IMPACT` past it, `POOL` for a pool that does not match, a read failure waits). Without it, as
+  before, such a retry ends `CURVE`.
+- **`MarketRead.pool`**: the decoded pool for a graduated coin. Dry fills price a graduated coin's buy on its pool.
+- **`sources/candleLaunches`** (root export `CandleLaunches`): candle-launch-bot's launch detector (Candle's token
+  list and the curve program on chain, deduped by mint, latency from block time), moved into the core unchanged so
+  every bot that watches Candle launches shares it.
+
 ## 0.3.1
 
 An alert, nothing else. A 0.3.0 config and trigger work as is.

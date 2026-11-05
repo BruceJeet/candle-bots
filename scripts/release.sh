@@ -7,7 +7,7 @@
 # Publishing is not done here: `npm publish packs/<file>.tgz` by hand, core first.
 set -e
 cd "$(dirname "$0")/.."
-PUBLISHED="packages/core packages/launch-bot"
+PUBLISHED="packages/core packages/launch-bot packages/graduation-bot"
 case "$1" in
   pack)
     npm run typecheck

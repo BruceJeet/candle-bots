@@ -15,6 +15,6 @@
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
-    "candle-bot-core": "0.3.1"
+    "candle-bot-core": "0.4.0"
   }
 }

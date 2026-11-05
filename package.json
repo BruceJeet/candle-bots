@@ -7,10 +7,11 @@
   "workspaces": [
     "packages/core",
     "packages/launch-bot",
+    "packages/graduation-bot",
     "packages/example-bot"
   ],
   "scripts": {
-    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot",
+    "build": "npm run build -w candle-bot-core && npm run build -w candle-launch-bot && npm run build -w candle-graduation-bot",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "check": "sh scripts/check-neutral.sh .",
     "pack:all": "sh scripts/release.sh pack"

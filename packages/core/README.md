@@ -201,6 +201,36 @@ or `{ action: "sell", fraction, reason }`, `fraction` a share of what remains. T
 throws on a position three ticks in a row raises an alert (`position:<id>:strategy_error`): that position does not
 exit by itself until it is fixed.
 
+## Candle launches as a source
+
+`candle-bot-core/sources/candleLaunches` (root export `CandleLaunches`) watches Candle launches from two sources at
+once: Candle's public token list (no key) and the launch-curve program on chain (`logsSubscribe`, with signature
+polling as a fallback and a backstop). Each mint is reported once, by whichever source saw it first; both sightings
+and their latencies from the launch transaction's block time are kept. A trigger starts it in `start(ctx)`, sets
+`onNew = () => ctx.wake()` for the fast entry lane, and takes new launches with `drain()` in `poll`:
+
+```ts
+import { CandleLaunches, type Launch } from "candle-bot-core";
+const launches = new CandleLaunches({ rpc, wsUrl, apiUrl: cfg.apiUrl, log }, { api: true, chain: true, apiPollMs: 3000, chainPollMs: 15_000, apiLimit: 20 });
+// Launch: mint, launchedAtMs, detectedAtMs, creator (token list), signer (launch tx fee payer), launchMode, curve, decimals, ...
+```
+
+candle-launch-bot, candle-graduation-bot and candle-creator-bot use it.
+
+## Buying a graduated coin (DAMM v2)
+
+A Candle coin whose curve completes trades on its Meteora DAMM v2 pool. `market/curve` decodes the pool and
+`dammBuy(pool, mint, lamports)` gives what a buy fills there: `expectedOutRaw`, `impactBps` (the swap's average price
+over spot, fee apart, as `buyImpact` on the curve) and `feeBps`. Pure: no I/O. One liquidity range, the coin on either
+side, the pool's fee taken on the side its `collect_fee_mode` says, at its lowest base fee (the dynamic fee only adds,
+so the fill is exact on a flat-fee pool and an upper bound otherwise). It throws `buy_past_range`, `pool_disabled`,
+`pool_mismatch`, `pool_not_quote` and `pool_reserves`.
+
+The engine uses it on its own: a buy verdict on a coin whose curve is migrated gets the smaller of the trigger's
+expected fill and the engine's read of the pool. A bot whose buys fill on pools passes `dammBuys: true` to its executor
+(`parts(ctx, ledger, { maxBuyImpactBps, executor: (d) => new Executor({ ...d, dammBuys: true }) })`) so a retry
+rechecks the impact on the pool rather than ending as `CURVE`. `readMarkets` returns the pool as `MarketRead.pool`.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;
@@ -230,7 +260,7 @@ exit by itself until it is fixed.
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/alerts`, `/log`, `/redact`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/alerts`, `/log`, `/redact`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.
