@@ -9,6 +9,7 @@ export function create(params: Record<string, unknown>): ExitStrategy {
   const after = param(params, "afterSec", "time", { exclusiveMin: 0 });
   return {
     name: "time",
+    needsBasis: false,
     onTick(p, m) {
       const age = (m.nowMs - p.openedAtMs) / 1000;
       return age >= after ? { action: "sell", fraction: 1, reason: `time ${Math.round(age)}s` } : HOLD;

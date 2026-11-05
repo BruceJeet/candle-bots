@@ -14,6 +14,7 @@ export function create(params: Record<string, unknown>): ExitStrategy {
   if (tp === Infinity && sl === 0 && trail === null) throw new StrategyConfigError("exit (tpsl): set takeProfit, stopLoss or trailing");
   return {
     name: "tpsl",
+    needsBasis: true,
     onTick(p, m) {
       const x = multiple(p, m);
       if (x === null) return HOLD;

@@ -3,5 +3,6 @@ import { HOLD, checkParams, type ExitStrategy } from "./types.ts";
 
 export function create(params: Record<string, unknown>): ExitStrategy {
   checkParams(params, [], "hold");
-  return { name: "hold", onTick: () => HOLD };
+  return { name: "hold",
+    needsBasis: false, onTick: () => HOLD };
 }

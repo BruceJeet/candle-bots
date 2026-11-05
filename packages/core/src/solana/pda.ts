@@ -71,3 +71,31 @@ export function dammPool(mint: string, quote = WSOL): string {
   const [hi, lo] = cmp(a, b) > 0 ? [a, b] : [b, a];
   return findPda([enc("cpool"), hi, lo], DAMM_V2_PROGRAM);
 }
+
+/** (0.5.0) pump.fun's bonding-curve program, PumpSwap (pump-amm) and pump's fee program. */
+export const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+export const PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+export const PUMP_FEE_PROGRAM = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+
+/** A pump.fun coin's bonding curve: PDA("bonding-curve", mint) under the pump program. */
+export function pumpCurve(mint: string): string {
+  return findPda([enc("bonding-curve"), b58decode(mint)], PUMP_PROGRAM);
+}
+
+/** The authority pump's migration creates the PumpSwap pool under: PDA("pool-authority", mint) under the pump program. */
+export function pumpPoolAuthority(mint: string): string {
+  return findPda([enc("pool-authority"), b58decode(mint)], PUMP_PROGRAM);
+}
+
+/**
+ * The canonical PumpSwap pool a pump.fun coin migrates to: PDA("pool", index 0 as u16 LE, pool authority, mint, quote)
+ * under pump-amm. Other pools of the same coin (made by anyone, any index) are not found here.
+ */
+export function pumpSwapPool(mint: string, quote = WSOL): string {
+  return findPda([enc("pool"), Uint8Array.of(0, 0), b58decode(pumpPoolAuthority(mint)), b58decode(mint), b58decode(quote)], PUMP_AMM_PROGRAM);
+}
+
+/** Pump's fee tiers for one program (the curve or pump-amm): PDA("fee_config", program id) under the fee program. */
+export function pumpFeeConfig(program: string): string {
+  return findPda([enc("fee_config"), b58decode(program)], PUMP_FEE_PROGRAM);
+}

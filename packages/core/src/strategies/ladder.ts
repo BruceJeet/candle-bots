@@ -21,6 +21,7 @@ export function create(params: Record<string, unknown>): ExitStrategy {
   const sl = params.stopLoss === undefined ? 0 : param(params, "stopLoss", "ladder", { min: 0, max: 1 });
   return {
     name: "ladder",
+    needsBasis: true,
     onTick(p, m) {
       const x = multiple(p, m);
       if (x === null || p.remainingRaw <= 0n) return HOLD;

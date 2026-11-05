@@ -24,7 +24,7 @@ import { blockhashValid, getTransaction, signatureStatus, tokenAccounts, tokenBa
 import { candleCurve, dammPool, WSOL } from "../solana/pda.ts";
 import { buyImpact, dammBuy, decodeCandleCurve, decodeDamm } from "../market/curve.ts";
 import { fillFromTx, type Fill } from "./fills.ts";
-import { blockhashOfSigned, signatureOfSigned, type TradeRail } from "./trader.ts";
+import { blockhashOfSigned, programIdsOf, signatureOfSigned, type TradeRail } from "./trader.ts";
 
 /** Lease while an attempt runs: longer than every timeout inside one attempt put together. */
 export const LEASE_MS = 180_000;
@@ -81,6 +81,12 @@ export interface ExecutorDeps {
    * (CURVE), as before.
    */
   dammBuys?: boolean;
+  /**
+   * (0.5.0) Linked payer only: a built transaction whose top-level instructions call a program outside this set is
+   * never signed (the order ends rejected, UNKNOWN_PROGRAM, alerted); an unreadable one neither (UNREADABLE_TX).
+   * Unset: no check (0.4.0). Payer main cannot be checked: Candle signs inside the build. See trader.ts KNOWN_PROGRAMS.
+   */
+  knownPrograms?: ReadonlySet<string>;
 }
 
 type Outcome =
@@ -522,6 +528,22 @@ export class Executor {
       if (built.walletAddress !== cfg.wallet) {
         this.d.ledger.endAttempt(att, this.now(), "rejected", "WRONG_WALLET", JSON.stringify({ walletAddress: built.walletAddress }));
         return this.apply(o, pos, { kind: "rejected", code: "WRONG_WALLET", detail: `build names ${built.walletAddress}` });
+      }
+      if (this.d.knownPrograms) {
+        // (0.5.0) Never sign a transaction that calls a program this bot does not know.
+        let unknown: string[];
+        let code = "UNKNOWN_PROGRAM";
+        try {
+          unknown = programIdsOf(built.artifacts.transactionBase64).filter((p) => !this.d.knownPrograms!.has(p));
+        } catch (e) {
+          unknown = [String((e as Error)?.message ?? e)];
+          code = "UNREADABLE_TX";
+        }
+        if (unknown.length) {
+          this.d.ledger.endAttempt(att, this.now(), "rejected", code, JSON.stringify({ programs: unknown }));
+          this.alert(`order:${o.id}:${code}`, `order ${o.id} ${o.side} ${pos.mint}: not signed, the built transaction calls ${unknown.join(", ")}`);
+          return this.apply(o, pos, { kind: "rejected", code, detail: unknown.join(", ").slice(0, 200) });
+        }
       }
       // (0.3.0) STOP while the build was under way: nothing is signed or submitted. The built transaction is dropped
       // (it was never signed, so it can never land); the order goes back as it was, its attempt counted.

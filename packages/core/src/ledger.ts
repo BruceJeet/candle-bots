@@ -8,7 +8,8 @@
  */
 import { DatabaseSync } from "node:sqlite";
 
-export type PositionStatus = "opening" | "open" | "closed" | "failed" | "exit_stuck";
+/** (0.5.0) `released`: an adopted bag the bot stopped managing (nothing sold; the tokens stay in the wallet). */
+export type PositionStatus = "opening" | "open" | "closed" | "failed" | "exit_stuck" | "released";
 export type OrderStatus = "pending" | "inflight" | "filled" | "rejected" | "reverted" | "failed";
 export type Side = "buy" | "sell";
 export type QtySource = "onchain" | "server" | "minout" | "wallet" | "dry";
@@ -363,6 +364,27 @@ export class Ledger {
       if (r.x) for (const e of JSON.parse(r.x) as string[]) out.push(e);
     }
     return out;
+  }
+
+  // ---------------------------------------------------------------- trail marks (0.5.0)
+  private trailTable = false;
+
+  /** (0.5.0) The trail-mark table, created on first use only (a ledger whose bot never uses `trail` is never changed). */
+  ensureTrailTable(): void {
+    if (this.trailTable) return;
+    this.db.exec("create table if not exists trail_marks (position_id integer primary key, mark real not null, updated_at integer not null)");
+    this.trailTable = true;
+  }
+
+  trailMark(positionId: number): number | undefined {
+    this.ensureTrailTable();
+    const r = this.db.prepare("select mark from trail_marks where position_id = ?").get(positionId) as { mark: number } | undefined;
+    return r?.mark;
+  }
+
+  setTrailMark(positionId: number, mark: number, now: number): void {
+    this.ensureTrailTable();
+    this.db.prepare("insert into trail_marks (position_id, mark, updated_at) values (?, ?, ?) on conflict(position_id) do update set mark = excluded.mark, updated_at = excluded.updated_at").run(positionId, mark, now);
   }
 
   // ---------------------------------------------------------------- alerts

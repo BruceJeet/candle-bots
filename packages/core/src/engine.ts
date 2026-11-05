@@ -14,7 +14,7 @@ import { Executor } from "./exec/executor.ts";
 import { fillFromTx, type Fill } from "./exec/fills.ts";
 import type { Ledger, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
-import { readMarkets, type MarketRead } from "./market/reader.ts";
+import { expectedSellOut, readMarkets, type MarketRead, type ReadOptions } from "./market/reader.ts";
 import { redactDeep } from "./redact.ts";
 import { getAccounts, tokenBalance, type Rpc } from "./solana/rpc.ts";
 import type { ExitStrategy, PositionView } from "./strategies/types.ts";
@@ -48,6 +48,25 @@ export interface EngineDeps {
   now?: () => number;
   /** Longest one trigger call (poll, decide) may take, ms (default TRIGGER_TIMEOUT_MS; capped by the cycle budget left). */
   triggerTimeoutMs?: number;
+  /**
+   * (0.5.0) What the exit tick's market read covers beyond the Candle curve and its DAMM v2 pool: pump.fun curves and
+   * PumpSwap pools (`pump`), real SOL per venue (`reserves`). Omitted: exactly the 0.4.0 read.
+   */
+  venues?: ReadOptions;
+  /**
+   * (0.5.0) Adoption (candle-bot-core/adopt/adopter): its step runs in each full cycle, it replaces the surplus check
+   * (it follows the wallet itself), and its sellCheck must pass before any sell of an adopted bag is booked.
+   */
+  adopter?: AdoptionHook;
+  /** (0.5.0) Honour a PAUSE_SELLS file in the state dir: the exit strategy's sells are held; reads and marks go on. */
+  pauseSells?: boolean;
+}
+
+/** (0.5.0) What the engine calls on an Adopter. */
+export interface AdoptionHook {
+  step(shouldStop: () => boolean): Promise<void>;
+  /** Why a sell of this position must not be signed now (null: go). */
+  sellCheck(p: PositionRow): Promise<string | null>;
 }
 
 /** Consecutive exit-strategy errors on one position before it is alerted. */
@@ -294,6 +313,11 @@ export class Engine {
     return readControl(join(this.d.cfg.stateDir, "PAUSE_BUYS")) !== null;
   }
 
+  /** (0.5.0, deps.pauseSells) A PAUSE_SELLS file in the state dir. */
+  sellsPaused(): boolean {
+    return !!this.d.pauseSells && readControl(join(this.d.cfg.stateDir, "PAUSE_SELLS")) !== null;
+  }
+
   /** STOP file or SIGTERM/SIGINT: checked before every step and between orders. */
   shouldStop = (): boolean => {
     if (!this.stopRequested && readControl(join(this.d.cfg.stateDir, "STOP")) !== null) {
@@ -493,11 +517,15 @@ export class Engine {
     const steps: Array<[string, () => Promise<void>]> = [
       // Manual sells: each holds its coin (Executor.reserveMint) while it reads the balance and books, not the lock.
       ["requests", () => this.guard("requests", () => this.manualRequests())],
+      // (0.5.0) Adoption: reads outside the lock; each booking holds its coin (Executor.reserveMint).
+      ...(this.d.adopter ? ([["adopt", () => this.guard("adopt", () => this.d.adopter!.step(this.shouldStop))]] as Array<[string, () => Promise<void>]>) : []),
       // Every due order (sells first; buys up to cfg.buy.concurrency), settles included: started, not awaited.
       ["orders", () => this.guard("orders", async () => this.pump())],
       ["nag", () => locked("nag", async () => this.nag())],
-      // Surplus: which coins are due and the verdicts under the lock, the balance reads outside it.
+      // Surplus: which coins are due and the verdicts under the lock, the balance reads outside it. (0.5.0) Not with an
+      // adopter: it follows the wallet itself.
       ["surplus", async () => {
+        if (this.d.adopter) return;
         const due = await this.exclusive(async () => this.surplusDue());
         if (!due.length || this.shouldStop()) return;
         const epochs = new Map(due.map((m) => [m, this.d.executor.mintEpoch(m)]));
@@ -701,13 +729,14 @@ export class Engine {
     // Exits first: a stop-loss never waits behind new entries.
     const steps: Array<[string, () => Promise<void>]> = [
       ["requests", () => this.manualRequests()],
+      ...(this.d.adopter ? ([["adopt", () => this.d.adopter!.step(this.shouldStop)]] as Array<[string, () => Promise<void>]>) : []),
       ...(all ? ([["sells", () => sweep("sell")], ["exits", () => this.exits()], ["sells2", () => sweep("sell")]] as Array<[string, () => Promise<void>]>) : []),
       // Buys that may already have executed get their own slot: settling them never waits behind a slow sell side.
       ["settle-buys", () => sweep("buy", true)],
       ...(all ? ([["entries", async () => void (await this.entries(t0))]] as Array<[string, () => Promise<void>]>) : []),
       ["orders", () => sweep()],
       ["nag", async () => this.nag()],
-      ["surplus", () => this.surplus()],
+      ["surplus", () => (this.d.adopter ? Promise.resolve() : this.surplus())],
     ];
     for (const [name, fn] of steps) {
       if (this.shouldStop()) {
@@ -1206,9 +1235,12 @@ export class Engine {
 
   private async exits(): Promise<void> {
     const open = this.mine("open", "exit_stuck");
-    const toSell: Array<{ p: PositionRow; fraction: number; reason: string }> = [];
+    const toSell: Array<{ p: PositionRow; fraction: number; reason: string; resetTrail: number | null }> = [];
     if (!open.length) return;
-    this.markets = await readMarkets(this.d.rpc, open.map((p) => ({ mint: p.mint, decimals: p.decimals })), this.now());
+    this.markets = await readMarkets(this.d.rpc, open.map((p) => ({ mint: p.mint, decimals: p.decimals })), this.now(), this.d.venues);
+    // (0.5.0) The trail mark (strategies with trailMark): the highest price since entry, or since the last sell that
+    // asked resetTrail; kept in the ledger so a restart does not reset it.
+    const trail = this.d.strategy.trailMark === true;
     // Every position's last and peak price in one ledger transaction (one commit, not one per position), and only
     // where they changed. The strategy's view reads the peak from the row and the market, as before.
     this.d.ledger.tx(() => {
@@ -1217,8 +1249,18 @@ export class Engine {
         if (!m || m.priceSol === null) continue;
         const peak = Math.max(p.peak_price, m.priceSol);
         if (p.last_price !== m.priceSol || p.peak_price !== peak) this.d.ledger.updatePosition(p.id, { last_price: m.priceSol, peak_price: peak });
+        if (trail) {
+          const mark = this.d.ledger.trailMark(p.id);
+          const next = Math.max(mark ?? p.peak_price, m.priceSol);
+          if (mark !== next) this.d.ledger.setTrailMark(p.id, next, this.now());
+        }
       }
     });
+    // (0.5.0) PAUSE_SELLS: the reads and marks above go on; no exit is decided or booked.
+    if (this.d.pauseSells && this.sellsPaused()) {
+      if (this.d.ledger.alert("engine:sells_paused", "PAUSE_SELLS", this.now(), 600_000)) this.d.log.info("exits_paused", { open: open.length });
+      return;
+    }
     for (const p0 of open) {
       // (0.3.0) Under run() a sell attempt runs outside the lock and may have filled during the market read: decide on
       // the row as it is now, never on the one read before the await (a ladder rung would fire twice).
@@ -1253,7 +1295,9 @@ export class Engine {
       if (streak > 0 && p.status !== "exit_stuck" && this.now() < sells[sells.length - 1].updated_at + this.d.executor.backoffMs(streak + 1)) continue;
       let decision;
       try {
-        decision = this.d.strategy.onTick(this.view(p, m), m);
+        const v = this.view(p, m);
+        if (trail) v.trailPeakSol = this.d.ledger.trailMark(p.id) ?? v.peakPriceSol;
+        decision = this.d.strategy.onTick(v, m);
         this.strategyErrors.delete(p.id);
       } catch (e) {
         const why = String((e as Error)?.message ?? e);
@@ -1265,13 +1309,14 @@ export class Engine {
         continue;
       }
       if (decision.action !== "sell") continue;
-      toSell.push({ p, fraction: decision.fraction, reason: decision.reason });
+      toSell.push({ p, fraction: decision.fraction, reason: decision.reason, resetTrail: trail && decision.resetTrail === true ? m.priceSol : null });
     }
     if (!this.running) {
       // cycle(): one after another, as in 0.1.0 (the sweeps that follow build them).
       for (const x of toSell) {
         if (this.shouldStop()) return;
-        await this.placeSell(x.p, x.fraction, x.reason, false);
+        const id = await this.placeSell(x.p, x.fraction, x.reason, false);
+        if (id !== null && x.resetTrail !== null) this.d.ledger.setTrailMark(x.p.id, x.resetTrail, this.now());
       }
       return;
     }
@@ -1283,7 +1328,9 @@ export class Engine {
         const x = toSell[next++];
         // One sell that throws ends neither the others nor the pass early (every worker is awaited below).
         try {
-          if ((await this.placeSell(x.p, x.fraction, x.reason, false)) !== null) this.pump();
+          const id = await this.placeSell(x.p, x.fraction, x.reason, false);
+          if (id !== null && x.resetTrail !== null) this.d.ledger.setTrailMark(x.p.id, x.resetTrail, this.now());
+          if (id !== null) this.pump();
         } catch (e) {
           this.d.log.error("cycle_step_failed", { step: "exits", position: x.p.id, error: String((e as Error)?.stack ?? e) });
         }
@@ -1324,6 +1371,16 @@ export class Engine {
     if (remaining <= 0n) return null;
     const part = (x: bigint) => (fraction >= 1 ? x : (x * BigInt(Math.round(fraction * 1e6))) / 1_000_000n);
     if (part(remaining) <= 0n) return null;
+    if (this.d.adopter) {
+      // (0.5.0) An adopted bag: its mint passes the junk check again and no other bot holds the coin, or no sell.
+      const why = await this.d.adopter.sellCheck(p);
+      if (why !== null) {
+        this.exitHoldUntil.set(p.id, this.now() + 60_000);
+        this.d.alerter.raise(`position:${p.id}:sell_check`, `sell refused for position ${p.id} ${p.mint}: ${why}`);
+        this.d.log.warn("sell_check_refused", { position: p.id, mint: p.mint, why });
+        return null;
+      }
+    }
     if (!p.dry) {
       const bal = await tokenBalance(this.d.rpc, this.d.cfg.wallet, p.mint);
       const refuse = (why: "unreadable" | "zero") => {
@@ -1351,7 +1408,11 @@ export class Engine {
     const amount = part(remaining);
     if (amount <= 0n) return null;
     const now = this.now();
-    const id = this.d.ledger.createOrder({ positionId: p.id, side: "sell", clientTradeId: `${this.d.trigger.sellIdPrefix ?? "bots"}-${randomUUID()}`, amountRaw: amount, slippageBps: this.d.cfg.sell.maxSlippageBps, maxAttempts: this.d.cfg.retry.maxAttempts, now, reason, manual });
+    // (0.5.0) On a pump.fun venue: the venue's own expected SOL out, from a read at most a few ticks old (recorded on
+    // the order; Candle's build quote still sets the slippage floor).
+    const m = this.d.venues?.pump ? this.markets.get(p.mint) : undefined;
+    const expected = m && (m.venue === "pump-curve" || m.venue === "pumpswap") && now - m.nowMs <= 4 * this.d.cfg.exitMs ? expectedSellOut(m, amount) : null;
+    const id = this.d.ledger.createOrder({ positionId: p.id, side: "sell", clientTradeId: `${this.d.trigger.sellIdPrefix ?? "bots"}-${randomUUID()}`, amountRaw: amount, slippageBps: this.d.cfg.sell.maxSlippageBps, maxAttempts: this.d.cfg.retry.maxAttempts, now, reason, manual, ...(expected !== null ? { expectedOutRaw: expected } : {}) });
     this.stats.sells++;
     this.d.log.info(p.dry ? "dry_sell" : "sell_order", { position: p.id, mint: p.mint, amountRaw: amount, fraction, reason, manual });
     return id;

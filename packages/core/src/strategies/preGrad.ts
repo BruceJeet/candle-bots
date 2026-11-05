@@ -15,6 +15,8 @@ export function create(params: Record<string, unknown>): ExitStrategy {
   const sl = params.stopLoss === undefined ? 0 : param(params, "stopLoss", "preGrad", { min: 0, max: 1 });
   return {
     name: "preGrad",
+    // A stop-loss reads the entry price; without one only graduation progress is read.
+    needsBasis: sl > 0,
     onTick(p, m) {
       const x = multiple(p, m);
       if (sl > 0 && x !== null && x <= sl) return { action: "sell", fraction: 1, reason: `stop_loss ${x.toFixed(3)}x` };

@@ -38,6 +38,9 @@ export interface TradeRail {
 /** base58 of a signed transaction's first signature (the fee payer's): its id on chain. */
 export function signatureOfSigned(signedBase64: string): string {
   const raw = Buffer.from(signedBase64, "base64");
+  // (0.5.0) A v1+ transaction starts with a version byte, not the signature count: refused (nothing is submitted),
+  // never read as a wrong signature.
+  if (raw.length && raw[0] & 0x80) throw new Error(`signed transaction version ${raw[0] & 0x7f} not read`);
   let n = 0;
   let shift = 0;
   let i = 0;
@@ -57,6 +60,7 @@ export function signatureOfSigned(signedBase64: string): string {
 /** base58 of the recent blockhash inside a signed transaction (legacy or v0 message). */
 export function blockhashOfSigned(signedBase64: string): string {
   const raw = Buffer.from(signedBase64, "base64");
+  if (raw.length && raw[0] & 0x80) throw new Error(`signed transaction version ${raw[0] & 0x7f} not read`);
   const vec = (at: number): [number, number] => {
     let n = 0, shift = 0, i = at;
     for (; i < at + 3; i++) {
@@ -75,6 +79,76 @@ export function blockhashOfSigned(signedBase64: string): string {
   if (raw.length < at + 32) throw new Error("signed transaction too short for a blockhash");
   return b58encode(raw.subarray(at, at + 32));
 }
+
+/**
+ * (0.5.0) The top-level program ids of a transaction's instructions (legacy or v0; signed or not). Program ids are
+ * always static account keys (a v0 lookup table cannot supply one); an index past them throws. Inner calls (CPI) are
+ * not visible here: a token's transfer hook, for one, is called by the token program (the mint check covers it).
+ */
+export function programIdsOf(txBase64: string): string[] {
+  const raw = Buffer.from(txBase64, "base64");
+  let at = 0;
+  const vec = (): number => {
+    let n = 0, shift = 0;
+    for (let i = 0; i < 3; i++) {
+      if (at >= raw.length) throw new Error("transaction truncated");
+      const x = raw[at++];
+      n |= (x & 0x7f) << shift;
+      if (!(x & 0x80)) return n;
+      shift += 7;
+    }
+    throw new Error("bad shortvec");
+  };
+  // A v1 (and later) transaction starts with its version byte (0x80 | version) before the signatures.
+  if (raw.length && raw[0] & 0x80) throw new Error(`transaction version ${raw[0] & 0x7f} not read`);
+  const nsig = vec();
+  at += 64 * nsig;
+  if (at >= raw.length) throw new Error("transaction truncated");
+  if (raw[at] & 0x80) {
+    if ((raw[at] & 0x7f) !== 0) throw new Error(`transaction version ${raw[at] & 0x7f} not read`);
+    at += 1;
+  }
+  at += 3; // header
+  const nkeys = vec();
+  const keys: string[] = [];
+  for (let i = 0; i < nkeys; i++) {
+    if (at + 32 > raw.length) throw new Error("transaction truncated");
+    keys.push(b58encode(raw.subarray(at, at + 32)));
+    at += 32;
+  }
+  at += 32; // recent blockhash
+  const nix = vec();
+  const out = new Set<string>();
+  for (let i = 0; i < nix; i++) {
+    if (at >= raw.length) throw new Error("transaction truncated");
+    const pi = raw[at++];
+    if (pi >= keys.length) throw new Error("program id outside the static keys");
+    out.add(keys[pi]);
+    const na = vec(); // account indexes (vec() moves `at`: read the count first)
+    at += na;
+    const dl = vec();
+    at += dl;
+    if (at > raw.length) throw new Error("transaction truncated");
+  }
+  return [...out];
+}
+
+/** (0.5.0) Programs a sell or buy on Candle's routes calls at the top level (ExecutorDeps.knownPrograms' default). */
+export const KNOWN_PROGRAMS: readonly string[] = Object.freeze([
+  "11111111111111111111111111111111", // System
+  "ComputeBudget111111111111111111111111111111",
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // Token
+  "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+  "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // Associated token account
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", // Memo v2
+  "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo", // Memo v1
+  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", // Jupiter v6
+  "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH", // DFlow aggregator
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", // pump.fun
+  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", // PumpSwap
+  "6wXTwJwdtA5RhNu6VyYnBzrV51TbsMpTbo5kZv2zdssG", // Candle curve
+  "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG", // Meteora DAMM v2
+]);
 
 /** A fetch that always carries a timeout (the SDK's own requests have none). */
 export function timedFetch(timeoutMs: number, base: typeof fetch = fetch): typeof fetch {

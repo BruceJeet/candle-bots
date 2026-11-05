@@ -19,6 +19,11 @@ export interface PositionView {
   peakPriceSol: number;
   /** Share of the original quantity already sold, 0..1. */
   soldFraction: number;
+  /**
+   * (0.5.0) For a strategy with `trailMark`: the highest price since entry (or adoption) or since its last sell that
+   * asked `resetTrail`, persisted in the ledger (a restart keeps it). Absent otherwise.
+   */
+  trailPeakSol?: number;
 }
 
 export interface MarketView {
@@ -27,15 +32,25 @@ export interface MarketView {
   /** Graduation progress 0..1 while on the curve; 1 once migrated; null when unknown. */
   progress: number | null;
   migrated: boolean;
-  venue: "curve" | "damm" | "unknown";
+  /** (0.5.0) "pump-curve" and "pumpswap" only when the bot reads pump.fun venues (EngineDeps.venues). */
+  venue: "curve" | "damm" | "pump-curve" | "pumpswap" | "unknown";
   nowMs: number;
 }
 
-export type Decision = { action: "hold" } | { action: "sell"; fraction: number; reason: string };
+/** `resetTrail` (0.5.0): once this sell is booked, the position's trail mark restarts at the price now. */
+export type Decision = { action: "hold" } | { action: "sell"; fraction: number; reason: string; resetTrail?: boolean };
 
 export interface ExitStrategy {
   readonly name: string;
   onTick(position: PositionView, market: MarketView): Decision;
+  /**
+   * (0.5.0) True when the strategy reads a cost basis (multiples of the entry price): a position adopted without one
+   * cannot use it (see the adoption config's noBasis). Built-ins say so; a strategy that leaves it unset is taken to
+   * need one.
+   */
+  readonly needsBasis?: boolean;
+  /** (0.5.0) True when the strategy reads PositionView.trailPeakSol: the engine keeps the mark in the ledger. */
+  readonly trailMark?: boolean;
 }
 
 export type StrategyFactory = (params: Record<string, unknown>) => ExitStrategy;
