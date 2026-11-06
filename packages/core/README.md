@@ -298,7 +298,36 @@ coin set (5 keys a coin, plus the two fee configs) and a second for the PumpSwap
 venue's real SOL (`quoteLiquidityLamports`). Without options the read is exactly 0.4.0's. `expectedSellOut(read, raw)`
 answers for the pump venues. A bot turns it on with `EngineDeps.venues`; the engine then records its own expected SOL
 out on each pump-venue sell (`orders.decision_out_raw` when the column exists; Candle's build still sets the floor).
-Buy-side math for these venues is not here yet (a buy needs the inverse and the fees on the input).
+
+**Buys (0.6.0):** `pumpCurveBuy(curve, lamports, fees)` and `pumpPoolBuy(state, mint, lamports, supply, fees)` give
+the raw coin a spend of `lamports` brings (the programs' `buy_exact_quote_in`: the fees come off the input), with the
+lamports that reach the venue, the fees, and the impact (the ticket's average price over spot, fees apart, as
+`buyImpact` and `dammBuy` report it). Reproduced to the raw unit on real buys (three on curves, four on PumpSwap pools,
+each read just before):
+
+- net: on PumpSwap the most `n` with `n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator / 1e4)`
+  within the spend; on the curve `floor(S * 1e4 / (1e4 + fees)) - 1` (the same `n` on every real buy; where they
+  would differ, the smaller);
+- out: `floor(vt * (n - 1) / (vq + n - 1))` on the curve, `floor(B * (n - 1) / (Q + n - 1))` on the pool, with `Q` the
+  SOL vault plus `virtual_quote_reserves` before the trade (the programs swap one lamport less than the net);
+- the fee tier at the market cap before the trade.
+
+Refused rather than guessed: a mayhem-mode curve (its real buys do not follow this math; a test shows it), a cashback
+curve or pool, a buy past the curve's real tokens, and everything the sell side refuses. `buyQuote(read, lamports)`
+answers on whichever venue a read found (Candle curve, DAMM v2, pump curve, PumpSwap), or `{ why }`.
+
+A bot that buys pump.fun coins turns on **`pumpBuys`** in both places:
+- `EngineDeps.pumpBuys`: a coin with no Candle curve gets the engine's own expected fill from a fresh read of its
+  venue, the smaller of that and the trigger's (as for Candle coins). A buy the math refuses keeps the trigger's
+  value, logged with why (`pump_buy_unquoted`, `expected_fill_unverified`).
+- `ExecutorDeps.pumpBuys`: a retry of such a buy reads the venue fresh and is refused when the ticket's impact there
+  is over `maxBuyImpactBps` (`IMPACT`), or when it would buy less than the order's decision fill less
+  `retry.maxPriceDriftBps` (`maxBuyImpactBps` when that is unset; `IMPACT`). An order with no decision fill, or a venue
+  the math refuses, is refused (`VENUE`); a failed read is retried. Without `pumpBuys` such a retry is refused
+  (`CURVE`), as before.
+
+The PumpSwap virtual quote reserve moves between trades, so an expected fill is only as good as its read: both checks
+read fresh.
 
 ## Adopting bags already in the wallet (opt-in)
 
@@ -425,6 +454,10 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
   refused or not confirmed, the subscription cap, the coin cap, a venue with no trade-log source, a coin not quoted in
   SOL. A quiet minute with no gap is a true zero.
 - **Nothing is backfilled.** A bar from any later backfill would say `backfilled: true`.
+- **Gaps are bounded without losing one.** Closed gaps with the same reason that share a bar merge. Past `maxGaps`
+  (default 200) the oldest closed gaps merge into one span over both, so the bars between them read incomplete too:
+  many sparse gaps (an unreadable log here and there) can make most of the 24 h read incomplete. That fails safe; a
+  rule that needs complete bars then waits.
 
 `sources/logsSeries`, a `LogsSeries` (a `SeriesSource`):
 - **Volume** comes from the trade events in each coin's own logs subscription: its pump.fun curve PDA, or its
@@ -447,9 +480,11 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
     30 s, puts every coin in a gap until notifications catch up.
   - A coin is in a `resolving` gap until its venue is read.
   - A refused or unconfirmed subscription is retried with backoff and alerted after 3 failures in a row.
-  - A socket that does not open within 15 s is dropped and replaced.
+  - A socket that does not open (or does not finish closing) within 15 s is dropped and replaced; one reconnect is
+    pending at most.
   - A transaction whose log cannot be read to its end (truncated, or an unaccounted invoke stack) makes that minute a
-    gap, counted (`partialLogs`) and alerted.
+    gap, counted (`partialLogs`) and alerted. So does a trade event whose quote cannot be read. A coin quoted in
+    another token is an open gap for as long as it is watched (its SOL volume is never known).
 - **Times:** a trade is placed in the bar of the moment it was received, not its block time (usually seconds apart,
   more under a lag, which is then a gap). While a coin moves from its curve to its pool, the market read says
   `migrating` and the coin has no log source (a gap) until the pool is found.

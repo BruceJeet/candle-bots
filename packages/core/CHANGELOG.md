@@ -15,6 +15,12 @@ Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 s
 - **`EngineDeps.series`**, exposed to a trigger as `ctx.series`.
 - **Watch-only bots** (`watch.ts`): a config that refuses every trading key, and `runWatch` (no executor, no key).
 - **Alert sinks** `discordWebhookEnv` and `telegram`; the `alerts` parser is exported (`parseAlerts`).
+- **pump.fun buys (money path).** `pumpCurveBuy`, `pumpPoolBuy` and `pumpBuyNet` in `market/pump` (spend in, fees on
+  the input), reproduced to the raw unit on real curve and PumpSwap buys; `buyQuote` in `market/reader` for any venue.
+  Refused: mayhem-mode curves (real buys differ), cashback curves and pools, a buy past the curve's real tokens.
+- **`pumpBuys`** on `EngineDeps` (the engine's own expected fill for a coin with no Candle curve) and on
+  `ExecutorDeps` (the retry recheck on the pump venue: impact, and drift against the decision fill at
+  `retry.maxPriceDriftBps`, else `maxBuyImpactBps`). Default off: as 0.5.0.
 
 ## 0.5.0
 
