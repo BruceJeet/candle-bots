@@ -356,7 +356,13 @@ export function dryPricer(rpc: Rpc, quotes: QuoteSource | null, decimalsOf: (min
           /* fall back to the curve */
         }
       }
-      const m = (await readMarkets(rpc, [{ mint, decimals: decimalsOf(mint) }], Date.now())).get(mint)!;
+      const m = (await readMarkets(rpc, [{ mint, decimals: decimalsOf(mint) }], Date.now(), opts?.pump ? opts : undefined)).get(mint)!;
+      // (0.6.0) A pump.fun venue: the venue's own buy math.
+      if (opts?.pump && (m.venue === "pump-curve" || m.venue === "pumpswap")) {
+        const q = buyQuote(m, lamports);
+        if ("why" in q) throw Object.assign(new Error(q.why), { code: "NO_MARKET" });
+        return q.expectedOutRaw;
+      }
       if (!m.curve) throw Object.assign(new Error("no curve"), { code: "NO_MARKET" });
       // (0.4.0) A graduated coin: the pool's own buy math.
       if (m.curve.migrated && m.pool) return dammBuy(m.pool, mint, lamports).expectedOutRaw;

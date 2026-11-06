@@ -13,7 +13,7 @@ import { Executor } from "./exec/executor.ts";
 import { EmbeddedRail, makeSecretStore, resolveEmbedded, resolveWallet, SdkRail, timedFetch, type TradeRail } from "./exec/trader.ts";
 import type { Ledger } from "./ledger.ts";
 import { makeLogger, type Logger } from "./log.ts";
-import { dryPricer } from "./market/reader.ts";
+import { dryPricer, type ReadOptions } from "./market/reader.ts";
 import { addSecret, redact } from "./redact.ts";
 import { PUBLIC_RPC, httpRpc, type Rpc } from "./solana/rpc.ts";
 import { wsUrlFor } from "./solana/logs-ws.ts";
@@ -107,7 +107,7 @@ export interface Parts {
  * state dir that holds the other mode's positions. `maxBuyImpactBps` is the bot's buy-retry impact limit.
  * `executor` lets a bot use its own Executor subclass.
  */
-export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: number; executor?: (d: ConstructorParameters<typeof Executor>[0]) => Executor }): Promise<Parts> {
+export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: number; executor?: (d: ConstructorParameters<typeof Executor>[0]) => Executor; venues?: ReadOptions }): Promise<Parts> {
   const strategy = await loadStrategy(ctx.cfg.exit, ctx.cfg.configDir).catch((e) => die(String(e.message)));
   const { rail, linkedWalletId } = await buildRail(ctx);
   const decimals = new Map<string, number>();
@@ -123,7 +123,7 @@ export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: n
   const deps = {
     cfg: ctx.cfg, ledger, rail, linkedWalletId, rpc: ctx.rpc, log: ctx.log, alerter, maxBuyImpactBps: opts.maxBuyImpactBps,
     buysPaused: () => existsSync(join(ctx.cfg.stateDir, "PAUSE_BUYS")),
-    dry: dryPricer(ctx.rpc, ctx.client, (m) => decimals.get(m) ?? ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6),
+    dry: dryPricer(ctx.rpc, ctx.client, (m) => decimals.get(m) ?? ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6, opts.venues),
   };
   const executor = opts.executor ? opts.executor(deps) : new Executor(deps);
   return { strategy, rail, linkedWalletId, alerter, executor };

@@ -22,7 +22,7 @@ export type { Logger, Level } from "./log.ts";
 export { redact, redactDeep, addSecret, errorJson } from "./redact.ts";
 export { readMarkets, dryPricer, buyQuote, expectedSellOut, sellFloor, type BuyQuote } from "./market/reader.ts";
 export type { MarketRead, CoinRef, QuoteSource, ReadOptions } from "./market/reader.ts";
-export { decodePumpCurve, decodePumpPool, decodeFeeConfig, decodeTokenAccount, feesAt, pumpCurveSell, pumpPoolSell, pumpCurveBuy, pumpPoolBuy, pumpBuyNet, pumpCurvePrice, pumpPoolPrice, pumpPoolState, pumpCurveProgress } from "./market/pump.ts";
+export { decodePumpCurve, decodePumpPool, decodeFeeConfig, decodeTokenAccount, feesAt, pumpCurveSell, pumpPoolSell, pumpCurveBuy, pumpPoolBuy, pumpBuyNet, pumpBuySplit, pumpCurvePrice, pumpPoolPrice, pumpPoolState, pumpCurveProgress } from "./market/pump.ts";
 export type { PumpCurve, PumpPool, PumpPoolState, FeeConfig, PumpFees, SellOut } from "./market/pump.ts";
 export { decodeMint, junkReason, EXT as MINT_EXTENSIONS } from "./market/mint.ts";
 export type { MintInfo, MintExtension, JunkOptions } from "./market/mint.ts";

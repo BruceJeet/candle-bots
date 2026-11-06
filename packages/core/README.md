@@ -305,8 +305,9 @@ lamports that reach the venue, the fees, and the impact (the ticket's average pr
 `buyImpact` and `dammBuy` report it). Reproduced to the raw unit on real buys (three on curves, four on PumpSwap pools,
 each read just before):
 
-- net: the most `n` with `n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator / 1e4)` within the
-  spend, on both venues;
+- net: `n0 = floor(S * 1e4 / (1e4 + fees))`, less the lamports by which `n0` plus its fees (each
+  `ceil(n0 * bps / 1e4)`) overshoots the spend `S`, on both venues. That is the programs' rule: on 163 real PumpSwap
+  buys it matched every one, and on 4 of them it is 1 lamport under the most that fits;
 - out: `floor(vt * (n - 1) / (vq + n - 1))` on the curve, `floor(B * (n - 1) / (Q + n - 1))` on the pool, with `Q` the
   SOL vault plus `virtual_quote_reserves` before the trade (the programs swap one lamport less than the net);
 - the fee tier at the market cap before the trade.

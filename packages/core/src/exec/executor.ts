@@ -106,6 +106,9 @@ export interface ExecutorDeps {
   sellFloor?: (mint: string, amountRaw: bigint, decimals: number) => Promise<bigint | null>;
 }
 
+/** (0.6.0) A pump venue read that is incomplete (retry), not a decoded state that refuses the buy. */
+const UNREAD = new Set(["vault_missing", "pump_fees_unread", "supply_unread", "no_venue", "migrating"]);
+
 type Outcome =
   | { kind: "filled"; fill: Fill | null; result?: any; source: QtySource }
   | { kind: "reverted"; fill: Fill | null }
@@ -718,10 +721,14 @@ export class Executor {
     } catch (e) {
       return this.readFailed(o, pos, errorInfo(e).code, "pump venue read failed");
     }
-    // The vaults come in a second read: a vault that could not be read is a read failure (retried), not a refusal.
-    if (m && m.problem === "vault_missing") return this.readFailed(o, pos, "VAULT_READ", "pump vault read failed");
-    if (!m || (m.venue !== "pump-curve" && m.venue !== "pumpswap")) return { kind: "rejected", code: "VENUE", detail: `no pump venue to buy on (${m?.problem ?? m?.venue ?? "unread"})` };
+    // Only a decoded state that says no refuses. Anything not read (a vault in the second round trip, a fee config or
+    // mint that did not read or decode, a pool or curve briefly absent, a migration in progress) is a read failure:
+    // retried with backoff and alerted at 5 and 20 in a row, like a failed curve read.
+    if (!m) return this.readFailed(o, pos, "VENUE_READ", "pump venue not read");
+    if (m.problem && UNREAD.has(m.problem)) return this.readFailed(o, pos, "VENUE_READ", `pump venue not read (${m.problem})`);
+    if (m.venue !== "pump-curve" && m.venue !== "pumpswap") return { kind: "rejected", code: "VENUE", detail: `no pump venue to buy on (${m.problem ?? m.venue})` };
     const q = buyQuote(m, BigInt(o.amount_raw));
+    if ("why" in q && UNREAD.has(q.why)) return this.readFailed(o, pos, "VENUE_READ", `pump venue not read (${q.why})`);
     if ("why" in q) return { kind: "rejected", code: "VENUE", detail: q.why };
     if (q.impactBps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${q.impactBps} bps on retry (${q.venue})` };
     // As on DAMM v2: the ticket's own impact falls as the price rises, so the ticket must still buy the decision fill

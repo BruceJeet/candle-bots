@@ -5,6 +5,8 @@
  * `onTick` is called once per cycle for each open position that has no exit order in flight. It returns
  * `hold` or `sell` with a fraction of the position's REMAINING quantity (0 < fraction <= 1).
  */
+import type { SeriesView } from "../sources/series.ts";
+
 export interface PositionView {
   mint: string;
   openedAtMs: number;
@@ -35,6 +37,11 @@ export interface MarketView {
   /** (0.5.0) "pump-curve" and "pumpswap" only when the bot reads pump.fun venues (EngineDeps.venues). */
   venue: "curve" | "damm" | "pump-curve" | "pumpswap" | "unknown";
   nowMs: number;
+  /**
+   * (0.6.0) The coin's price and volume series (sources/series) when the bot opts in (EngineDeps.exitSeries with a
+   * series); absent otherwise, and null when the coin is not watched. Read `complete` before acting on a bar.
+   */
+  series?: SeriesView | null;
 }
 
 /** `resetTrail` (0.5.0): once this sell is booked, the position's trail mark restarts at the price now. */

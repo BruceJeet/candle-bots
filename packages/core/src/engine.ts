@@ -69,6 +69,8 @@ export interface EngineDeps {
   pumpBuys?: boolean;
   /** (0.6.0) A per-coin price and volume series (sources/series) the trigger may read as `ctx.series`. */
   series?: SeriesSource;
+  /** (0.6.0) Give the exit strategy each coin's series too (MarketView.series), from `series`. Default false. */
+  exitSeries?: boolean;
 }
 
 /** (0.5.0) What the engine calls on an Adopter. */
@@ -1346,7 +1348,7 @@ export class Engine {
       try {
         const v = this.view(p, m);
         if (trail) v.trailPeakSol = this.d.ledger.trailMark(p.id) ?? v.peakPriceSol;
-        decision = this.d.strategy.onTick(v, m);
+        decision = this.d.strategy.onTick(v, this.d.exitSeries && this.d.series ? { ...m, series: this.d.series.series(p.mint) } : m);
         this.strategyErrors.delete(p.id);
       } catch (e) {
         const why = String((e as Error)?.message ?? e);

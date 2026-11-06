@@ -28,9 +28,9 @@
  *
  * (0.6.0) Buy math (spend S lamports, fees on the input: pump's buy_exact_quote_in and PumpSwap's
  * buy_exact_quote_in), reproduced to the raw unit on real buys (fixtures in the tests):
- *  - net: the most lamports n with n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator / 1e4) <= S,
- *    on both venues (checked on real curve buys where floor(S * 1e4 / (1e4 + fees)) fits exactly and where it does
- *    not);
+ *  - net: n0 = floor(S * 1e4 / (1e4 + fees)), less the lamports by which n0 + ceil(n0 * lp / 1e4) + ceil(n0 *
+ *    protocol / 1e4) + ceil(n0 * creator / 1e4) overshoots S (both venues; 163 real PumpSwap buys and every real curve
+ *    buy, including ones where n0 fits exactly and ones where this is 1 under the most that fits);
  *  - curve: tokens = floor(vt * (n - 1) / (vq + n - 1)); PumpSwap: base = floor(B * (n - 1) / (Q + n - 1)) with Q the
  *    quote vault + virtual_quote_reserves before the trade (the programs swap one lamport less than the net);
  *  - fee tier: the market cap before the trade.
@@ -298,17 +298,24 @@ export interface PumpBuy {
 const feeOn = (n: bigint, f: PumpFees) => ceilBps(n, f.lpBps) + ceilBps(n, f.protocolBps) + ceilBps(n, f.creatorBps);
 
 /**
- * The most lamports n (the swap's input) with n plus its fees (each ceil(n * bps / 1e4)) within `lamports`: what a
- * buy_exact_quote_in of `lamports` puts into the venue. 0 when even 1 lamport does not fit.
+ * What a buy_exact_quote_in of `lamports` puts into the venue (the swap's net input), by the programs' own rule:
+ * n0 = floor(S * 1e4 / (1e4 + fees)); when n0 plus its fees (each ceil(n0 * bps / 1e4)) overshoots S by k lamports,
+ * the net is n0 - k. This always fits the budget and is at most the most that fits (1 lamport under it on a few
+ * budgets). Reproduced on 163 real PumpSwap buys (4 of them where the two differ) and every real curve buy.
  */
 export function pumpBuyNet(lamports: bigint, f: PumpFees): bigint {
-  if (lamports <= 0n) return 0n;
+  return pumpBuySplit(lamports, f).net;
+}
+
+/** pumpBuyNet with the fees the program charges: those of n0 (so net + fee is the budget whenever n0 overshoots). */
+export function pumpBuySplit(lamports: bigint, f: PumpFees): { net: bigint; fee: bigint } {
+  if (lamports <= 0n) return { net: 0n, fee: 0n };
   const tot = f.lpBps + f.protocolBps + f.creatorBps;
-  // n + fees(n) >= n * (1e4 + tot) / 1e4, so the answer is at most floor(S * 1e4 / (1e4 + tot)), and at most 3 below it
-  // (one ceil per fee): start there and step down to the first that fits (n + fees(n) only grows with n).
-  let n = (lamports * 10_000n) / (10_000n + tot);
-  while (n > 0n && n + feeOn(n, f) > lamports) n--;
-  return n;
+  const n0 = (lamports * 10_000n) / (10_000n + tot);
+  const fee = feeOn(n0, f);
+  const over = n0 + fee - lamports;
+  const n = over > 0n ? n0 - over : n0;
+  return { net: n > 0n ? n : 0n, fee };
 }
 
 function impactOf(inLamports: bigint, outRaw: bigint, quoteReserve: bigint, baseReserve: bigint): number {
@@ -336,15 +343,14 @@ export function pumpCurveBuy(c: PumpCurve, lamports: bigint, cfg: FeeConfig): Pu
   if (why) throw new DecodeError(why);
   // The creator fee is charged even on a curve with no creator set (no real buy showed one): a lower expected out.
   const fees = feesAt(cfg, pumpCurveMcap(c));
-  // The most that fits the budget (the real buys where the floor fits exactly take the floor: max fit, not floor - 1).
-  const net = pumpBuyNet(lamports, fees);
+  const { net, fee } = pumpBuySplit(lamports, fees);
   if (net <= 1n) throw new DecodeError("pump_amount");
   const swapIn = net - 1n;
   const out = (c.virtualToken * swapIn) / (c.virtualQuote + swapIn);
   if (out <= 0n) throw new DecodeError("pump_amount");
   if (out > c.realToken) throw new DecodeError("buy_past_graduation");
   const impact = impactOf(swapIn, out, c.virtualQuote, c.virtualToken);
-  return { expectedOutRaw: out, netLamports: net, feeLamports: feeOn(net, fees), fees, impact, impactBps: Math.round(impact * 10_000), feeBps: Number(fees.lpBps + fees.protocolBps + fees.creatorBps) };
+  return { expectedOutRaw: out, netLamports: net, feeLamports: fee, fees, impact, impactBps: Math.round(impact * 10_000), feeBps: Number(fees.lpBps + fees.protocolBps + fees.creatorBps) };
 }
 
 /** Why this pool's buy of `mint` cannot be modelled, or null. */
@@ -365,14 +371,14 @@ export function pumpPoolBuy(s: PumpPoolState, mint: string, lamports: bigint, su
   const tier = feesAt(cfg, pumpPoolMcap(s, supply));
   // As the sell: a pool with no coin creator set pays no creator fee (no real buy checked it).
   const fees = s.pool.coinCreator === SYSTEM ? { ...tier, creatorBps: 0n } : tier;
-  const net = pumpBuyNet(lamports, fees);
+  const { net, fee } = pumpBuySplit(lamports, fees);
   if (net <= 1n) throw new DecodeError("pump_amount");
   const swapIn = net - 1n;
   const out = (s.baseReserve * swapIn) / (s.quoteReserve + swapIn);
   if (out <= 0n) throw new DecodeError("pump_amount");
   if (out >= s.baseReserve) throw new DecodeError("pump_reserves");
   const impact = impactOf(swapIn, out, s.quoteReserve, s.baseReserve);
-  return { expectedOutRaw: out, netLamports: net, feeLamports: feeOn(net, fees), fees, impact, impactBps: Math.round(impact * 10_000), feeBps: Number(fees.lpBps + fees.protocolBps + fees.creatorBps) };
+  return { expectedOutRaw: out, netLamports: net, feeLamports: fee, fees, impact, impactBps: Math.round(impact * 10_000), feeBps: Number(fees.lpBps + fees.protocolBps + fees.creatorBps) };
 }
 
 export { TOKEN_PROGRAM, TOKEN_2022 };

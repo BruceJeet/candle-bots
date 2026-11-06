@@ -1,7 +1,8 @@
 /** The command line: run, status. */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { watchContext, runWatch, LogsSeries, CandleFeed, Watchlist, type WatchCtx } from "candle-bot-core";
+import { watchContext, runWatch, type WatchCtx } from "candle-bot-core";
+import { seriesStack } from "candle-bot-core/sources/stack";
 import { args, die, guardMain } from "candle-bot-core/runtime";
 import { loadConfig, ConfigError, type Config } from "./config.ts";
 import { Scanner } from "./scanner.ts";
@@ -29,10 +30,7 @@ function load(path: string): Config {
 export function makeScanner(ctx: WatchCtx<Config>, d: { ledger: any; alerter: any; now?: () => number; fetch?: typeof fetch; socket?: any }): Scanner {
   const cfg = ctx.cfg;
   const now = d.now ?? Date.now;
-  const series = new LogsSeries({ rpc: ctx.rpc, wsUrl: ctx.wsUrl, log: ctx.log, alerter: d.alerter, now, ...(d.socket ? { socket: d.socket } : {}) }, { maxSubscriptions: cfg.series.maxSubscriptions, maxCoins: cfg.watchlist.maxCoins, maxBars: cfg.series.maxBars, maxSlotLag: cfg.series.maxSlotLag });
-  const f = cfg.watchlist.feed;
-  const feed = f ? new CandleFeed({ apiUrl: cfg.apiUrl, log: ctx.log, alerter: d.alerter, now, ...(d.fetch ? { fetch: d.fetch } : {}) }, { buckets: f.buckets, ...(f.where ? { where: f.where } : {}), everyMs: f.everySec * 1000 }) : null;
-  const watchlist = new Watchlist({ series, feed, alerter: d.alerter, log: ctx.log, now }, { mints: cfg.watchlist.mints, maxCoins: cfg.watchlist.maxCoins, ...(f ? { maxFeedCoins: f.maxCoins } : {}), dropAfterMs: cfg.watchlist.dropAfterMin * 60_000 });
+  const { series, feed, watchlist } = seriesStack({ rpc: ctx.rpc, wsUrl: ctx.wsUrl, apiUrl: cfg.apiUrl, log: ctx.log, alerter: d.alerter, now, ...(d.fetch ? { fetch: d.fetch } : {}), ...(d.socket ? { socket: d.socket } : {}) }, cfg.watchlist, cfg.series);
   return new Scanner({ cfg, ledger: d.ledger, alerter: d.alerter, log: ctx.log, series, watchlist, feed, now });
 }
 
