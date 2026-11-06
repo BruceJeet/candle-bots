@@ -1,0 +1,15 @@
+{
+  "comment": "Dry run: decides and logs, never trades. No API key needed. Watches the Candle feed's onfire bucket (pump.fun and PumpSwap coins only are bought). Set your wallet (and a key for live) before going live.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "buy": { "sol": 0.01, "maxSlippageBps": 500, "maxOpen": 3, "lifetimeSol": 0.1, "maxPerCoin": 1 },
+  "sell": { "maxSlippageBps": 1000 },
+  "watchlist": { "feed": { "buckets": ["onfire"], "maxCoins": 20, "everySec": 30 }, "maxCoins": 25, "dropAfterMin": 30 },
+  "series": { "maxSubscriptions": 25 },
+  "dip": { "windowBars": 30, "minFallPct": 35, "minWindowVolumeSol": 10, "bounceBars": 3, "minBouncePct": 5, "maxImpactBps": 300, "cooldownMin": 120, "buyWithinSec": 30 },
+  "exit": { "strategy": "fade", "stopLoss": 0.7, "takeProfit": 2, "fadeRecentBars": 5, "fadeBaselineBars": 20, "fadeBelowRatio": 0.25, "minHoldMin": 5, "maxHoldMin": 360 }
+}

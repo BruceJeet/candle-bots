@@ -1,0 +1,63 @@
+{
+  "name": "candle-spike-rider",
+  "version": "0.1.0",
+  "description": "Buys pump.fun and PumpSwap coins on a volume spike with buyers behind it (on a live price and volume series), and exits them by a pluggable strategy. A Solana bot built on @candledottv/agent-sdk.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/spike-rider"
+  },
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/spike-rider#readme",
+  "bugs": {
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
+  },
+  "bin": {
+    "candle-spike-rider": "bin/candle-spike-rider"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "candle-bot-core": "0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "candle",
+    "solana",
+    "trading-bot",
+    "pump.fun",
+    "pumpswap",
+    "volume",
+    "momentum",
+    "memecoin",
+    "bot",
+    "agent"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
