@@ -22,6 +22,17 @@ Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 s
 - **`pumpBuys`** on `EngineDeps` (the engine's own expected fill for a coin with no Candle curve) and on
   `ExecutorDeps` (the retry recheck on the pump venue: impact, and drift against the decision fill at
   `retry.maxPriceDriftBps`, else `maxBuyImpactBps`). Default off: as 0.5.0.
+- **The pump buy net is the programs' own rule** (CP3): floor(S * 1e4 / (1e4 + fees)) less its overshoot, with the
+  fees charged on the floor. It matched 163 real PumpSwap buys, 4 of them 1 lamport under the most that fits.
+  `pumpBuySplit` gives the net and the fee.
+- **On a pumpBuys retry, a venue read that is incomplete is retried, not refused:** a vault, a fee config, a mint, a
+  pool briefly absent, a migration. Only a decoded state that says no refuses.
+- **`seriesBuy`:** `SeriesBuyTrigger`, a buy trigger on a series rule. Mayhem, cashback and other refused venues are
+  skipped before any attempt, and the expected fill is the venue's own quote.
+- **`sources/stack`:** the shared `watchlist` / `series` config sections and `seriesStack()`. The scanner uses them,
+  with the same keys and defaults.
+- **Series-aware exits:** `MarketView.series` (opt-in, `EngineDeps.exitSeries`) and the `fade` exit strategy.
+- **`dryPricer(..., { pump })`** prices dry buys on pump venues. `runtime.parts(..., { venues })` passes it through.
 
 ## 0.5.0
 

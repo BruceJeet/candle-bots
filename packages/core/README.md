@@ -516,6 +516,51 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
 `SellEvent` from `Program data:` log lines. `sources/replay`: `SeriesRecorder` writes snapshots, and `ReplaySeries` /
 `replay()` serve them back by time, so a rule can be run on a recording; the same recording gives the same decisions.
 
+## Buying on the series (opt-in)
+
+`seriesBuy` gives a `SeriesBuyTrigger(name, prefixes, deps, rule, options)`: a trigger that runs a rule
+(`(view, mint, feed) => { reason, numbers } | null`) on every coin of a watchlist and buys where it fires. The dip
+buyer and the spike rider are built on it.
+
+- **Each poll:** the coins the bot holds are pushed onto the watchlist (a series-aware exit keeps their bars), the
+  watchlist steps, the series is read, and the rule runs on every watched coin not held. A coin whose rule fires is
+  a candidate, then cools down for `cooldownMin`.
+- **decide:**
+  - The rule runs again on the series as it is now.
+  - The coin's venue is read fresh. Only a pump.fun curve or the canonical PumpSwap pool is bought.
+  - The venue's buy math must quote the ticket, and `buyQuote` refuses mayhem-mode and cashback venues, other
+    quote mints and buys past the curve's tokens. These are skipped **before any attempt**: the executor's recheck
+    only covers retries.
+  - The impact must be within `maxImpactBps`.
+  - The verdict's expected fill is the venue's own value, never a lower one. The engine keeps the smaller of it and
+    its own read, so a lower value would loosen the drift check. The verdict also carries a deadline,
+    `buyWithinSec`.
+- Pair it with EngineDeps `pumpBuys`, `series`, `exitSeries` and `venues: { pump: true }`, and ExecutorDeps
+  `pumpBuys`. `runtime.parts(..., { venues })` prices dry runs on the same venues.
+
+`sources/stack` holds the `watchlist` and `series` config sections every series bot shares
+(`parseWatchlistSection`, `parseSeriesSection`), and `seriesStack()`, which builds the LogsSeries, the Candle feed
+and the Watchlist from them.
+
+**Series-aware exits:** with `EngineDeps.exitSeries` (and a `series`), the exit strategy gets `MarketView.series`:
+the coin's view, or null when it is not watched. Without it the field is absent and `MarketView` is as before. The
+`fade` strategy reads it:
+
+```json
+{ "strategy": "fade", "stopLoss": 0.7, "takeProfit": 2, "fadeRecentBars": 5, "fadeBaselineBars": 20,
+  "fadeBelowRatio": 0.25, "dropWindowBars": 15, "dropFromHighPct": 25, "minHoldMin": 5, "maxHoldMin": 360 }
+```
+
+It sells everything on the first of:
+- take profit or stop loss (multiples of entry);
+- volume fade: the last `fadeRecentBars` trading under `fadeBelowRatio` of the `fadeBaselineBars` before them;
+- a drop: the last close `dropFromHighPct` under the high of the bars since entry (a fall it bought into does not
+  count);
+- `maxHoldMin`.
+
+The series rules act only on complete bars and after `minHoldMin`. With no series they hold, and the price rules
+still apply.
+
 ## Watch-only bots
 
 `watch.ts`: `parseWatchConfig` takes the shared keys a watcher has (`mode: "watch"`, `apiUrl`, `rpcUrlEnv`,
@@ -559,7 +604,7 @@ can never trade.
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.
