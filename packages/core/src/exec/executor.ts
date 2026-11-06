@@ -722,7 +722,7 @@ export class Executor {
       return this.readFailed(o, pos, errorInfo(e).code, "pump venue read failed");
     }
     // Only a decoded state that says no refuses. Anything not read (a vault in the second round trip, a fee config or
-    // mint that did not read or decode, a pool or curve briefly absent, a migration in progress) is a read failure:
+    // mint that did not read or decode, a pool or curve absent for a moment, a migration in progress) is a read failure:
     // retried with backoff and alerted at 5 and 20 in a row, like a failed curve read.
     if (!m) return this.readFailed(o, pos, "VENUE_READ", "pump venue not read");
     if (m.problem && UNREAD.has(m.problem)) return this.readFailed(o, pos, "VENUE_READ", `pump venue not read (${m.problem})`);

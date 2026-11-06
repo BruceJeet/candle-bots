@@ -26,7 +26,7 @@ Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 s
   fees charged on the floor. It matched 163 real PumpSwap buys, 4 of them 1 lamport under the most that fits.
   `pumpBuySplit` gives the net and the fee.
 - **On a pumpBuys retry, a venue read that is incomplete is retried, not refused:** a vault, a fee config, a mint, a
-  pool briefly absent, a migration. Only a decoded state that says no refuses.
+  pool absent for a moment, a migration. Only a decoded state that says no refuses.
 - **`seriesBuy`:** `SeriesBuyTrigger`, a buy trigger on a series rule. Mayhem, cashback and other refused venues are
   skipped before any attempt, and the expected fill is the venue's own quote.
 - **`sources/stack`:** the shared `watchlist` / `series` config sections and `seriesStack()`. The scanner uses them,
