@@ -107,7 +107,7 @@ export interface Parts {
  * state dir that holds the other mode's positions. `maxBuyImpactBps` is the bot's buy-retry impact limit.
  * `executor` lets a bot use its own Executor subclass.
  */
-export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: number; executor?: (d: ConstructorParameters<typeof Executor>[0]) => Executor; venues?: ReadOptions; exitParams?: Record<string, unknown> }): Promise<Parts> {
+export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: number; executor?: (d: ConstructorParameters<typeof Executor>[0]) => Executor; venues?: ReadOptions; exitParams?: Record<string, unknown>; now?: () => number }): Promise<Parts> {
   // (0.6.0) exitParams: extra exit parameters the bot fills in (e.g. the event bot's event times), merged into exit.
   const strategy = await loadStrategy(opts.exitParams ? { ...ctx.cfg.exit, ...opts.exitParams } : ctx.cfg.exit, ctx.cfg.configDir).catch((e) => die(String(e.message)));
   const { rail, linkedWalletId } = await buildRail(ctx);
@@ -123,6 +123,8 @@ export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: n
   }
   const deps = {
     cfg: ctx.cfg, ledger, rail, linkedWalletId, rpc: ctx.rpc, log: ctx.log, alerter, maxBuyImpactBps: opts.maxBuyImpactBps,
+    // (0.6.0) A clock for the executor (a library user's or a test's; default Date.now).
+    ...(opts.now ? { now: opts.now } : {}),
     buysPaused: () => existsSync(join(ctx.cfg.stateDir, "PAUSE_BUYS")),
     dry: dryPricer(ctx.rpc, ctx.client, (m) => decimals.get(m) ?? ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6, opts.venues),
   };

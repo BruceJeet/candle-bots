@@ -48,6 +48,7 @@ export async function makeEngine(ctx: Ctx, ledger: Ledger, d: { now?: () => numb
     executor: (x) => new Executor({ ...x, dammBuys: true, pumpBuys: true, ...(known ? { knownPrograms: known } : {}), ...(floor ? { sellFloor: floor } : {}) }),
     venues: { pump: true },
     ...(c.exit.strategy === "event" ? { exitParams: { events: eventTimes(c) } } : {}),
+    ...(d.now ? { now: d.now } : {}),
   });
   const trigger = new EventTrigger({ cfg: c, log: ctx.log, ...(d.now ? { now: d.now } : {}) });
   const engine = new Engine({ cfg: c, ledger, trigger, executor, strategy, rpc: ctx.rpc, log: ctx.log, alerter, pumpBuys: true, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });

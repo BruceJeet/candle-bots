@@ -53,7 +53,7 @@ export async function makeEngine(ctx: Ctx, ledger: Ledger, d: { now?: () => numb
   const linked = c.payer === "linked";
   const known = linked && c.dip.checkPrograms ? new Set([...KNOWN_PROGRAMS, ...c.dip.extraPrograms]) : undefined;
   const floor = linked ? sellFloor(ctx.rpc, c.sell.maxSlippageBps, c.dip.sellFloorMarginBps) : undefined;
-  const { strategy, alerter, executor } = await parts(ctx, ledger, { maxBuyImpactBps: c.dip.maxImpactBps, executor: (x) => new Executor({ ...x, pumpBuys: true, ...(known ? { knownPrograms: known } : {}), ...(floor ? { sellFloor: floor } : {}) }), venues: { pump: true } });
+  const { strategy, alerter, executor } = await parts(ctx, ledger, { maxBuyImpactBps: c.dip.maxImpactBps, executor: (x) => new Executor({ ...x, pumpBuys: true, ...(known ? { knownPrograms: known } : {}), ...(floor ? { sellFloor: floor } : {}) }), venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   const { trigger, series } = makeTrigger(ctx, alerter, d);
   const engine = new Engine({ cfg: ctx.cfg, ledger, trigger, executor, strategy, rpc: ctx.rpc, log: ctx.log, alerter, series, exitSeries: true, pumpBuys: true, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   return { engine, trigger };
