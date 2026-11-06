@@ -25,6 +25,7 @@
  *  - PumpSwap: quote_out = floor(n * Q / (B + n)) with B the base vault and Q = quote vault + virtual_quote_reserves;
  *    fees ceil(quote_out * bps / 10_000) each for lp, protocol and coin creator. The wallet gets quote_out - fees.
  *  - fee tier: the last tier whose threshold <= market cap (lamports): curve vq * supply / vt; pool Q * supply / B.
+ *    (0.6.0) A curve's own creator_fee_bps (@115), when larger than the tier's, is the creator fee (real trades paid it).
  *
  * (0.6.0) Buy math (spend S lamports, fees on the input: pump's buy_exact_quote_in and PumpSwap's
  * buy_exact_quote_in), reproduced to the raw unit on real buys (fixtures in the tests):
@@ -86,6 +87,11 @@ export interface PumpCurve {
   cashback: boolean;
   /** The curve's quote mint; WSOL for SOL (the field all zero, or absent on older curves). */
   quoteMint: string;
+  /**
+   * (0.6.0) The curve's own creator fee (bps, u64 @115; 0 when unset or on a shorter curve). Real trades on curves
+   * with 100, 150 and 300 here paid that creator fee, not the tier's: the math uses the larger of the two.
+   */
+  creatorFeeBps: bigint;
 }
 
 export function decodePumpCurve(v: AccountValue | null | undefined): PumpCurve {
@@ -102,7 +108,15 @@ export function decodePumpCurve(v: AccountValue | null | undefined): PumpCurve {
     mayhem: b.length >= 82 ? b[81] !== 0 : false,
     cashback: b.length >= 83 ? b[82] !== 0 : false,
     quoteMint: q === SYSTEM ? WSOL : q,
+    creatorFeeBps: b.length >= 123 ? u64(b, 115) : 0n,
   };
+}
+
+/** The curve's fees at its market cap: the tier's, with the curve's own creator fee when it is larger. */
+export function pumpCurveFees(c: PumpCurve, cfg: FeeConfig): PumpFees {
+  const t = feesAt(cfg, pumpCurveMcap(c));
+  const own = c.creatorFeeBps ?? 0n;
+  return own > t.creatorBps ? { ...t, creatorBps: own } : t;
 }
 
 export interface PumpPool {
@@ -228,7 +242,7 @@ export function pumpCurveSell(c: PumpCurve, raw: bigint, cfg: FeeConfig): SellOu
   if (raw <= 0n) throw new DecodeError("pump_amount");
   const gross = (raw * c.virtualQuote) / (c.virtualToken + raw);
   if (gross > c.realQuote) throw new DecodeError("pump_reserves");
-  const fees = feesAt(cfg, pumpCurveMcap(c));
+  const fees = pumpCurveFees(c, cfg);
   const fee = ceilBps(gross, fees.protocolBps) + ceilBps(gross, fees.creatorBps) + ceilBps(gross, fees.lpBps);
   return { outLamports: gross > fee ? gross - fee : 0n, grossLamports: gross, feeLamports: fee, fees };
 }
@@ -342,7 +356,7 @@ export function pumpCurveBuy(c: PumpCurve, lamports: bigint, cfg: FeeConfig): Pu
   const why = pumpCurveBuyUnsupported(c);
   if (why) throw new DecodeError(why);
   // The creator fee is charged even on a curve with no creator set (no real buy showed one): a lower expected out.
-  const fees = feesAt(cfg, pumpCurveMcap(c));
+  const fees = pumpCurveFees(c, cfg);
   const { net, fee } = pumpBuySplit(lamports, fees);
   if (net <= 1n) throw new DecodeError("pump_amount");
   const swapIn = net - 1n;
