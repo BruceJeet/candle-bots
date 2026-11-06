@@ -305,15 +305,16 @@ lamports that reach the venue, the fees, and the impact (the ticket's average pr
 `buyImpact` and `dammBuy` report it). Reproduced to the raw unit on real buys (three on curves, four on PumpSwap pools,
 each read just before):
 
-- net: on PumpSwap the most `n` with `n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator / 1e4)`
-  within the spend; on the curve `floor(S * 1e4 / (1e4 + fees)) - 1` (the same `n` on every real buy; where they
-  would differ, the smaller);
+- net: the most `n` with `n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator / 1e4)` within the
+  spend, on both venues;
 - out: `floor(vt * (n - 1) / (vq + n - 1))` on the curve, `floor(B * (n - 1) / (Q + n - 1))` on the pool, with `Q` the
   SOL vault plus `virtual_quote_reserves` before the trade (the programs swap one lamport less than the net);
 - the fee tier at the market cap before the trade.
 
-Refused rather than guessed: a mayhem-mode curve (its real buys do not follow this math; a test shows it), a cashback
-curve or pool, a buy past the curve's real tokens, and everything the sell side refuses. `buyQuote(read, lamports)`
+Refused rather than guessed: a mayhem-mode curve (two real exact-in buys there follow this math, but other trades on
+the same curve paid no fee, so the fee is not known in advance), a cashback curve or pool, a buy past the curve's real
+tokens, and everything the sell side refuses. On a curve with no creator set the creator fee is still counted (a lower
+expected out; no real buy showed one). `buyQuote(read, lamports)`
 answers on whichever venue a read found (Candle curve, DAMM v2, pump curve, PumpSwap), or `{ why }`.
 
 A bot that buys pump.fun coins turns on **`pumpBuys`** in both places:
@@ -323,7 +324,7 @@ A bot that buys pump.fun coins turns on **`pumpBuys`** in both places:
 - `ExecutorDeps.pumpBuys`: a retry of such a buy reads the venue fresh and is refused when the ticket's impact there
   is over `maxBuyImpactBps` (`IMPACT`), or when it would buy less than the order's decision fill less
   `retry.maxPriceDriftBps` (`maxBuyImpactBps` when that is unset; `IMPACT`). An order with no decision fill, or a venue
-  the math refuses, is refused (`VENUE`); a failed read is retried. Without `pumpBuys` such a retry is refused
+  the math refuses, is refused (`VENUE`); a failed read (the venue, or a PumpSwap vault) is retried. Without `pumpBuys` such a retry is refused
   (`CURVE`), as before.
 
 The PumpSwap virtual quote reserve moves between trades, so an expected fill is only as good as its read: both checks

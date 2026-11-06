@@ -28,14 +28,15 @@
  *
  * (0.6.0) Buy math (spend S lamports, fees on the input: pump's buy_exact_quote_in and PumpSwap's
  * buy_exact_quote_in), reproduced to the raw unit on real buys (fixtures in the tests):
- *  - net: PumpSwap: the most lamports n with n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator /
- *    1e4) <= S; the curve: floor(S * 1e4 / (1e4 + fees)) - 1 (the same n on every real buy; where they would differ,
- *    the smaller, by one lamport);
+ *  - net: the most lamports n with n + ceil(n * lp / 1e4) + ceil(n * protocol / 1e4) + ceil(n * creator / 1e4) <= S,
+ *    on both venues (checked on real curve buys where floor(S * 1e4 / (1e4 + fees)) fits exactly and where it does
+ *    not);
  *  - curve: tokens = floor(vt * (n - 1) / (vq + n - 1)); PumpSwap: base = floor(B * (n - 1) / (Q + n - 1)) with Q the
  *    quote vault + virtual_quote_reserves before the trade (the programs swap one lamport less than the net);
  *  - fee tier: the market cap before the trade.
- * The buy side refuses (never guesses) what was not reproduced on a real buy: a mayhem-mode curve (real mayhem buys do
- * not follow this math; tested), a cashback curve or pool, a mayhem-mode pool,
+ * The buy side refuses (never guesses) what is not settled by real buys: a mayhem-mode curve (two real exact-in buys
+ * follow this math, but other trades on the same curve paid no fee at all, so the fee a buy pays there is not known
+ * in advance), a cashback curve or pool, a mayhem-mode pool,
  * a buy past the curve's real tokens (the program then caps it), a quote other than SOL.
  * Not modelled (refused, never guessed): a quote other than SOL, a mayhem-mode PumpSwap pool, a pool whose base is not
  * the coin (the canonical pool always has the coin as base). A mayhem-mode curve's ordinary sell follows the same math.
@@ -333,12 +334,10 @@ export function pumpCurveBuyUnsupported(c: PumpCurve): string | null {
 export function pumpCurveBuy(c: PumpCurve, lamports: bigint, cfg: FeeConfig): PumpBuy {
   const why = pumpCurveBuyUnsupported(c);
   if (why) throw new DecodeError(why);
+  // The creator fee is charged even on a curve with no creator set (no real buy showed one): a lower expected out.
   const fees = feesAt(cfg, pumpCurveMcap(c));
-  // The curve's net on every real buy was floor(S * 1e4 / (1e4 + fees)) - 1, which there was also the most that fits.
-  // Where the floor itself fits exactly (no real buy showed one) the two differ by a lamport: take the smaller.
-  const fit = pumpBuyNet(lamports, fees);
-  const closed = (lamports * 10_000n) / (10_000n + fees.lpBps + fees.protocolBps + fees.creatorBps) - 1n;
-  const net = closed < fit ? closed : fit;
+  // The most that fits the budget (the real buys where the floor fits exactly take the floor: max fit, not floor - 1).
+  const net = pumpBuyNet(lamports, fees);
   if (net <= 1n) throw new DecodeError("pump_amount");
   const swapIn = net - 1n;
   const out = (c.virtualToken * swapIn) / (c.virtualQuote + swapIn);

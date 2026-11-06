@@ -718,6 +718,8 @@ export class Executor {
     } catch (e) {
       return this.readFailed(o, pos, errorInfo(e).code, "pump venue read failed");
     }
+    // The vaults come in a second read: a vault that could not be read is a read failure (retried), not a refusal.
+    if (m && m.problem === "vault_missing") return this.readFailed(o, pos, "VAULT_READ", "pump vault read failed");
     if (!m || (m.venue !== "pump-curve" && m.venue !== "pumpswap")) return { kind: "rejected", code: "VENUE", detail: `no pump venue to buy on (${m?.problem ?? m?.venue ?? "unread"})` };
     const q = buyQuote(m, BigInt(o.amount_raw));
     if ("why" in q) return { kind: "rejected", code: "VENUE", detail: q.why };
