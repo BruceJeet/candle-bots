@@ -1,6 +1,6 @@
 {
   "name": "candle-launch-helper",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Fires the Candle launch you describe, with its dev buy in the same bundle, then manages the dev bag with exits and controls. A Solana bot built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",

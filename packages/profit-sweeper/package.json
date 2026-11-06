@@ -1,6 +1,6 @@
 {
   "name": "candle-profit-sweeper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Sells the bags in a Solana wallet at your targets and asks for the profit to be swept to your home address: a sweep request with the wallet, the amount, the full home address and a request id, alerted once and kept until you mark it done. It never moves funds itself. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",

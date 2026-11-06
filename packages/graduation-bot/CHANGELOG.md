@@ -1,6 +1,6 @@
 # Changelog: candle-graduation-bot
 
-## Unreleased
+## 0.1.2
 
 - Pins candle-bot-core 0.6.0 (batch 3: opt-in additions only; no change in this package).
 

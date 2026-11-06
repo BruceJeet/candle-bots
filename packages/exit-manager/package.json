@@ -1,6 +1,6 @@
 {
   "name": "candle-exit-manager",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Runs exits on bags already in a Solana wallet (bought by hand or by another tool): adopts them, then sells by a pluggable strategy, a trailing stop included. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",

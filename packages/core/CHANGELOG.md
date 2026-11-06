@@ -1,6 +1,6 @@
 # Changelog: candle-bot-core
 
-## 0.6.0 (unreleased)
+## 0.6.0
 
 Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 state.)
 

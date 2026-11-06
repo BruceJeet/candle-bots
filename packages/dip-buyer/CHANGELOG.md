@@ -1,6 +1,6 @@
 # Changelog: candle-dip-buyer
 
-## 0.1.0 (unreleased)
+## 0.1.0
 
 First version, on candle-bot-core 0.6.0.
 
