@@ -107,8 +107,9 @@ export interface Parts {
  * state dir that holds the other mode's positions. `maxBuyImpactBps` is the bot's buy-retry impact limit.
  * `executor` lets a bot use its own Executor subclass.
  */
-export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: number; executor?: (d: ConstructorParameters<typeof Executor>[0]) => Executor; venues?: ReadOptions }): Promise<Parts> {
-  const strategy = await loadStrategy(ctx.cfg.exit, ctx.cfg.configDir).catch((e) => die(String(e.message)));
+export async function parts(ctx: Ctx, ledger: Ledger, opts: { maxBuyImpactBps: number; executor?: (d: ConstructorParameters<typeof Executor>[0]) => Executor; venues?: ReadOptions; exitParams?: Record<string, unknown> }): Promise<Parts> {
+  // (0.6.0) exitParams: extra exit parameters the bot fills in (e.g. the event bot's event times), merged into exit.
+  const strategy = await loadStrategy(opts.exitParams ? { ...ctx.cfg.exit, ...opts.exitParams } : ctx.cfg.exit, ctx.cfg.configDir).catch((e) => die(String(e.message)));
   const { rail, linkedWalletId } = await buildRail(ctx);
   const decimals = new Map<string, number>();
   const modes = ledger.modes();

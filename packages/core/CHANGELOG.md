@@ -40,6 +40,8 @@ Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 s
   with no log is a gap from its last log (`logs silent`), and is subscribed again in place
   (`MultiLogsSocket.resubscribe`). `logs-multi` rebuilds the socket after `maxUnansweredUnsubscribes` unanswered
   unsubscribes. `sources/stack` gains `checkWindows()`.
+- **The `event` exit strategy:** a build-up (ladder rungs, stop loss), a hedge at the event, a moonshot core. The
+  share kept is a target, as in the ladder. `runtime.parts(..., { exitParams })` merges bot-supplied exit parameters.
 - **`dryPricer(..., { pump })`** prices dry buys on pump venues. `runtime.parts(..., { venues })` passes it through.
 
 ## 0.5.0

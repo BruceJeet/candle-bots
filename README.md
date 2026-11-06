@@ -17,6 +17,7 @@ one you want and you get that bot and the core, nothing else.
 | [candle-scanner-bot](packages/scanner-bot/README.md) | Watch-only: watches pump.fun and PumpSwap coins (a list, or a Candle feed bucket) and alerts on Telegram, Discord or a webhook on a volume spike, a dip, a breakout or a hot 5 min on the feed; no wallet, no key, never trades | `npx candle-scanner-bot run --config scan.json` (start from `examples/watch.json`) |
 | [candle-dip-buyer](packages/dip-buyer/README.md) | Buys pump.fun and PumpSwap coins on a dip from their recent high (optionally once they turn up), on a live price and volume series; exits by a strategy, `fade` reading the series too | `npx candle-dip-buyer scan --config bot.json` (start from `examples/dry.json`) |
 | [candle-spike-rider](packages/spike-rider/README.md) | Buys pump.fun and PumpSwap coins on a volume spike with buyers behind it and the price rising; exits by a strategy, `fade` reading the series too | `npx candle-spike-rider scan --config bot.json` (start from `examples/dry.json`) |
+| [candle-event-bot](packages/event-bot/README.md) | Buys coins tied to a dated event in a window before it, and exits in phases keyed to the event: ride the build-up, hedge at the event, keep a moonshot core | `npx candle-event-bot plan --config bot.json` (start from `examples/dry.json`) |
 
 Under them:
 

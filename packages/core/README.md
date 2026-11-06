@@ -576,6 +576,18 @@ The series rules act only on complete bars and after `minHoldMin`. The fade rule
 window are bars wholly after entry. With no series, or a gap, they hold and the price rules still apply, so with a
 series rule `stopLoss` or `maxHoldMin` is required.
 
+## The event exit (opt-in)
+
+`strategies/event`: a phased exit keyed to a coin's dated event. The bot fills `events` (mint to event time, ms), e.g.
+through `runtime.parts(..., { exitParams: { events } })`. The phases:
+- build-up: optional ladder `rungs` and `stopLoss`;
+- hedge: from `hedgeAtMin`, keep at most `hedgeKeep`;
+- core: from `afterMin`, keep at most `coreKeep`;
+- core exit: `coreTakeProfit` or `coreMaxHoldHours`.
+
+Every phase is a target for the share of the original kept, so it never sells twice. The event bot's README has the
+details.
+
 ## Watch-only bots
 
 `watch.ts`: `parseWatchConfig` takes the shared keys a watcher has (`mode: "watch"`, `apiUrl`, `rpcUrlEnv`,
@@ -619,7 +631,7 @@ can never trade.
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/strategies/event`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.

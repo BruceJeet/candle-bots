@@ -1,0 +1,48 @@
+{
+  "comment": "Dry run: decides and logs, never trades. No API key needed. Replace the event's mint with your coin and its time with the event's (ISO 8601 with its offset). Set your wallet (and a key for live) before going live.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "buy": {
+    "sol": 0.01,
+    "maxSlippageBps": 500,
+    "maxOpen": 3,
+    "lifetimeSol": 0.1,
+    "maxPerCoin": 1
+  },
+  "sell": {
+    "maxSlippageBps": 1000
+  },
+  "events": [
+    {
+      "mint": "11111111111111111111111111111111",
+      "at": "2026-12-01T17:00:00Z",
+      "label": "replace me: the coin and its event"
+    }
+  ],
+  "entry": {
+    "fromHours": 72,
+    "untilMin": 60,
+    "maxImpactBps": 300,
+    "buyWithinSec": 60,
+    "retryMin": 10
+  },
+  "exit": {
+    "strategy": "event",
+    "rungs": [
+      {
+        "at": 3,
+        "sell": 0.2
+      }
+    ],
+    "hedgeAtMin": 0,
+    "hedgeKeep": 0.5,
+    "afterMin": 60,
+    "coreKeep": 0.2,
+    "coreTakeProfit": 20,
+    "coreMaxHoldHours": 168
+  }
+}
