@@ -23,6 +23,7 @@ import { errorJson } from "../redact.ts";
 import { blockhashValid, getTransaction, signatureStatus, tokenAccounts, tokenBalance, type Rpc } from "../solana/rpc.ts";
 import { candleCurve, dammPool, WSOL } from "../solana/pda.ts";
 import { buyImpact, dammBuy, decodeCandleCurve, decodeDamm } from "../market/curve.ts";
+import { buyQuote, readMarkets } from "../market/reader.ts";
 import { fillFromTx, type Fill } from "./fills.ts";
 import { blockhashOfSigned, programIdsOf, signatureOfSigned, type TradeRail } from "./trader.ts";
 
@@ -81,6 +82,15 @@ export interface ExecutorDeps {
    * (CURVE), as before.
    */
   dammBuys?: boolean;
+  /**
+   * (0.6.0) Buys of pump.fun coins (no Candle curve; the pump curve or the canonical PumpSwap pool): the retry recheck
+   * reads the venue fresh (market/reader, `pump: true`) and applies maxBuyImpactBps to the ticket's impact there, and a
+   * drift limit to the price since the decision: the ticket must still buy the order's decision fill less
+   * retry.maxPriceDriftBps (maxBuyImpactBps when that is unset). An order with no decision fill, a venue the math
+   * refuses (mayhem, cashback, another quote, past the curve's tokens) or a fee config that cannot be read: refused
+   * (VENUE), never guessed. Default false: such a buy is refused on retry (CURVE), as before.
+   */
+  pumpBuys?: boolean;
   /**
    * (0.5.0) Linked payer only: a built transaction whose top-level instructions call a program outside this set is
    * never signed (the order ends rejected, UNKNOWN_PROGRAM, alerted); an unreadable one neither (UNREADABLE_TX).
@@ -171,7 +181,7 @@ export class Executor {
     if (typeof d.maxBuyImpactBps !== "number" || !Number.isFinite(d.maxBuyImpactBps) || d.maxBuyImpactBps < 0) throw new Error("Executor: maxBuyImpactBps must be a number >= 0");
     // (0.4.0) A drift check holds every retry to the decision fill: the ledger keeps it in its own column, added
     // only when a check is on (no drift check: the ledger is never migrated, 0.3.1 behavior).
-    if (d.cfg.retry.maxPriceDriftBps !== undefined || d.dammBuys) d.ledger.ensureDecisionColumn();
+    if (d.cfg.retry.maxPriceDriftBps !== undefined || d.dammBuys || d.pumpBuys) d.ledger.ensureDecisionColumn();
     this.d = d;
     this.now = d.now ?? Date.now;
     this.random = d.random ?? Math.random;
@@ -650,6 +660,8 @@ export class Executor {
     } catch (e) {
       return this.readFailed(o, pos, errorInfo(e).code, "curve read failed");
     }
+    // (0.6.0, pumpBuys) No Candle curve: a pump.fun coin, rechecked on its own venue.
+    if (!v && this.d.pumpBuys) return this.recheckPumpBuy(o, pos);
     try {
       const c = decodeCandleCurve(v);
       if (c.quoteMint !== WSOL) return { kind: "rejected", code: "QUOTE_MINT", detail: "curve is not SOL-quoted" };
@@ -696,6 +708,28 @@ export class Executor {
     } catch (e) {
       return { kind: "rejected", code: "POOL", detail: String((e as Error).message) };
     }
+  }
+
+  /** (0.6.0, pumpBuys) The recheck of a pump.fun coin's buy: its venue read fresh, the impact there and the drift. */
+  private async recheckPumpBuy(o: OrderRow, pos: PositionRow): Promise<Outcome | null> {
+    let m;
+    try {
+      m = (await readMarkets(this.d.rpc, [{ mint: pos.mint, decimals: pos.decimals }], this.now(), { pump: true })).get(pos.mint);
+    } catch (e) {
+      return this.readFailed(o, pos, errorInfo(e).code, "pump venue read failed");
+    }
+    if (!m || (m.venue !== "pump-curve" && m.venue !== "pumpswap")) return { kind: "rejected", code: "VENUE", detail: `no pump venue to buy on (${m?.problem ?? m?.venue ?? "unread"})` };
+    const q = buyQuote(m, BigInt(o.amount_raw));
+    if ("why" in q) return { kind: "rejected", code: "VENUE", detail: q.why };
+    if (q.impactBps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${q.impactBps} bps on retry (${q.venue})` };
+    // As on DAMM v2: the ticket's own impact falls as the price rises, so the ticket must still buy the decision fill
+    // (set once, never a later quote) less the drift limit.
+    const booked = decisionOf(o);
+    if (booked === null) return { kind: "rejected", code: "VENUE", detail: "no decision fill on the order to hold the retry to (pumpBuys refuses a retry without one)" };
+    const drift = Math.min(10_000, Math.max(0, Math.round(this.d.cfg.retry.maxPriceDriftBps ?? this.d.maxBuyImpactBps)));
+    if (q.expectedOutRaw < (booked * BigInt(10_000 - drift)) / 10_000n)
+      return { kind: "rejected", code: "IMPACT", detail: `price moved up on retry (${q.venue}): ${q.expectedOutRaw} < ${booked} less ${drift} bps` };
+    return null;
   }
 
   private async classify(o: OrderRow, pos: PositionRow, info: ErrorInfo, phase: "build" | "sign" | "submit", n: number, att: number): Promise<Outcome> {

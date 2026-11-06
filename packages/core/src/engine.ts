@@ -14,7 +14,7 @@ import { Executor } from "./exec/executor.ts";
 import { fillFromTx, type Fill } from "./exec/fills.ts";
 import type { Ledger, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
-import { expectedSellOut, readMarkets, type MarketRead, type ReadOptions } from "./market/reader.ts";
+import { buyQuote, expectedSellOut, readMarkets, type MarketRead, type ReadOptions } from "./market/reader.ts";
 import type { SeriesSource } from "./sources/series.ts";
 import { redactDeep } from "./redact.ts";
 import { getAccounts, tokenBalance, type Rpc } from "./solana/rpc.ts";
@@ -61,6 +61,12 @@ export interface EngineDeps {
   adopter?: AdoptionHook;
   /** (0.5.0) Honour a PAUSE_SELLS file in the state dir: the exit strategy's sells are held; reads and marks go on. */
   pauseSells?: boolean;
+  /**
+   * (0.6.0) Buys of pump.fun coins: a coin with no Candle curve gets the engine's own expected fill from its pump curve
+   * or canonical PumpSwap pool (a fresh wide read, the venue's buy math), the smaller of that and the trigger's, as for
+   * Candle coins. Pair with ExecutorDeps.pumpBuys. Default false: the trigger's value is kept (logged), as before.
+   */
+  pumpBuys?: boolean;
   /** (0.6.0) A per-coin price and volume series (sources/series) the trigger may read as `ctx.series`. */
   series?: SeriesSource;
 }
@@ -1157,15 +1163,37 @@ export class Engine {
       }
     } else if (r.status === "ok" && r.curve.baseMint === mint && r.curve.migrated) {
       mine = await this.dammExpectedOut(mint, r.curve.authority, lamports);
+    } else if (r.status === "missing" && this.d.pumpBuys) {
+      mine = await this.pumpExpectedOut(mint, lamports);
     }
     // No curve read: keep the trigger's value rather than none. With none, an uncertain buy whose transaction is not
     // found could adopt nothing and `sell` could not reach its tokens (0.1.3 always had a cap). The adoption still
     // counts only tokens received for SOL since the order, inside its attempt windows. Logged.
     if (mine === null) {
-      if (fromTrigger !== null) this.d.log.warn("expected_fill_unverified", { mint, expectedOutRaw: fromTrigger, why: r.status === "ok" && r.curve.migrated ? "pool not readable at the buy" : "curve not readable at the buy" });
+      if (fromTrigger !== null) this.d.log.warn("expected_fill_unverified", { mint, expectedOutRaw: fromTrigger, why: r.status === "ok" && r.curve.migrated ? "pool not readable at the buy" : r.status === "missing" && this.d.pumpBuys ? "pump venue not quotable at the buy" : "curve not readable at the buy" });
       return fromTrigger;
     }
     return fromTrigger !== null && fromTrigger < mine ? fromTrigger : mine;
+  }
+
+  /**
+   * (0.6.0, pumpBuys) A pump.fun coin's buy: a fresh read of its venue (pump curve, else the canonical PumpSwap pool)
+   * and that venue's buy math. Null when the read fails or the math refuses the buy (why logged).
+   */
+  private async pumpExpectedOut(mint: string, lamports: bigint): Promise<bigint | null> {
+    try {
+      // Decimals only scale the price, which the expected fill does not use.
+      const m = (await readMarkets(this.d.rpc, [{ mint, decimals: 6 }], this.now(), { pump: true })).get(mint);
+      if (!m) return null;
+      const q = buyQuote(m, lamports);
+      if ("why" in q) {
+        this.d.log.warn("pump_buy_unquoted", { mint, why: q.why });
+        return null;
+      }
+      return q.expectedOutRaw;
+    } catch {
+      return null;
+    }
   }
 
   /**
