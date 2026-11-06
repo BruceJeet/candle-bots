@@ -490,9 +490,14 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
   - A refused or unconfirmed subscription is retried with backoff and alerted after 3 failures in a row.
   - A socket that does not open (or does not finish closing) within 15 s is dropped and replaced; one reconnect is
     pending at most.
-  - A subscribed coin whose market price moves more than `silencePct` (1 %) with no trade log for `silenceMs` (45 s)
-    had trades the socket did not deliver (a subscription the server dropped without saying): its bars since its
-    last log are a gap (`logs silent`), alerted, and it is subscribed again; the gap ends when that is confirmed.
+  - A subscribed coin whose market price moves more than `silencePct` (1 %) from its price at the last trade log, and
+    stays moved for `silenceMs` (45 s) with no log, had trades the socket did not deliver (a subscription the server
+    dropped without saying). The clock starts at the move, so a quiet coin's first trade, seen by a price poll a
+    moment before its own log, is not a verdict. Its bars since the last log are a gap (`logs silent`), alerted once
+    per coin, and it is subscribed again in place (no socket rebuild); the gap ends when that is confirmed. A dropped
+    subscription on a coin whose price stays flat is not caught.
+  - Unsubscribes the server leaves unanswered (each may keep a subscription on its side) are counted; past
+    `maxUnansweredUnsubscribes` (20) the socket is rebuilt, which drops them all.
   - A transaction whose log cannot be read to its end (truncated, or an unaccounted invoke stack) makes that minute a
     gap, counted (`partialLogs`) and alerted. So does a trade event whose quote cannot be read. A coin quoted in
     another token is an open gap for as long as it is watched (its SOL volume is never known).

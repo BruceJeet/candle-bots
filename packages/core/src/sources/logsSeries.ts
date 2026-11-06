@@ -45,8 +45,8 @@ export interface LogsSeriesOptions {
   /** A notification more than this many slots behind the chain marks every coin's bars incomplete (about 400 ms a slot). */
   maxSlotLag?: number;
   /**
-   * A subscribed coin whose market price moved more than `silencePct` % since its last trade log, with no log for
-   * `silenceMs`, has trades this socket did not deliver (a subscription the server dropped without saying): its bars
+   * A subscribed coin whose market price moved more than `silencePct` % from its price at the last trade log and stayed
+   * moved for `silenceMs` with no log, has trades this socket did not deliver (a subscription the server dropped without saying): its bars
    * since the last log are a gap ("logs silent"), and it is subscribed again. Defaults 45 s and 1 %.
    */
   silenceMs?: number;
@@ -90,6 +90,8 @@ export class LogsSeries implements SeriesSource {
   private lastLogAt = new Map<string, number>();
   private refPrice = new Map<string, number>();
   private silent = new Set<string>();
+  /** When the price first moved past silencePct since the last log (cleared by a log, or a return within the band). */
+  private movedAt = new Map<string, number>();
   silentResubscribes = 0;
 
   constructor(d: LogsSeriesDeps, o: LogsSeriesOptions = {}) {
@@ -114,6 +116,7 @@ export class LogsSeries implements SeriesSource {
           this.store.gapEnd(m, "logs silent", at);
           this.lastLogAt.set(m, at);
           this.refPrice.delete(m);
+          this.movedAt.delete(m);
         }
       },
       onTrouble: (a, tries, why) => {
@@ -185,6 +188,7 @@ export class LogsSeries implements SeriesSource {
       this.lastLogAt.delete(m);
       this.refPrice.delete(m);
       this.silent.delete(m);
+      this.movedAt.delete(m);
     }
     this.applySockets();
   }
@@ -261,28 +265,42 @@ export class LogsSeries implements SeriesSource {
     }
   }
 
-  /** A subscribed coin whose price moved with no trade log for silenceMs: a gap from its last log, and a new subscription. */
+  /**
+   * A subscribed coin whose price has stayed more than silencePct away from its price at the last log for silenceMs,
+   * with no log since it moved: trades the socket did not deliver. The clock starts when the price first moves (a
+   * quiet coin's first trade after a long silence moves the price a poll before its log arrives: not a verdict). The gap
+   * starts at the last log (honest if the subscription really dropped); the coin is subscribed again in place.
+   */
   private checkSilence(mint: string, price: number): void {
     const addr = this.addrOf.get(mint);
     if (!addr || !this.socket.held().includes(addr)) return;
     const now = this.now();
     if (!this.lastLogAt.has(mint)) this.lastLogAt.set(mint, now);
     const ref = this.refPrice.get(mint);
-    if (ref === undefined) {
+    if (ref === undefined || !(ref > 0)) {
       this.refPrice.set(mint, price);
       return;
     }
     if (this.silent.has(mint)) return;
+    if (Math.abs(price / ref - 1) * 100 <= this.o.silencePct) {
+      this.movedAt.delete(mint); // back within the band: not a move
+      return;
+    }
+    const moved = this.movedAt.get(mint) ?? now;
+    this.movedAt.set(mint, moved);
+    if (now - moved < this.o.silenceMs) return;
     const since = this.lastLogAt.get(mint)!;
-    if (now - since < this.o.silenceMs || !(ref > 0) || Math.abs(price / ref - 1) * 100 <= this.o.silencePct) return;
     this.silent.add(mint);
+    this.movedAt.delete(mint);
     this.silentResubscribes++;
     this.store.gapStart(mint, "logs silent", since);
-    this.d.alerter.raise(`series:logs_silent:${mint}:${since}`, `series: ${mint}'s price moved ${(Math.abs(price / ref - 1) * 100).toFixed(1)} % with no trade log for ${Math.round((now - since) / 1000)} s (a subscription the server dropped?): its bars since then are a gap; subscribing again`);
-    this.d.log.warn("series_logs_silent", { mint, sinceMs: now - since, ref, price });
-    // Drop the address and add it again: a fresh subscription (its "subscribing" gap closes on confirmation).
-    this.socket.set(this.socket.held().filter((a) => a !== addr));
-    this.applySockets();
+    this.d.alerter.raise(`series:logs_silent:${mint}`, `series: ${mint}'s price moved ${(Math.abs(price / ref - 1) * 100).toFixed(1)} % and stayed moved ${Math.round((now - moved) / 1000)} s with no trade log (last ${Math.round((now - since) / 1000)} s ago: a subscription the server dropped?): its bars since its last log are a gap; subscribing again`);
+    this.d.log.warn("series_logs_silent", { mint, movedForMs: now - moved, sinceLogMs: now - since, ref, price });
+    if (this.socket.resubscribe) this.socket.resubscribe(addr);
+    else {
+      this.socket.set(this.socket.held().filter((a) => a !== addr));
+      this.applySockets();
+    }
   }
 
   /** The chain's slot, every slotEveryMs (a failed read leaves the last one; no verdict without one). */
@@ -349,6 +367,7 @@ export class LogsSeries implements SeriesSource {
       // The subscription delivers: the silence clock restarts at the price now.
       this.lastLogAt.set(mint, this.now());
       this.refPrice.delete(mint);
+      this.movedAt.delete(mint);
       if (this.silent.delete(mint)) this.store.gapEnd(mint, "logs silent");
     }
     if (!mint || err) return; // a failed transaction counts no volume

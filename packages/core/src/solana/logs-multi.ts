@@ -6,7 +6,9 @@
  * - `maxSubscriptions` caps what one socket holds (the public RPC held 100 cleanly in a probe on Nov 5 2026; the default
  *   is half that). Addresses past the cap are reported, never silently dropped.
  * - Removing addresses does not wait on logsUnsubscribe (the public RPC left them unanswered in the probe): it sends
- *   them and stops delivering for those addresses. When more than half the held addresses go, the socket is rebuilt.
+ *   them and stops delivering for those addresses. When more than half the held addresses go, the socket is rebuilt;
+ *   so is it once `maxUnansweredUnsubscribes` are left unanswered (each may hold a subscription on the server's side).
+ * - `resubscribe(address)` subscribes one address again in place (no rebuild).
  * - Down (closed, refused, stalled: no message, not even a ping reply, for `stallMs`): reconnect with backoff; every
  *   held address gets a gap from the moment it went down to the moment its subscription is confirmed again.
  * Failed transactions are delivered with their `err` (the caller drops them before counting volume).
@@ -44,12 +46,22 @@ export interface MultiLogsOptions {
   connectTimeoutMs?: number;
   /** Failed subscriptions in a row before onTrouble (default 3). */
   troubleAfter?: number;
+  /**
+   * logsUnsubscribe requests left unanswered past confirmMs (each may leave a server-side subscription toward the
+   * server's cap) before the socket is rebuilt, which drops them all (default 20).
+   */
+  maxUnansweredUnsubscribes?: number;
   now?: () => number;
 }
 
 export interface MultiLogsSocket {
   /** Set the addresses to watch. Returns those held and those left out by the cap. */
   set(addresses: string[]): { held: string[]; overCap: string[] };
+  /**
+   * (0.6.0) Subscribe one held address again on this socket (its old subscription released): no rebuild, no gap for
+   * the others. Its gap ("subscribing") ends on the new confirmation.
+   */
+  resubscribe?(address: string): void;
   held(): string[];
   isUp(): boolean;
   close(): void;
@@ -96,6 +108,10 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
   let ping: ReturnType<typeof setInterval> | null = null;
   let queue: string[] = [];
   let pumping = false;
+  /** logsUnsubscribe request id -> when sent; unanswered ones past confirmMs are counted. */
+  const unsubPending = new Map<number, number>();
+  let unanswered = 0;
+  const maxUnanswered = o.maxUnansweredUnsubscribes ?? 20;
   let connectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   const clearConnectTimer = () => {
@@ -147,6 +163,8 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
     bySub.clear();
     pendingReq.clear();
     late.clear();
+    unsubPending.clear();
+    unanswered = 0;
     for (const t of tries.values()) t.nextAt = 0;
     try {
       ws = new WS(url);
@@ -193,6 +211,17 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
           queue.push(...retry);
           void pumpQueue();
         }
+        // Unsubscribes the server never answered: each may still hold a subscription on its side. Past the limit, a
+        // fresh socket drops them all (every coin gets a short reconnect gap, as on any reconnect).
+        for (const [id, at] of unsubPending) if (t - at > confirmMs) {
+          unsubPending.delete(id);
+          unanswered++;
+        }
+        if (unanswered >= maxUnanswered) {
+          for (const a of want) openGap(a, "reconnect");
+          teardown(`${unanswered} unsubscribes unanswered`);
+          return;
+        }
         if (t - lastMsg > stallMs) {
           // A stalled socket heard nothing since lastMsg: the gap starts there, not now. Torn down at once (a
           // half-open connection's onclose can come minutes late, or never) and reconnected.
@@ -216,6 +245,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       } catch {
         return;
       }
+      if (typeof msg.id === "number" && unsubPending.delete(msg.id)) return; // an unsubscribe answered
       if (typeof msg.id === "number" && pendingReq.has(msg.id)) {
         const p = pendingReq.get(msg.id)!;
         pendingReq.delete(msg.id);
@@ -270,8 +300,11 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
   };
 
   const release = (id: number) => {
+    if (!ws || ws.readyState !== 1) return;
+    const rid = ++reqId;
     try {
-      ws?.send(JSON.stringify({ jsonrpc: "2.0", id: ++reqId, method: "logsUnsubscribe", params: [id] }));
+      ws.send(JSON.stringify({ jsonrpc: "2.0", id: rid, method: "logsUnsubscribe", params: [id] }));
+      unsubPending.set(rid, now());
     } catch {
       /* closing */
     }
@@ -333,13 +366,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
         subId.delete(a);
         if (id !== undefined) bySub.delete(id);
         gapOpen.delete(a);
-        if (id !== undefined && ws && ws.readyState === 1 && !rebuild) {
-          try {
-            ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++reqId, method: "logsUnsubscribe", params: [id] }));
-          } catch {
-            /* closing */
-          }
-        }
+        if (id !== undefined && !rebuild) release(id);
       }
       const added = held.filter((a) => !want.includes(a));
       want = held;
@@ -356,6 +383,24 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
         void pumpQueue();
       }
       return { held, overCap };
+    },
+    resubscribe(a) {
+      if (closed || !want.includes(a)) return;
+      const id = subId.get(a);
+      subId.delete(a);
+      if (id !== undefined) {
+        bySub.delete(id);
+        release(id);
+      }
+      // A request still pending for it: its answer is an orphan to release (late).
+      for (const [rid, p] of [...pendingReq]) if (p.address === a) {
+        pendingReq.delete(rid);
+        late.set(rid, a);
+      }
+      tries.delete(a);
+      openGap(a, "subscribing");
+      if (!queue.includes(a)) queue.push(a);
+      void pumpQueue();
     },
     held: () => [...want],
     isUp: () => up,
