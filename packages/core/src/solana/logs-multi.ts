@@ -155,13 +155,14 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       return;
     }
     // A socket that never opens (and never closes) would leave no ping and no stall check: give up on it. Only while
-    // it is still connecting (readyState 0): a socket that opened or closed has its own handlers, and the timer is
+    // it is still connecting or stuck closing: a socket that opened or closed has its own handlers, and the timer is
     // cleared by both (one live loop: a closed socket's reconnect is already scheduled by its onclose).
     const mine = ws;
     clearConnectTimer();
     connectTimer = setTimeout(() => {
       connectTimer = null;
-      if (!closed && ws === mine && mine.readyState === 0) {
+      // Connecting (0), or stuck closing (2: a close whose onclose never fires; onclose clears this timer when it does).
+      if (!closed && ws === mine && (mine.readyState === 0 || mine.readyState === 2)) {
         for (const a of want) openGap(a, "reconnect", lastMsg);
         teardown("connect timeout");
       }
@@ -226,6 +227,8 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
           bySub.set(msg.result, p.address);
           tries.delete(p.address);
           closeGap(p.address);
+        } else if (subId.has(p.address)) {
+          // A refused retry for an address already subscribed (its late answer came first): nothing is missing.
         } else failed(p.address, `subscription refused${msg.error ? `: ${String(msg.error.message ?? "").slice(0, 80)}` : ""}`);
         return;
       }

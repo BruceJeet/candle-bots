@@ -34,7 +34,8 @@
  *  - curve: tokens = floor(vt * (n - 1) / (vq + n - 1)); PumpSwap: base = floor(B * (n - 1) / (Q + n - 1)) with Q the
  *    quote vault + virtual_quote_reserves before the trade (the programs swap one lamport less than the net);
  *  - fee tier: the market cap before the trade.
- * The buy side refuses (never guesses) what was not reproduced on a real buy: a mayhem-mode or cashback curve or pool,
+ * The buy side refuses (never guesses) what was not reproduced on a real buy: a mayhem-mode curve (real mayhem buys do
+ * not follow this math; tested), a cashback curve or pool, a mayhem-mode pool,
  * a buy past the curve's real tokens (the program then caps it), a quote other than SOL.
  * Not modelled (refused, never guessed): a quote other than SOL, a mayhem-mode PumpSwap pool, a pool whose base is not
  * the coin (the canonical pool always has the coin as base). A mayhem-mode curve's ordinary sell follows the same math.
@@ -302,10 +303,10 @@ const feeOn = (n: bigint, f: PumpFees) => ceilBps(n, f.lpBps) + ceilBps(n, f.pro
 export function pumpBuyNet(lamports: bigint, f: PumpFees): bigint {
   if (lamports <= 0n) return 0n;
   const tot = f.lpBps + f.protocolBps + f.creatorBps;
+  // n + fees(n) >= n * (1e4 + tot) / 1e4, so the answer is at most floor(S * 1e4 / (1e4 + tot)), and at most 3 below it
+  // (one ceil per fee): start there and step down to the first that fits (n + fees(n) only grows with n).
   let n = (lamports * 10_000n) / (10_000n + tot);
-  // floor(S * 1e4 / (1e4 + tot)) is at most 3 above the answer (one ceil per fee); step down to the fit, then up.
   while (n > 0n && n + feeOn(n, f) > lamports) n--;
-  while (n + 1n + feeOn(n + 1n, f) <= lamports) n++;
   return n;
 }
 
