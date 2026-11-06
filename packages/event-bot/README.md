@@ -63,7 +63,18 @@ Any core strategy, or `event` (the phased exit; the bot gives it each coin's eve
 | core exit | any time after `afterMin` | `coreTakeProfit` (a multiple) or `coreMaxHoldHours` after the event: the core goes; without them it is held |
 
 Every phase is a target for the share of the original position kept, so a restart, a failed sell or a late tick
-never sells twice. Without `rungs` and `stopLoss` nothing sells before the hedge.
+never sells twice. Without `rungs` and `stopLoss` nothing sells before the hedge. `stopLoss` acts only in the build-up:
+from the hedge on there is no stop loss, and what is kept rides the event down as well as up, until `coreTakeProfit`
+or `coreMaxHoldHours`.
+
+- **The buy window must close before the hedge:** a config whose window (`entry.untilMin`) reaches the hedge time
+  (`hedgeAtMin`) is refused at load, and a decision at or past the hedge is skipped. A buy then would be sold down at
+  once.
+- **The phases follow the event time in the config as it is now.** An event moved while a coin is held moves its
+  phases. Moved into the past, the phases already due sell at the next tick.
+- **A coin held with no event in the list** (removed or changed in the config) gets no phase at all. The bot alerts
+  on it while it lasts. List it again, or `sell` it by hand.
+- Event times are checked as real dates: Feb 30 or 24:00 are refused, not rolled over.
 
 ## Known limits
 

@@ -16,10 +16,15 @@
  *  - after: from `afterMin` minutes after the event, keep at most `coreKeep` (the moonshot core).
  *  - core: `coreTakeProfit` (a multiple: the core goes) and `coreMaxHoldHours` after the event (the core goes); without
  *    them the core is held.
- * A coin with no event time in `events` holds (and is logged by the bot).
+ * A coin with no event time in `events` holds (the event bot alerts on it while it lasts). The phases follow the event
+ * time the strategy is given now: an event moved in the config moves the phases of a coin already held (moved into the
+ * past, the due phases sell at the next tick). `stopLoss` acts only in the build-up: the event is ridden after it.
  */
 import { create as ladder } from "./ladder.ts";
 import { HOLD, checkParams, multiple, param, StrategyConfigError, type Decision, type ExitStrategy } from "./types.ts";
+
+/** The phases' defaults (the bot's `plan` prints with them). */
+export const EVENT_DEFAULTS = Object.freeze({ hedgeAtMin: 0, hedgeKeep: 0.5, afterMin: 60, coreKeep: 0.2 });
 
 const KEYS = ["events", "rungs", "stopLoss", "hedgeAtMin", "hedgeKeep", "afterMin", "coreKeep", "coreTakeProfit", "coreMaxHoldHours"];
 
@@ -35,10 +40,10 @@ export function create(params: Record<string, unknown>): ExitStrategy {
   const has = (k: string) => params[k] !== undefined;
   const build = has("rungs") ? ladder({ rungs: params.rungs }) : null;
   const sl = has("stopLoss") ? param(params, "stopLoss", "event", { exclusiveMin: 0, max: 1 }) : 0;
-  const hedgeAtMs = param(params, "hedgeAtMin", "event", { min: -10_080, max: 10_080, def: 0 }) * 60_000;
-  const hedgeKeep = param(params, "hedgeKeep", "event", { min: 0, max: 1, def: 0.5 });
-  const afterMs = param(params, "afterMin", "event", { min: -10_080, max: 525_600, def: 60 }) * 60_000;
-  const coreKeep = param(params, "coreKeep", "event", { min: 0, max: 1, def: 0.2 });
+  const hedgeAtMs = param(params, "hedgeAtMin", "event", { min: -10_080, max: 10_080, def: EVENT_DEFAULTS.hedgeAtMin }) * 60_000;
+  const hedgeKeep = param(params, "hedgeKeep", "event", { min: 0, max: 1, def: EVENT_DEFAULTS.hedgeKeep });
+  const afterMs = param(params, "afterMin", "event", { min: -10_080, max: 525_600, def: EVENT_DEFAULTS.afterMin }) * 60_000;
+  const coreKeep = param(params, "coreKeep", "event", { min: 0, max: 1, def: EVENT_DEFAULTS.coreKeep });
   const coreTp = has("coreTakeProfit") ? param(params, "coreTakeProfit", "event", { exclusiveMin: 1 }) : Infinity;
   const coreMaxMs = has("coreMaxHoldHours") ? param(params, "coreMaxHoldHours", "event", { exclusiveMin: 0, max: 87_600 }) * 3_600_000 : Infinity;
   if (coreKeep > hedgeKeep) throw new StrategyConfigError("exit (event): coreKeep is above hedgeKeep (the core is what is left after the hedge)");

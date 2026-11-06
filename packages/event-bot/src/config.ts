@@ -6,7 +6,7 @@
  */
 import { parseConfig as parseCore, loadConfig as loadCore, ConfigError, isObj, only, num, bool, str, strList, type Config as CoreConfig } from "candle-bot-core/config";
 import { asAddress } from "candle-bot-core/solana/base58";
-import { create as eventExit } from "candle-bot-core/strategies/event";
+import { create as eventExit, EVENT_DEFAULTS } from "candle-bot-core/strategies/event";
 
 export { ConfigError } from "candle-bot-core/config";
 
@@ -50,7 +50,11 @@ function parseEvents(raw: unknown): EventItem[] {
     if (asAddress(mint) !== mint) throw new ConfigError(`${k}.mint: "${mint}" is not a Solana address`);
     const at = str(e, "at", k)!;
     // An explicit offset is required: a time without one would read as the machine's local time.
-    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(at)) throw new ConfigError(`${k}.at: an ISO 8601 time with its offset, e.g. "2026-12-01T17:00:00Z"`);
+    const g = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.exec(at);
+    if (!g) throw new ConfigError(`${k}.at: an ISO 8601 time with its offset, e.g. "2026-12-01T17:00:00Z"`);
+    // A date that does not exist (Feb 30, 24:00) would roll over to another day without a word: refused.
+    const [y, mo, d, hh, mm, ss] = [g[1], g[2], g[3], g[4], g[5], g[6] ?? "0"].map(Number);
+    if (mo < 1 || mo > 12 || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate() || hh > 23 || mm > 59 || ss > 59) throw new ConfigError(`${k}.at: "${at}" is not a real date and time`);
     const atMs = Date.parse(at);
     if (!Number.isFinite(atMs)) throw new ConfigError(`${k}.at: not a time`);
     if (seen.has(mint)) throw new ConfigError(`${k}.mint: ${mint} is listed twice (one event per coin)`);
@@ -89,6 +93,9 @@ export function eventTimes(c: Pick<Config, "events">): Record<string, number> {
 function checked(c: Config): Config {
   if (c.exit.strategy === "event") {
     if (c.exit.events !== undefined) throw new ConfigError("config.exit.events: filled from config.events; leave it out");
+    // The buy window must close before the hedge: a buy after it would be sold down at the next exit tick.
+    const hedgeAtMin = typeof c.exit.hedgeAtMin === "number" ? c.exit.hedgeAtMin : EVENT_DEFAULTS.hedgeAtMin;
+    if (-c.entry.untilMin >= hedgeAtMin) throw new ConfigError(`config.entry.untilMin: the buy window closes ${-c.entry.untilMin} min after the event, at or after the hedge (exit.hedgeAtMin ${hedgeAtMin}): a buy then would be sold at once`);
     try {
       const { strategy: _s, ...params } = c.exit;
       eventExit({ ...params, events: eventTimes(c) });

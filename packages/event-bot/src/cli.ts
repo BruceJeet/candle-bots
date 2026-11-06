@@ -9,6 +9,7 @@ import { sellFloor } from "candle-bot-core/market/reader";
 import { args, context as coreContext, die, guardMain, parts, run, sell, status, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { loadConfig, ConfigError, eventTimes, type Config } from "./config.ts";
 import { EventTrigger, windowOf } from "./trigger.ts";
+import { EVENT_DEFAULTS } from "candle-bot-core/strategies/event";
 
 export const HELP = `candle-event-bot: buys coins tied to a dated event (a launch, a keynote, a listing) in a window before it, and exits
 them in phases keyed to the event: ride the build-up, hedge at the event, keep a moonshot core.
@@ -65,8 +66,9 @@ export function plan(cfg: Config, now = Date.now()): Array<Record<string, unknow
     const iso = (t: number) => new Date(t).toISOString();
     const row: Record<string, unknown> = { mint: e.mint, label: e.label, event: iso(e.atMs), buyFrom: iso(w.opens), buyUntil: iso(w.closes), window: now < w.opens ? "not open" : now >= w.closes ? "closed" : "open" };
     if (x.strategy === "event") {
-      row.hedge = `${iso(e.atMs + (x.hedgeAtMin ?? 0) * 60_000)}: keep ${((x.hedgeKeep ?? 0.5) * 100).toFixed(0)} %`;
-      row.core = `${iso(e.atMs + (x.afterMin ?? 60) * 60_000)}: keep ${((x.coreKeep ?? 0.2) * 100).toFixed(0)} %`;
+      const v = { ...EVENT_DEFAULTS, ...x };
+      row.hedge = `${iso(e.atMs + v.hedgeAtMin * 60_000)}: keep ${(v.hedgeKeep * 100).toFixed(0)} %`;
+      row.core = `${iso(e.atMs + v.afterMin * 60_000)}: keep ${(v.coreKeep * 100).toFixed(0)} %`;
       if (x.coreMaxHoldHours !== undefined) row.coreEnds = iso(e.atMs + x.coreMaxHoldHours * 3_600_000);
     }
     return row;

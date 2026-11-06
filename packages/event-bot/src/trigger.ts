@@ -12,6 +12,7 @@ import { decodeMint } from "candle-bot-core/market/mint";
 import { buyQuote, readMarkets, type MarketRead } from "candle-bot-core/market/reader";
 import type { Candidate, PendingInfo, Trigger, TriggerContext, Verdict } from "candle-bot-core/trigger";
 import type { Config, EventItem } from "./config.ts";
+import { EVENT_DEFAULTS } from "candle-bot-core/strategies/event";
 
 export interface TriggerDeps {
   cfg: Config;
@@ -40,9 +41,22 @@ export class EventTrigger implements Trigger {
     this.now = d.now ?? Date.now;
   }
 
+  /** With the event exit: when, after the event, the hedge begins (a buy is never made from then on). */
+  private hedgeAtMs(): number | null {
+    const x = this.d.cfg.exit as Record<string, unknown>;
+    if (x.strategy !== "event") return null;
+    return (typeof x.hedgeAtMin === "number" ? x.hedgeAtMin : EVENT_DEFAULTS.hedgeAtMin) * 60_000;
+  }
+
   poll(ctx: TriggerContext): Candidate[] {
     const now = this.now();
     const out: Candidate[] = [];
+    // A coin held with no event in the list (removed or changed in the config) gets no phase at all: said, while it lasts.
+    const listed = new Set(this.d.cfg.events.map((e) => e.mint));
+    for (const p of ctx.ledger.positions("opening", "open", "exit_stuck")) {
+      if (listed.has(p.mint)) continue;
+      ctx.alerter.raise(`event:no_event:${p.mint}`, `event bot: position ${p.id} ${p.mint} has no event in config.events, so no exit phase applies to it (held until it is listed again or sold by hand)`);
+    }
     for (const e of this.d.cfg.events) {
       const w = windowOf(this.d.cfg, e);
       if (now < w.opens || now >= w.closes) continue;
@@ -73,6 +87,8 @@ export class EventTrigger implements Trigger {
     const now = this.now();
     const w = windowOf(this.d.cfg, e);
     if (now < w.opens || now >= w.closes) return { verdict: "skip", reason: "outside its buy window" };
+    const hedge = this.hedgeAtMs();
+    if (hedge !== null && now >= e.atMs + hedge) return { verdict: "skip", reason: "past the event's hedge" };
     const caps = ctx.caps(c.mint);
     if (caps.paused) return { verdict: "skip", reason: "PAUSE_BUYS" };
     if (caps.entriesForMint >= ctx.cfg.buy.maxPerCoin) return { verdict: "skip", reason: `maxPerCoin ${ctx.cfg.buy.maxPerCoin}` };
