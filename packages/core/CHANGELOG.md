@@ -42,6 +42,8 @@ Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 s
   unsubscribes. `sources/stack` gains `checkWindows()`.
 - **The `event` exit strategy:** a build-up (ladder rungs, stop loss), a hedge at the event, a moonshot core. The
   share kept is a target, as in the ladder. `runtime.parts(..., { exitParams })` merges bot-supplied exit parameters.
+- **`ExecutorDeps.buyFloorMarginBps`** (linked payer): a buy whose Candle floor is under the decision fill less the
+  slippage and a margin is never signed (`BUY_FLOOR`), on the first attempt too.
 - **`dryPricer(..., { pump })`** prices dry buys on pump venues. `runtime.parts(..., { venues })` passes it through.
 
 ## 0.5.0

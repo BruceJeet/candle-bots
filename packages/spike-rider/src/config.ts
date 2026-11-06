@@ -19,8 +19,13 @@ export interface Spike extends SpikeRule {
   /** Linked payer: sign only builds whose programs are known (the core's list plus extraPrograms). Default true. */
   checkPrograms: boolean;
   extraPrograms: string[];
-  /** Linked payer: a sell is never signed below the venue's own expected out less sell.maxSlippageBps and this. */
+  /**
+   * Linked payer: a sell is never signed below the venue's own expected out less sell.maxSlippageBps and this (pump.fun
+   * venues only; on another venue, or when the read fails, only Candle's own floor applies).
+   */
   sellFloorMarginBps: number;
+  /** Linked payer: a buy is never signed with a floor under the decision fill less buy.maxSlippageBps and this. */
+  buyFloorMarginBps: number;
 }
 
 export type Config = CoreConfig & { watchlist: WatchlistSection; series: SeriesSection; spike: Spike };
@@ -29,7 +34,7 @@ function parseSpike(raw: unknown): Spike {
   const w = "config.spike";
   const d = raw === undefined ? {} : raw;
   if (!isObj(d)) throw new ConfigError(`${w}: must be an object`);
-  only(d, ["recentBars", "baselineBars", "minRatio", "minVolumeSol", "minBuyShare", "minRisePct", "maxRisePct", "allowIncomplete", "maxImpactBps", "cooldownMin", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], w);
+  only(d, ["recentBars", "baselineBars", "minRatio", "minVolumeSol", "minBuyShare", "minRisePct", "maxRisePct", "allowIncomplete", "maxImpactBps", "cooldownMin", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps"], w);
   const out: Spike = {
     recentBars: num(d, "recentBars", w, { min: 1, max: 60, int: true, def: 2 }),
     baselineBars: num(d, "baselineBars", w, { min: 3, max: 720, int: true, def: 20 }),
@@ -45,6 +50,7 @@ function parseSpike(raw: unknown): Spike {
     checkPrograms: bool(d, "checkPrograms", w, true),
     extraPrograms: strList(d, "extraPrograms", w, { def: [], address: true })!,
     sellFloorMarginBps: num(d, "sellFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
+    buyFloorMarginBps: num(d, "buyFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
   };
   if (out.minRisePct >= out.maxRisePct) throw new ConfigError(`${w}: minRisePct must be under maxRisePct`);
   return out;

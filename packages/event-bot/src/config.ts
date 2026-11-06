@@ -31,8 +31,13 @@ export interface Entry {
   /** Linked payer: sign only builds whose programs are known (the core's list plus extraPrograms). Default true. */
   checkPrograms: boolean;
   extraPrograms: string[];
-  /** Linked payer: a sell is never signed below the venue's own expected out less sell.maxSlippageBps and this. */
+  /**
+   * Linked payer: a sell is never signed below the venue's own expected out less sell.maxSlippageBps and this (pump.fun
+   * venues only; on another venue, or when the read fails, only Candle's own floor applies).
+   */
   sellFloorMarginBps: number;
+  /** Linked payer: a buy is never signed with a floor under the decision fill less buy.maxSlippageBps and this. */
+  buyFloorMarginBps: number;
 }
 
 export type Config = CoreConfig & { events: EventItem[]; entry: Entry };
@@ -67,7 +72,7 @@ function parseEntry(raw: unknown): Entry {
   const w = "config.entry";
   const d = raw === undefined ? {} : raw;
   if (!isObj(d)) throw new ConfigError(`${w}: must be an object`);
-  only(d, ["fromHours", "untilMin", "maxImpactBps", "buyWithinSec", "retryMin", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], w);
+  only(d, ["fromHours", "untilMin", "maxImpactBps", "buyWithinSec", "retryMin", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps"], w);
   const out: Entry = {
     fromHours: num(d, "fromHours", w, { min: 0.1, max: 8760, def: 72 }),
     untilMin: num(d, "untilMin", w, { min: -10_080, max: 525_600, def: 60 }),
@@ -77,6 +82,7 @@ function parseEntry(raw: unknown): Entry {
     checkPrograms: bool(d, "checkPrograms", w, true),
     extraPrograms: strList(d, "extraPrograms", w, { def: [], address: true })!,
     sellFloorMarginBps: num(d, "sellFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
+    buyFloorMarginBps: num(d, "buyFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
   };
   if (out.untilMin >= out.fromHours * 60) throw new ConfigError(`${w}: the window closes (untilMin before the event) before it opens (fromHours before it)`);
   return out;

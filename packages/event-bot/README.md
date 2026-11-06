@@ -31,8 +31,9 @@ can make, and `plan` prints every phase in clock time to catch it.
 | `maxImpactBps` | 300 | the ticket's impact on the venue (also the retry limit) |
 | `buyWithinSec` | 60 | no attempt is built later than this after the decision |
 | `retryMin` | 10 | a coin skipped in its window is looked at again after this long |
-| `checkPrograms` / `extraPrograms` | true / [] | linked payer: only builds calling known programs are signed |
-| `sellFloorMarginBps` | 200 | linked payer: a sell is never signed below the venue's expected out less `sell.maxSlippageBps` and this |
+| `checkPrograms` / `extraPrograms` | true / [] | linked payer: only builds calling known programs are signed. With payer `main` none of these three checks applies (Candle signs inside the build) |
+| `sellFloorMarginBps` | 200 | linked payer: a sell is never signed below the venue's expected out less `sell.maxSlippageBps` and this. pump.fun venues only: on a Candle curve or DAMM v2 coin, or when the read fails, only Candle's own floor applies |
+| `buyFloorMarginBps` | 200 | linked payer: a buy is never signed with a floor under the decision fill less `buy.maxSlippageBps` and this (the first attempt too) |
 
 Each coin is bought once (`buy.maxPerCoin`, default 1) with a ticket of `buy.sol`. The coin's venue is read fresh at
 the decision: the Candle curve, its DAMM v2 pool, the pump.fun curve or the canonical PumpSwap pool. The buy must be
@@ -71,7 +72,8 @@ or `coreMaxHoldHours`.
   (`hedgeAtMin`) is refused at load, and a decision at or past the hedge is skipped. A buy then would be sold down at
   once.
 - **The phases follow the event time in the config as it is now.** An event moved while a coin is held moves its
-  phases. Moved into the past, the phases already due sell at the next tick.
+  phases. Moved into the past, the phases already due sell at the next tick. Edit an event's time only while flat in
+  that coin, unless moving its phases is what you want.
 - **A coin held with no event in the list** (removed or changed in the config) gets no phase at all. The bot alerts
   on it while it lasts. List it again, or `sell` it by hand.
 - Event times are checked as real dates: Feb 30 or 24:00 are refused, not rolled over.

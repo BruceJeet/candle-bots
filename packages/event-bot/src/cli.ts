@@ -46,7 +46,7 @@ export async function makeEngine(ctx: Ctx, ledger: Ledger, d: { now?: () => numb
   const floor = linked ? sellFloor(ctx.rpc, c.sell.maxSlippageBps, c.entry.sellFloorMarginBps) : undefined;
   const { strategy, alerter, executor } = await parts(ctx, ledger, {
     maxBuyImpactBps: c.entry.maxImpactBps,
-    executor: (x) => new Executor({ ...x, dammBuys: true, pumpBuys: true, ...(known ? { knownPrograms: known } : {}), ...(floor ? { sellFloor: floor } : {}) }),
+    executor: (x) => new Executor({ ...x, dammBuys: true, pumpBuys: true, ...(known ? { knownPrograms: known } : {}), ...(floor ? { sellFloor: floor, buyFloorMarginBps: c.entry.buyFloorMarginBps } : {}) }),
     venues: { pump: true },
     ...(c.exit.strategy === "event" ? { exitParams: { events: eventTimes(c) } } : {}),
     ...(d.now ? { now: d.now } : {}),

@@ -100,10 +100,17 @@ export interface ExecutorDeps {
   /**
    * (0.5.0) Linked payer, sells only: the least SOL (lamports) a sell of `amountRaw` of `mint` may be built to accept,
    * from the bot's own fresh read of the venue (market/reader `sellFloor`), or null for no check. A build whose
-   * minOutRaw is under it is never signed (rejected, SELL_FLOOR, alerted; the next exit is a new order). A read that
-   * fails answers null: Candle's own floor still applies.
+   * minOutRaw is under it is never signed (rejected, SELL_FLOOR, alerted; the next exit is a new order). The reader
+   * answers only for pump.fun venues (pump curve, PumpSwap); on a Candle curve or DAMM v2 coin, or when the read fails,
+   * it answers null and only Candle's own floor applies.
    */
   sellFloor?: (mint: string, amountRaw: bigint, decimals: number) => Promise<bigint | null>;
+  /**
+   * (0.6.0) Linked payer, buys: a build whose minOutRaw is under the order's decision fill less the order's slippage
+   * and this many bps is never signed (rejected, BUY_FLOOR, alerted). The decision fill is the engine's checked value at
+   * booking, else the first build's quote. Unset: no check. Payer main cannot be checked: Candle signs inside the build.
+   */
+  buyFloorMarginBps?: number;
 }
 
 /** (0.6.0) A pump venue read that is incomplete (retry), not a decoded state that refuses the buy. */
@@ -186,7 +193,7 @@ export class Executor {
     if (typeof d.maxBuyImpactBps !== "number" || !Number.isFinite(d.maxBuyImpactBps) || d.maxBuyImpactBps < 0) throw new Error("Executor: maxBuyImpactBps must be a number >= 0");
     // (0.4.0) A drift check holds every retry to the decision fill: the ledger keeps it in its own column, added
     // only when a check is on (no drift check: the ledger is never migrated, 0.3.1 behavior).
-    if (d.cfg.retry.maxPriceDriftBps !== undefined || d.dammBuys || d.pumpBuys) d.ledger.ensureDecisionColumn();
+    if (d.cfg.retry.maxPriceDriftBps !== undefined || d.dammBuys || d.pumpBuys || d.buyFloorMarginBps !== undefined) d.ledger.ensureDecisionColumn();
     this.d = d;
     this.now = d.now ?? Date.now;
     this.random = d.random ?? Math.random;
@@ -577,6 +584,21 @@ export class Executor {
           this.d.ledger.endAttempt(att, this.now(), "rejected", "SELL_FLOOR", JSON.stringify({ minOutRaw: String(built.minOutRaw ?? ""), floor: floor.toString() }));
           this.alert(`order:${o.id}:SELL_FLOOR`, `order ${o.id} sell ${pos.mint}: not signed, Candle's floor ${String(built.minOutRaw ?? "none")} is under ${floor} lamports (the venue's own price less slippage)`);
           return this.apply(o, pos, { kind: "rejected", code: "SELL_FLOOR", detail: `minOut ${String(built.minOutRaw ?? "none")} < ${floor}` });
+        }
+      }
+      if (o.side === "buy" && this.d.buyFloorMarginBps !== undefined) {
+        // (0.6.0) The first attempt too (the venue recheck only runs on retries): Candle's floor must not sit under the
+        // decision fill less the order's slippage and a margin.
+        const decision = decisionOf(this.d.ledger.order(o.id) ?? o);
+        const minOut = /^\d+$/.test(String(built.minOutRaw ?? "")) ? BigInt(String(built.minOutRaw)) : null;
+        if (decision !== null) {
+          const off = Math.min(10_000, Math.max(0, Math.round(o.slippage_bps + this.d.buyFloorMarginBps)));
+          const floor = (decision * BigInt(10_000 - off)) / 10_000n;
+          if (minOut === null || minOut < floor) {
+            this.d.ledger.endAttempt(att, this.now(), "rejected", "BUY_FLOOR", JSON.stringify({ minOutRaw: String(built.minOutRaw ?? ""), floor: floor.toString(), decision: decision.toString() }));
+            this.alert(`order:${o.id}:BUY_FLOOR`, `order ${o.id} buy ${pos.mint}: not signed, Candle's floor ${String(built.minOutRaw ?? "none")} is under ${floor} (the decision fill ${decision} less ${off} bps)`);
+            return this.apply(o, pos, { kind: "rejected", code: "BUY_FLOOR", detail: `minOut ${String(built.minOutRaw ?? "none")} < ${floor}` });
+          }
         }
       }
       // (0.3.0) STOP while the build was under way: nothing is signed or submitted. The built transaction is dropped

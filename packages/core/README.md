@@ -438,6 +438,16 @@ signed, the coin's venue is read again and its own expected out computed (pump.f
 next exit is a new order. A read that fails, or a venue without the math (Candle's curve, DAMM v2), means no check:
 Candle's own floor still applies. The embedded wallet executes inside the build, so this cannot run there.
 
+(0.6.0) The reader's `sellFloor` answers only for pump.fun venues (the pump curve, PumpSwap). On a Candle curve or DAMM
+v2 coin, or when the read fails, it answers null, and only Candle's own floor applies.
+
+## A floor on buys (opt-in, linked payer)
+
+`ExecutorDeps.buyFloorMarginBps` (0.6.0): a buy build whose `minOutRaw` is under the order's decision fill, less the
+order's slippage and this margin, is never signed (rejected, `BUY_FLOOR`, alerted). This covers the first attempt too;
+the venue rechecks only run on retries. The decision fill is the engine's checked value at booking, else the first
+build's quote. With payer `main` it does not apply, since Candle signs inside the build.
+
 ## Holders of a coin (polled)
 
 `sources/holders` (0.5.0): `HolderPoller(rpc).snapshot(mint)` gives the wallets among the 20 largest token accounts

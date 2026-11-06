@@ -37,8 +37,9 @@ The `spike` rule, on ended bars:
 | `maxImpactBps` | 300 | the ticket's impact on the venue (also the retry limit) |
 | `cooldownMin` | 60 | a coin is not looked at again for this long after a signal |
 | `buyWithinSec` | 20 | no attempt is built later than this after the decision |
-| `checkPrograms` / `extraPrograms` | true / [] | linked payer: only builds calling known programs are signed |
-| `sellFloorMarginBps` | 200 | linked payer: a sell is never signed below the venue's expected out less `sell.maxSlippageBps` and this |
+| `checkPrograms` / `extraPrograms` | true / [] | linked payer: only builds calling known programs are signed. With payer `main` none of these three checks applies (Candle signs inside the build) |
+| `sellFloorMarginBps` | 200 | linked payer: a sell is never signed below the venue's expected out less `sell.maxSlippageBps` and this. pump.fun venues only: on a Candle curve or DAMM v2 coin, or when the read fails, only Candle's own floor applies |
+| `buyFloorMarginBps` | 200 | linked payer: a buy is never signed with a floor under the decision fill less `buy.maxSlippageBps` and this (the first attempt too) |
 
 A signal is checked again at the decision, then the coin's venue is read fresh. Only a pump.fun curve or the canonical
 PumpSwap pool is bought, and only when the venue's own buy math quotes the ticket. Mayhem-mode and cashback venues,
