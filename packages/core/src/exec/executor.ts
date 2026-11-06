@@ -108,6 +108,8 @@ export interface ExecutorDeps {
 
 /** (0.6.0) A pump venue read that is incomplete (retry), not a decoded state that refuses the buy. */
 const UNREAD = new Set(["vault_missing", "pump_fees_unread", "supply_unread", "no_venue", "migrating"]);
+/** (0.6.0) How long a pumpBuys retry waits on a venue it cannot read before it is refused (VENUE). */
+export const PUMP_UNREAD_MAX_MS = 30 * 60_000;
 
 type Outcome =
   | { kind: "filled"; fill: Fill | null; result?: any; source: QtySource }
@@ -224,6 +226,8 @@ export class Executor {
    * one process that no longer lets a second claim in). The lease still covers a restart after a crash.
    */
   private live = new Map<number, { mint: string; side: "buy" | "sell" | "settle"; done: Promise<void> }>();
+  /** (0.6.0) pumpBuys: when each order's venue first failed to read (cleared on a read that answers). */
+  private pumpUnreadSince = new Map<number, number>();
   /** Coins with a live attempt or reserved by the engine (reserveMint): at most one of either per coin. */
   private busy = new Map<string, "attempt" | "reserved">();
   /** Bumped whenever an attempt on the coin starts or ends (the engine's surplus check skips a coin that moved). */
@@ -724,11 +728,24 @@ export class Executor {
     // Only a decoded state that says no refuses. Anything not read (a vault in the second round trip, a fee config or
     // mint that did not read or decode, a pool or curve absent for a moment, a migration in progress) is a read failure:
     // retried with backoff and alerted at 5 and 20 in a row, like a failed curve read.
-    if (!m) return this.readFailed(o, pos, "VENUE_READ", "pump venue not read");
-    if (m.problem && UNREAD.has(m.problem)) return this.readFailed(o, pos, "VENUE_READ", `pump venue not read (${m.problem})`);
+    // A state that stays unread (an old coin whose pool is elsewhere, a migration that never ends) must not hold the
+    // order forever on a bot with no deadline: refused once its venue has been unread for PUMP_UNREAD_MAX_MS (kept per
+    // order in this process: a restart starts the clock again).
+    const unread = (why: string): Outcome => {
+      const since = this.pumpUnreadSince.get(o.id) ?? this.now();
+      this.pumpUnreadSince.set(o.id, since);
+      if (this.now() - since >= PUMP_UNREAD_MAX_MS) {
+        this.pumpUnreadSince.delete(o.id);
+        return { kind: "rejected", code: "VENUE", detail: `pump venue not read for ${Math.round((this.now() - since) / 60_000)} min (${why})` };
+      }
+      return this.readFailed(o, pos, "VENUE_READ", `pump venue not read (${why})`);
+    };
+    if (!m) return unread("no read");
+    if (m.problem && UNREAD.has(m.problem)) return unread(m.problem);
     if (m.venue !== "pump-curve" && m.venue !== "pumpswap") return { kind: "rejected", code: "VENUE", detail: `no pump venue to buy on (${m.problem ?? m.venue})` };
     const q = buyQuote(m, BigInt(o.amount_raw));
-    if ("why" in q && UNREAD.has(q.why)) return this.readFailed(o, pos, "VENUE_READ", `pump venue not read (${q.why})`);
+    if ("why" in q && UNREAD.has(q.why)) return unread(q.why);
+    this.pumpUnreadSince.delete(o.id);
     if ("why" in q) return { kind: "rejected", code: "VENUE", detail: q.why };
     if (q.impactBps > this.d.maxBuyImpactBps) return { kind: "rejected", code: "IMPACT", detail: `impact ${q.impactBps} bps on retry (${q.venue})` };
     // As on DAMM v2: the ticket's own impact falls as the price rises, so the ticket must still buy the decision fill

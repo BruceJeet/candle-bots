@@ -31,7 +31,11 @@ Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 s
   skipped before any attempt, and the expected fill is the venue's own quote.
 - **`sources/stack`:** the shared `watchlist` / `series` config sections and `seriesStack()`. The scanner uses them,
   with the same keys and defaults.
-- **Series-aware exits:** `MarketView.series` (opt-in, `EngineDeps.exitSeries`) and the `fade` exit strategy.
+- **Series-aware exits:** `MarketView.series` (opt-in, `EngineDeps.exitSeries`) and the `fade` exit strategy. Its
+  series rules read only bars after entry, and need `stopLoss` or `maxHoldMin` with them.
+- **A curve's own `creator_fee_bps`** (byte 115) is the creator fee when larger than the tier's, on buys and sells. A
+  value over 1000 bps is refused.
+- **An unread pump venue on a pumpBuys retry** is refused after 30 min (`PUMP_UNREAD_MAX_MS`).
 - **`dryPricer(..., { pump })`** prices dry buys on pump venues. `runtime.parts(..., { venues })` passes it through.
 
 ## 0.5.0

@@ -7,6 +7,8 @@ import { Ledger } from "candle-bot-core/ledger";
 import { Alerter } from "candle-bot-core/alerts";
 import { args, context as coreContext, die, guardMain, parts, run, sell, status, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { SeriesBuyTrigger } from "candle-bot-core/seriesBuy";
+import { KNOWN_PROGRAMS } from "candle-bot-core/exec/trader";
+import { sellFloor } from "candle-bot-core/market/reader";
 import { seriesStack } from "candle-bot-core/sources/stack";
 import type { TriggerContext } from "candle-bot-core/trigger";
 import { loadConfig, ConfigError, type Config } from "./config.ts";
@@ -46,7 +48,12 @@ export function makeTrigger(ctx: Ctx, alerter: Alerter, d: { now?: () => number;
 
 /** The engine: pump.fun buys checked on their own venue (engine and executor), the series given to the exit too. */
 export async function makeEngine(ctx: Ctx, ledger: Ledger, d: { now?: () => number; fetch?: typeof fetch; socket?: any } = {}) {
-  const { strategy, alerter, executor } = await parts(ctx, ledger, { maxBuyImpactBps: ctx.cfg.dip.maxImpactBps, executor: (x) => new Executor({ ...x, pumpBuys: true }), venues: { pump: true } });
+  const c = ctx.cfg;
+  // Linked payer: only known programs are signed, and a sell is never signed below the venue's own expected out.
+  const linked = c.payer === "linked";
+  const known = linked && c.dip.checkPrograms ? new Set([...KNOWN_PROGRAMS, ...c.dip.extraPrograms]) : undefined;
+  const floor = linked ? sellFloor(ctx.rpc, c.sell.maxSlippageBps, c.dip.sellFloorMarginBps) : undefined;
+  const { strategy, alerter, executor } = await parts(ctx, ledger, { maxBuyImpactBps: c.dip.maxImpactBps, executor: (x) => new Executor({ ...x, pumpBuys: true, ...(known ? { knownPrograms: known } : {}), ...(floor ? { sellFloor: floor } : {}) }), venues: { pump: true } });
   const { trigger, series } = makeTrigger(ctx, alerter, d);
   const engine = new Engine({ cfg: ctx.cfg, ledger, trigger, executor, strategy, rpc: ctx.rpc, log: ctx.log, alerter, series, exitSeries: true, pumpBuys: true, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   return { engine, trigger };

@@ -31,6 +31,8 @@ The `dip` rule, on ended bars:
 | `maxImpactBps` | 300 | the ticket's impact on the venue (also the retry limit) |
 | `cooldownMin` | 60 | a coin is not looked at again for this long after a signal |
 | `buyWithinSec` | 30 | no attempt is built later than this after the decision |
+| `checkPrograms` / `extraPrograms` | true / [] | linked payer: only builds calling known programs are signed |
+| `sellFloorMarginBps` | 200 | linked payer: a sell is never signed below the venue's expected out less `sell.maxSlippageBps` and this |
 
 A signal is checked again at the decision, then the coin's venue is read fresh. Only a pump.fun curve or the canonical
 PumpSwap pool is bought, and only when the venue's own buy math quotes the ticket. Mayhem-mode and cashback venues,
@@ -50,7 +52,8 @@ Any core strategy (`tpsl`, `trail`, `ladder`, `time`, `hold`), or `fade`, which 
 
 `fade` sells everything on the first of: take profit or stop loss (multiples of entry), the last `fadeRecentBars`
 trading under `fadeBelowRatio` of the `fadeBaselineBars` before them, the last close `dropFromHighPct` under the high
-of the bars since entry, or `maxHoldMin`. The series rules act only on complete bars and after `minHoldMin`.
+of the bars since entry, or `maxHoldMin`. The series rules act only on complete bars, on bars after entry, and
+after `minHoldMin`. They hold on a gap, so with them `stopLoss` or `maxHoldMin` is required.
 
 ## Known limits
 

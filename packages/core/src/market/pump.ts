@@ -88,8 +88,9 @@ export interface PumpCurve {
   /** The curve's quote mint; WSOL for SOL (the field all zero, or absent on older curves). */
   quoteMint: string;
   /**
-   * (0.6.0) The curve's own creator fee (bps, u64 @115; 0 when unset or on a shorter curve). Real trades on curves
-   * with 100, 150 and 300 here paid that creator fee, not the tier's: the math uses the larger of the two.
+   * (0.6.0) The curve's own creator fee (bps, u64 @115; 0 when unset or on a shorter curve). Real trades on three
+   * curves with 100, 150 and 300 here (all quoted in another token, so the SOL math refuses them today) paid that
+   * creator fee, not the tier's: the math uses the larger of the two, and refuses a value over 1000.
    */
   creatorFeeBps: bigint;
 }
@@ -116,6 +117,8 @@ export function decodePumpCurve(v: AccountValue | null | undefined): PumpCurve {
 export function pumpCurveFees(c: PumpCurve, cfg: FeeConfig): PumpFees {
   const t = feesAt(cfg, pumpCurveMcap(c));
   const own = c.creatorFeeBps ?? 0n;
+  // A value no real curve shows (over 10 %) is not trusted: the venue's math is refused (no expected out), never guessed.
+  if (own > 1_000n) throw new DecodeError("pump_creator_fee_unread");
   return own > t.creatorBps ? { ...t, creatorBps: own } : t;
 }
 

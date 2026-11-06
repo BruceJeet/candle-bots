@@ -312,6 +312,10 @@ each read just before):
   SOL vault plus `virtual_quote_reserves` before the trade (the programs swap one lamport less than the net);
 - the fee tier at the market cap before the trade.
 
+A curve's own `creator_fee_bps` (byte 115), when larger than the tier's creator fee, is the creator fee, on buys and
+sells. Real trades on three such curves (100, 150 and 300 bps, all quoted in another token) paid it. A value over
+1000 bps is not trusted: the math refuses it, and the sell floor then falls back to Candle's own floor.
+
 Refused rather than guessed: a mayhem-mode curve (two real exact-in buys there follow this math, but other trades on
 the same curve paid no fee, so the fee is not known in advance), a cashback curve or pool, a buy past the curve's real
 tokens, and everything the sell side refuses. On a curve with no creator set the creator fee is still counted (a lower
@@ -325,7 +329,9 @@ A bot that buys pump.fun coins turns on **`pumpBuys`** in both places:
 - `ExecutorDeps.pumpBuys`: a retry of such a buy reads the venue fresh and is refused when the ticket's impact there
   is over `maxBuyImpactBps` (`IMPACT`), or when it would buy less than the order's decision fill less
   `retry.maxPriceDriftBps` (`maxBuyImpactBps` when that is unset; `IMPACT`). An order with no decision fill, or a venue
-  the math refuses, is refused (`VENUE`); a failed read (the venue, or a PumpSwap vault) is retried. Without `pumpBuys` such a retry is refused
+  the math refuses, is refused (`VENUE`). A read that does not answer (the venue, a PumpSwap vault, a fee config, the
+  mint, a pool or curve absent for a moment, a migration) is retried, and refused (`VENUE`) once the venue has been
+  unread for 30 min (`PUMP_UNREAD_MAX_MS`). Without `pumpBuys` such a retry is refused
   (`CURVE`), as before.
 
 The PumpSwap virtual quote reserve moves between trades, so an expected fill is only as good as its read: both checks
@@ -558,8 +564,9 @@ It sells everything on the first of:
   count);
 - `maxHoldMin`.
 
-The series rules act only on complete bars and after `minHoldMin`. With no series they hold, and the price rules
-still apply.
+The series rules act only on complete bars and after `minHoldMin`. The fade rule's recent bars and the drop rule's
+window are bars wholly after entry. With no series, or a gap, they hold and the price rules still apply, so with a
+series rule `stopLoss` or `maxHoldMin` is required.
 
 ## Watch-only bots
 

@@ -3,7 +3,7 @@
  * their trade-log series, shared with the scanner) and `spike` (the rule and the entry limits). Unknown keys are refused
  * at every level.
  */
-import { parseConfig as parseCore, loadConfig as loadCore, ConfigError, isObj, only, num, bool, type Config as CoreConfig } from "candle-bot-core/config";
+import { parseConfig as parseCore, loadConfig as loadCore, ConfigError, isObj, only, num, bool, strList, type Config as CoreConfig } from "candle-bot-core/config";
 import { parseSeriesSection, parseWatchlistSection, type SeriesSection, type WatchlistSection } from "candle-bot-core/sources/stack";
 import type { SpikeRule } from "./rule.ts";
 
@@ -16,6 +16,11 @@ export interface Spike extends SpikeRule {
   cooldownMin: number;
   /** No attempt of a buy is built more than this many seconds after the decision. */
   buyWithinSec: number;
+  /** Linked payer: sign only builds whose programs are known (the core's list plus extraPrograms). Default true. */
+  checkPrograms: boolean;
+  extraPrograms: string[];
+  /** Linked payer: a sell is never signed below the venue's own expected out less sell.maxSlippageBps and this. */
+  sellFloorMarginBps: number;
 }
 
 export type Config = CoreConfig & { watchlist: WatchlistSection; series: SeriesSection; spike: Spike };
@@ -24,7 +29,7 @@ function parseSpike(raw: unknown): Spike {
   const w = "config.spike";
   const d = raw === undefined ? {} : raw;
   if (!isObj(d)) throw new ConfigError(`${w}: must be an object`);
-  only(d, ["recentBars", "baselineBars", "minRatio", "minVolumeSol", "minBuyShare", "minRisePct", "maxRisePct", "allowIncomplete", "maxImpactBps", "cooldownMin", "buyWithinSec"], w);
+  only(d, ["recentBars", "baselineBars", "minRatio", "minVolumeSol", "minBuyShare", "minRisePct", "maxRisePct", "allowIncomplete", "maxImpactBps", "cooldownMin", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps"], w);
   const out: Spike = {
     recentBars: num(d, "recentBars", w, { min: 1, max: 60, int: true, def: 2 }),
     baselineBars: num(d, "baselineBars", w, { min: 3, max: 720, int: true, def: 20 }),
@@ -37,6 +42,9 @@ function parseSpike(raw: unknown): Spike {
     maxImpactBps: num(d, "maxImpactBps", w, { min: 0, max: 10_000, def: 300 }),
     cooldownMin: num(d, "cooldownMin", w, { min: 1, max: 10_080, int: true, def: 60 }),
     buyWithinSec: num(d, "buyWithinSec", w, { min: 5, max: 3600, int: true, def: 20 }),
+    checkPrograms: bool(d, "checkPrograms", w, true),
+    extraPrograms: strList(d, "extraPrograms", w, { def: [], address: true })!,
+    sellFloorMarginBps: num(d, "sellFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
   };
   if (out.minRisePct >= out.maxRisePct) throw new ConfigError(`${w}: minRisePct must be under maxRisePct`);
   return out;

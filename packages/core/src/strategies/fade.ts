@@ -7,9 +7,10 @@
  *  - maxHoldMin: minutes since entry.
  *   { "strategy": "fade", "stopLoss": 0.7, "fadeRecentBars": 3, "fadeBaselineBars": 10, "fadeBelowRatio": 0.3,
  *     "dropWindowBars": 15, "dropFromHighPct": 25, "minHoldMin": 3, "maxHoldMin": 240 }
- * The series rules act only on complete bars (no gap) and only after `minHoldMin`; with no series (the bot did not opt
- * in, or the coin is not watched) or a gap they hold, and the price rules (takeProfit, stopLoss, maxHoldMin) still
- * apply. Needs EngineDeps.exitSeries and a series that keeps the held coin watched.
+ * The series rules act only on complete bars (no gap) and only after `minHoldMin`; the fade rule's recent bars and the
+ * drop rule's window are bars wholly after entry. With no series (the bot did not opt in, or the coin is not watched)
+ * or a gap they hold, and the price rules still apply: with a series rule, stopLoss or maxHoldMin is required. Needs
+ * EngineDeps.exitSeries and a series that keeps the held coin watched.
  */
 import { fallFromHigh, volumeVsBaseline } from "../market/indicators.ts";
 import { HOLD, checkParams, multiple, param, StrategyConfigError, type ExitStrategy } from "./types.ts";
@@ -33,6 +34,8 @@ export function create(params: Record<string, unknown>): ExitStrategy {
   if (fade && (!Number.isInteger(fr) || !Number.isInteger(fb))) throw new StrategyConfigError("exit (fade): fadeRecentBars and fadeBaselineBars are whole bars");
   if (drop && !Number.isInteger(dw)) throw new StrategyConfigError("exit (fade): dropWindowBars is whole bars");
   if (tp === Infinity && sl === 0 && !fade && !drop && maxHoldMs === Infinity) throw new StrategyConfigError("exit (fade): set at least one of takeProfit, stopLoss, the fade rule, the drop rule, maxHoldMin");
+  // The series rules hold on a gap or an unwatched coin: with them, a price rule must be able to end the position.
+  if ((fade || drop) && sl === 0 && maxHoldMs === Infinity) throw new StrategyConfigError("exit (fade): the series rules hold while the series is unknown; set stopLoss or maxHoldMin too");
   return {
     name: "fade",
     needsBasis: tp !== Infinity || sl > 0,
@@ -45,9 +48,12 @@ export function create(params: Record<string, unknown>): ExitStrategy {
       if (held < minHoldMs) return HOLD;
       const v = m.series;
       if (!v) return HOLD;
-      // Only bars wholly after entry: a fade or a drop the position bought into is not a reason to sell.
-      const bars = v.bars.filter((b) => b.t >= p.openedAtMs - (p.openedAtMs % v.barMs) + v.barMs || b === v.bars[v.bars.length - 1]);
-      if (fade) {
+      // The drop rule reads only bars wholly after entry (a fall the position bought into is not a reason to sell). The
+      // fade rule's baseline may be before entry (the move it bought), but its recent bars must all be after entry.
+      const firstAfter = p.openedAtMs - (p.openedAtMs % v.barMs) + v.barMs;
+      const bars = v.bars.filter((b) => b.t >= firstAfter || b === v.bars[v.bars.length - 1]);
+      const endedAfter = bars.length - 1;
+      if (fade && endedAfter >= fr) {
         const r = volumeVsBaseline(v.bars, fr, fb);
         if (r && r.complete && r.value < fbr) return { action: "sell", fraction: 1, reason: `volume_fade ${r.value.toFixed(3)}x baseline` };
       }
