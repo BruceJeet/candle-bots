@@ -14,8 +14,13 @@ candle-spike-rider run  --config examples/dry.json             # dry run: decide
 - `watchlist`: a fixed list of mints, a Candle feed bucket (`onfire`, `new`, `graduated`, `bluechip`, `finalstretch`,
   by 5 min volume), or both, within `maxCoins`. Coins this bot holds stay watched while it holds them.
 - `series`: each watched coin's trade logs on one websocket (pump.fun curve or canonical PumpSwap pool), folded into
-  1 min bars of price and SOL volume. A gap (a reconnect, a stall, a lagging socket, an unreadable log) is unknown,
-  never zero, and the bars it touches are not complete. See the core README.
+  1 min bars of price and SOL volume. A trade lands in the bar of the moment the bot received it, not its block
+  time (seconds apart; more under a lag, which is then a gap). A gap (a reconnect, a stall, a lagging socket, an
+  unreadable log, a subscription that went silent while the price moved) is unknown, never zero, and the bars it
+  touches are not complete. Nothing is backfilled: a coin needs the rule's whole window watched (`windowBars`, or the
+  spike's `recentBars + baselineBars`, complete minutes) before it can fire, so a coin that just joined from the feed
+  waits that long. Every window must fit in `series.maxBars` (refused at load). The Candle feed only picks which coins
+  to watch; its own values are never bars. See the core README.
 
 ## When it buys
 
@@ -53,7 +58,7 @@ Any core strategy (`tpsl`, `trail`, `ladder`, `time`, `hold`), or `fade`, which 
 
 `fade` sells everything on the first of: take profit or stop loss (multiples of entry), the last `fadeRecentBars`
 trading under `fadeBelowRatio` of the `fadeBaselineBars` before them, the last close `dropFromHighPct` under the high
-of the bars since entry, or `maxHoldMin`. The series rules act only on complete bars, on bars after entry, and
+of the last `dropWindowBars` bars after entry (the entry bar and earlier never count), or `maxHoldMin`. The series rules act only on complete bars, on bars after entry, and
 after `minHoldMin`. They hold on a gap, so with them `stopLoss` or `maxHoldMin` is required.
 
 ## Known limits
@@ -63,6 +68,8 @@ after `minHoldMin`. They hold on a gap, so with them `stopLoss` or `maxHoldMin` 
 - Volume comes from pump.fun and PumpSwap trade logs only (Candle curve and DAMM v2 coins have no volume here, and are
   never bought). The public RPC holds about 100 log subscriptions; a private RPC is better for a large watchlist.
 - Sparse gaps (an unreadable log here and there) can make long stretches of bars read incomplete; the rule then waits.
+- Spend: `buy.lifetimeSol` counts tickets only. Candle's platform fee (0.25 % a side), network fees and about
+  0.002 SOL of token-account rent per new coin come on top: fund the wallet with some room above `lifetimeSol`.
 
 ## License
 

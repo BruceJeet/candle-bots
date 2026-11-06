@@ -490,6 +490,9 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
   - A refused or unconfirmed subscription is retried with backoff and alerted after 3 failures in a row.
   - A socket that does not open (or does not finish closing) within 15 s is dropped and replaced; one reconnect is
     pending at most.
+  - A subscribed coin whose market price moves more than `silencePct` (1 %) with no trade log for `silenceMs` (45 s)
+    had trades the socket did not deliver (a subscription the server dropped without saying): its bars since its
+    last log are a gap (`logs silent`), alerted, and it is subscribed again; the gap ends when that is confirmed.
   - A transaction whose log cannot be read to its end (truncated, or an unaccounted invoke stack) makes that minute a
     gap, counted (`partialLogs`) and alerted. So does a trade event whose quote cannot be read. A coin quoted in
     another token is an open gap for as long as it is watched (its SOL volume is never known).
@@ -545,8 +548,8 @@ buyer and the spike rider are built on it.
   `pumpBuys`. `runtime.parts(..., { venues })` prices dry runs on the same venues.
 
 `sources/stack` holds the `watchlist` and `series` config sections every series bot shares
-(`parseWatchlistSection`, `parseSeriesSection`), and `seriesStack()`, which builds the LogsSeries, the Candle feed
-and the Watchlist from them.
+(`parseWatchlistSection`, `parseSeriesSection`), `seriesStack()`, which builds the LogsSeries, the Candle feed and
+the Watchlist from them, and `checkWindows()`, which refuses a rule or fade window that cannot fit in `series.maxBars`.
 
 **Series-aware exits:** with `EngineDeps.exitSeries` (and a `series`), the exit strategy gets `MarketView.series`:
 the coin's view, or null when it is not watched. Without it the field is absent and `MarketView` is as before. The
@@ -560,8 +563,8 @@ the coin's view, or null when it is not watched. Without it the field is absent 
 It sells everything on the first of:
 - take profit or stop loss (multiples of entry);
 - volume fade: the last `fadeRecentBars` trading under `fadeBelowRatio` of the `fadeBaselineBars` before them;
-- a drop: the last close `dropFromHighPct` under the high of the bars since entry (a fall it bought into does not
-  count);
+- a drop: the last close `dropFromHighPct` under the high of the last `dropWindowBars` bars after entry (the entry
+  bar and earlier never count, so a fall it bought into is no reason to sell);
 - `maxHoldMin`.
 
 The series rules act only on complete bars and after `minHoldMin`. The fade rule's recent bars and the drop rule's

@@ -4,7 +4,7 @@
  * at every level.
  */
 import { parseConfig as parseCore, loadConfig as loadCore, ConfigError, isObj, only, num, bool, strList, type Config as CoreConfig } from "candle-bot-core/config";
-import { parseSeriesSection, parseWatchlistSection, type SeriesSection, type WatchlistSection } from "candle-bot-core/sources/stack";
+import { checkWindows, parseSeriesSection, parseWatchlistSection, type SeriesSection, type WatchlistSection } from "candle-bot-core/sources/stack";
 import type { DipRule } from "./rule.ts";
 
 export { ConfigError } from "candle-bot-core/config";
@@ -52,10 +52,16 @@ function parseDip(raw: unknown): Dip {
 
 export const SECTIONS = { watchlist: parseWatchlistSection, series: parseSeriesSection, dip: parseDip };
 
+/** The rule's and the exit's windows must fit in the bars the series keeps. */
+function checked(c: Config): Config {
+  checkWindows(c.series.maxBars, [{ key: "dip.windowBars", bars: c.dip.windowBars }], c.exit as Record<string, unknown>);
+  return c;
+}
+
 export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
-  return parseCore(raw, baseDir, SECTIONS) as Config;
+  return checked(parseCore(raw, baseDir, SECTIONS) as Config);
 }
 
 export function loadConfig(path: string): Config {
-  return loadCore(path, SECTIONS) as Config;
+  return checked(loadCore(path, SECTIONS) as Config);
 }

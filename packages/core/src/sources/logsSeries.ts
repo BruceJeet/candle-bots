@@ -44,6 +44,13 @@ export interface LogsSeriesOptions {
   slotEveryMs?: number;
   /** A notification more than this many slots behind the chain marks every coin's bars incomplete (about 400 ms a slot). */
   maxSlotLag?: number;
+  /**
+   * A subscribed coin whose market price moved more than `silencePct` % since its last trade log, with no log for
+   * `silenceMs`, has trades this socket did not deliver (a subscription the server dropped without saying): its bars
+   * since the last log are a gap ("logs silent"), and it is subscribed again. Defaults 45 s and 1 %.
+   */
+  silenceMs?: number;
+  silencePct?: number;
 }
 
 /** Socket gap reasons, closed when the subscription is confirmed. */
@@ -79,11 +86,16 @@ export class LogsSeries implements SeriesSource {
   private chainSlot: { slot: number; at: number } | null = null;
   private slotReadAt = 0;
   private behind = false;
+  /** Per coin: the last trade log (any, a failed transaction too), the price then, and whether it is silent now. */
+  private lastLogAt = new Map<string, number>();
+  private refPrice = new Map<string, number>();
+  private silent = new Set<string>();
+  silentResubscribes = 0;
 
   constructor(d: LogsSeriesDeps, o: LogsSeriesOptions = {}) {
     this.d = d;
     this.now = d.now ?? Date.now;
-    this.o = { maxSubscriptions: o.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS, maxCoins: o.maxCoins ?? 200, maxBars: o.maxBars ?? 1440, priceEveryMs: o.priceEveryMs ?? 5_000, venueEveryMs: o.venueEveryMs ?? 60_000, slotEveryMs: o.slotEveryMs ?? 30_000, maxSlotLag: o.maxSlotLag ?? 150 };
+    this.o = { maxSubscriptions: o.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS, maxCoins: o.maxCoins ?? 200, maxBars: o.maxBars ?? 1440, priceEveryMs: o.priceEveryMs ?? 5_000, venueEveryMs: o.venueEveryMs ?? 60_000, slotEveryMs: o.slotEveryMs ?? 30_000, maxSlotLag: o.maxSlotLag ?? 150, silenceMs: o.silenceMs ?? 45_000, silencePct: o.silencePct ?? 1 };
     this.store = d.store ?? new SeriesStore({ maxCoins: this.o.maxCoins, maxBars: this.o.maxBars, now: this.now });
     const handlers: MultiLogsHandlers = {
       onLogs: (e) => {
@@ -97,6 +109,12 @@ export class LogsSeries implements SeriesSource {
       onGapEnd: (a, at) => {
         const m = this.mintOf.get(a);
         if (m) for (const r of SOCKET_REASONS) this.store.gapEnd(m, r, at);
+        // A silent coin's new subscription is confirmed: the missed span ends here (it is re-detected if it recurs).
+        if (m && this.silent.delete(m)) {
+          this.store.gapEnd(m, "logs silent", at);
+          this.lastLogAt.set(m, at);
+          this.refPrice.delete(m);
+        }
       },
       onTrouble: (a, tries, why) => {
         const m = this.mintOf.get(a);
@@ -164,6 +182,9 @@ export class LogsSeries implements SeriesSource {
       this.venueAt.delete(m);
       this.noSource.delete(m);
       this.fresh.delete(m);
+      this.lastLogAt.delete(m);
+      this.refPrice.delete(m);
+      this.silent.delete(m);
     }
     this.applySockets();
   }
@@ -187,7 +208,10 @@ export class LogsSeries implements SeriesSource {
       for (const m of coins) {
         const r = markets.get(m);
         if (!r) continue;
-        if (r.priceSol !== null && !r.problem) this.store.price(m, r.nowMs, r.priceSol);
+        if (r.priceSol !== null && !r.problem) {
+          this.store.price(m, r.nowMs, r.priceSol);
+          this.checkSilence(m, r.priceSol);
+        }
         if (force || this.fresh.has(m) || !this.venueAt.has(m) || this.now() - (this.venueAt.get(m) ?? 0) >= this.o.venueEveryMs || this.venueOf.get(m) !== r.venue) this.resolve(m, r);
       }
       this.applySockets();
@@ -235,6 +259,30 @@ export class LogsSeries implements SeriesSource {
         this.mintOf.set(addr, mint);
       } else this.addrOf.delete(mint);
     }
+  }
+
+  /** A subscribed coin whose price moved with no trade log for silenceMs: a gap from its last log, and a new subscription. */
+  private checkSilence(mint: string, price: number): void {
+    const addr = this.addrOf.get(mint);
+    if (!addr || !this.socket.held().includes(addr)) return;
+    const now = this.now();
+    if (!this.lastLogAt.has(mint)) this.lastLogAt.set(mint, now);
+    const ref = this.refPrice.get(mint);
+    if (ref === undefined) {
+      this.refPrice.set(mint, price);
+      return;
+    }
+    if (this.silent.has(mint)) return;
+    const since = this.lastLogAt.get(mint)!;
+    if (now - since < this.o.silenceMs || !(ref > 0) || Math.abs(price / ref - 1) * 100 <= this.o.silencePct) return;
+    this.silent.add(mint);
+    this.silentResubscribes++;
+    this.store.gapStart(mint, "logs silent", since);
+    this.d.alerter.raise(`series:logs_silent:${mint}:${since}`, `series: ${mint}'s price moved ${(Math.abs(price / ref - 1) * 100).toFixed(1)} % with no trade log for ${Math.round((now - since) / 1000)} s (a subscription the server dropped?): its bars since then are a gap; subscribing again`);
+    this.d.log.warn("series_logs_silent", { mint, sinceMs: now - since, ref, price });
+    // Drop the address and add it again: a fresh subscription (its "subscribing" gap closes on confirmation).
+    this.socket.set(this.socket.held().filter((a) => a !== addr));
+    this.applySockets();
   }
 
   /** The chain's slot, every slotEveryMs (a failed read leaves the last one; no verdict without one). */
@@ -297,6 +345,12 @@ export class LogsSeries implements SeriesSource {
 
   private onLogs(address: string, signature: string, err: unknown, logs: string[]): void {
     const mint = this.mintOf.get(address);
+    if (mint) {
+      // The subscription delivers: the silence clock restarts at the price now.
+      this.lastLogAt.set(mint, this.now());
+      this.refPrice.delete(mint);
+      if (this.silent.delete(mint)) this.store.gapEnd(mint, "logs silent");
+    }
     if (!mint || err) return; // a failed transaction counts no volume
     const seen = this.seen.get(mint) ?? new Set<string>();
     if (seen.has(signature)) return; // one transaction, counted once
@@ -335,6 +389,6 @@ export class LogsSeries implements SeriesSource {
   }
 
   status(): Record<string, unknown> {
-    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, partialLogs: this.partialLogs, noTradeLogSource: Object.fromEntries(this.noSource) };
+    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, partialLogs: this.partialLogs, silent: [...this.silent], silentResubscribes: this.silentResubscribes, noTradeLogSource: Object.fromEntries(this.noSource) };
   }
 }

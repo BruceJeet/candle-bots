@@ -14,3 +14,5 @@ First version, on candle-bot-core 0.6.0.
   `maxImpactBps`. Retries are rechecked on the venue (impact and drift against the decision fill).
 - Exits by any core strategy; `fade` reads the series (volume fade, drop from high) as well as price.
 - `scan` prints signals and what it would buy, and never trades.
+- The rule needs the whole baseline watched (`recentBars + baselineBars` complete minutes) and reads the price rise from
+  the last close before the recent bars, so a quiet minute right before a burst does not hide it.

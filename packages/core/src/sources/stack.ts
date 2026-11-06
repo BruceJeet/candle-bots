@@ -79,3 +79,18 @@ export function seriesStack(d: StackDeps, w: WatchlistSection, s: SeriesSection)
   const watchlist = new Watchlist({ series, feed, alerter: d.alerter, log: d.log, now }, { mints: w.mints, maxCoins: w.maxCoins, ...(f ? { maxFeedCoins: f.maxCoins } : {}), dropAfterMs: w.dropAfterMin * 60_000 });
   return { series, feed, watchlist };
 }
+
+/**
+ * (0.6.0) A rule window must fit in the bars the series keeps (each window counts ended bars, plus the one in
+ * progress): refused at config load otherwise, since the rule could never read a full window. The fade exit's windows
+ * are checked too when it is the exit (its defaults when a rule is on: fade 3 + 10 bars, drop 15).
+ */
+export function checkWindows(maxBars: number, windows: Array<{ key: string; bars: number }>, exit?: Record<string, unknown>): void {
+  const all = [...windows];
+  if (exit && exit.strategy === "fade") {
+    const n = (k: string, def: number) => (typeof exit[k] === "number" ? (exit[k] as number) : def);
+    if (exit.fadeBelowRatio !== undefined || exit.fadeRecentBars !== undefined || exit.fadeBaselineBars !== undefined) all.push({ key: "exit.fadeRecentBars + exit.fadeBaselineBars", bars: n("fadeRecentBars", 3) + n("fadeBaselineBars", 10) });
+    if (exit.dropFromHighPct !== undefined || exit.dropWindowBars !== undefined) all.push({ key: "exit.dropWindowBars", bars: n("dropWindowBars", 15) });
+  }
+  for (const w of all) if (w.bars + 1 > maxBars) throw new ConfigError(`config.${w.key}: ${w.bars} bars do not fit in series.maxBars ${maxBars} (a window needs its bars ended, plus the one in progress)`);
+}
