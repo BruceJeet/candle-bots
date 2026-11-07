@@ -66,6 +66,9 @@ export class HedgeBook {
   constructor(path: string, now: () => number = Date.now) {
     this.db = new DatabaseSync(path);
     this.db.exec(TABLES);
+    // (audit fixes) Whether an order was signed but not submitted: added to a book made before it.
+    const cols = (this.db.prepare("pragma table_info(hedge_orders)").all() as any[]).map((c) => c.name);
+    if (!cols.includes("signed")) this.db.exec("alter table hedge_orders add column signed integer not null default 0");
     this.now = now;
     if (this.meta("started_at") === null) this.setMeta("started_at", String(now()));
   }
@@ -110,7 +113,7 @@ export class HedgeBook {
     if (r.status === "filled") {
       this.db.prepare("update hedge_orders set status = 'filled', oid = ?, filled_sz = ?, avg_px = ?, error = null, updated_at = ? where id = ?").run(r.oid, this.signed(row.side, Number(r.filledSz)), r.avgPx, t, id);
     } else {
-      this.db.prepare("update hedge_orders set status = ?, error = ?, updated_at = ? where id = ?").run(r.status, r.error.slice(0, 500), t, id);
+      this.db.prepare("update hedge_orders set status = ?, error = ?, signed = ?, updated_at = ? where id = ?").run(r.status, r.error.slice(0, 500), r.status === "unknown" && r.signed ? 1 : 0, t, id);
     }
   }
 
@@ -160,6 +163,16 @@ export class HedgeBook {
   expected(coin: string): number {
     const v = Number((this.db.prepare("select coalesce(sum(filled_sz), 0) as s from hedge_orders where coin = ? and status in ('filled', 'accepted')").get(coin) as any).s);
     return +v.toPrecision(12);
+  }
+
+  /**
+   * Coins with an order that was signed but never submitted and then written off as not placed, within `windowMs`
+   * and with no `accept` on the coin since: its signature may still land, so the hedger opens nothing there.
+   */
+  signedWriteOffs(windowMs: number): Array<{ coin: string; id: number; at: number }> {
+    const since = this.now() - windowMs;
+    return (this.db.prepare(`select o.coin, o.id, o.created_at as at from hedge_orders o where o.status = 'not_placed' and o.signed = 1 and o.created_at >= ?
+      and not exists (select 1 from hedge_orders a where a.coin = o.coin and a.status = 'accepted' and a.id > o.id) order by o.id`).all(since) as any[]).map((r) => ({ coin: r.coin, id: r.id, at: r.at }));
   }
 
   /** Whether a venue order id is one of the book's orders. */

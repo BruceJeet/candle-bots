@@ -18,7 +18,7 @@ candle-perps-hedger run  --config examples/dry.json --max-seconds 60    # dry ru
 | `dry` | a Solana wallet address to read (`spot.wallet`) and an RPC (public by default). No key: the perps are paper. |
 | `live` | a Candle API key with scope `perps:write` (`apiKeyEnv`), an EVM TEE wallet bound to that key (`perps.wallet`, its `0x` address), its P-256 signer (`perps.signer`, the same stores as the other bots), a first deposit and `candle perps setup` on that wallet. The Hyperliquid account must be in standard mode. |
 
-`network` is `mainnet` or `testnet` (Hyperliquid's). The SDK refuses a build for the other network, and asset indexes
+`network` is `mainnet` or `testnet` (Hyperliquid's); a live config must name it. The SDK refuses a build for the other network, and asset indexes
 differ between the two, so the bot always reads them. Start live on testnet.
 
 Every perps order goes through the SDK: `perpsOpen` (a market IOC within `perps.slippageBps` of the mid), `perpsClose`
@@ -49,7 +49,7 @@ funding from Hyperliquid's public `/info`.
 | `maxLeverage` | 3 | the leverage set on each hedge coin, capped at the market's own max |
 | `maxMarginUsd` | required | notional / leverage over every hedge, at most this; also at most 90 % of the account value |
 | `maxNotionalUsd` | none | optional cap on the total notional |
-| `unpricedCloseSec` | 60 | a bag not priced for this long counts zero: its hedge is closed |
+| `unpricedCloseSec` | 300 | a bag not priced for this long counts zero: its hedge is closed |
 
 Over a cap, every target is scaled down by the same factor, and the bot alerts. Positions it cannot change this step
 count against the caps first.
@@ -58,7 +58,8 @@ count against the caps first.
 
 - One order per coin per step. More short: a market open. Less short: a reduce-only close of the difference. A bag
   sold, a bag unpriced past `unpricedCloseSec`, or `FLATTEN`: a reduce-only close of the whole position. A long on a
-  hedge coin is closed.
+  hedge coin is closed. A bag missing from one wallet read gets one more read before its hedge is closed.
+- `maxMarginUsd` is a hard ceiling: while the positions use more margin than it, the reduce goes out with no band.
 - No venue read, no order.
 - Before the venue is asked, every order is written to the book (`hedge.sqlite`) under a fresh client id (the order's
   cloid). An order with no clear answer (a timeout, a submit that failed, an unreadable leg) freezes its coin. The bot
@@ -66,12 +67,20 @@ count against the caps first.
   record after `perps.settleSec` (default 120) and no unexplained fill on the coin, it writes the order off. A restart
   reads the same book, so an order in doubt is never sent again.
 - The book's position on each coin (the sum of its fills) is checked against the account's every step. A difference
-  held for `perps.mismatchSec` (default 30) is alerted, and the coin gets no new or larger orders. It can still be
-  closed whole when nothing should be hedged on it. `accept <coin>` (with the bot stopped) takes the account's
-  position over as the hedger's. From then on the hedger sizes that position to the bags, so it may reduce or close
-  it.
+  freezes the coin at once: no opens and no closes. It is alerted after `perps.mismatchSec` (default 30), or at once
+  when the hedger starts with it. The hedger only ever closes what its book explains: a frozen coin's short is closed
+  (when nothing should be hedged there) only when the freeze is its own order in doubt, or the book holds a short at
+  least as large as the account's. A manual or another tool's position on a hedge coin is left alone until
+  `accept <coin>` (with the bot stopped) takes it over as the hedger's. From then on the hedger sizes that position to
+  the bags, so it may reduce or close it.
+- Candle perps builds carry no expiry: a signed order stays valid on Hyperliquid for its nonce window. An order that
+  was signed but not submitted, then written off after `settleSec`, could still land. Its coin gets no opens (closes
+  still run) for 48 h or until `accept <coin>`, and it is alerted.
+- There is no liquidation guard. Keep leverage low and margin to spare. A liquidated or partly liquidated short leaves
+  the account and the book apart, so the coin freezes until `accept <coin>`.
 - The coins it trades are the proxy, the configured perps and coins it traded before. Positions on other coins are
-  never touched. Use a perps wallet of its own: funding is booked per coin.
+  never touched, and their margin counts against the account-value cap. Use a perps wallet of its own: funding is
+  booked per coin.
 - Leverage and margin mode (`perps.marginMode`, default `isolated`) are set on a coin once per run, before its first
   open. A refusal skips the open and is alerted.
 - Fees (Hyperliquid's own `fee`, the builder fee included) and funding (signed: negative paid) are read every

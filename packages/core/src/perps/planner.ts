@@ -17,8 +17,11 @@
  *  - Orders: one per coin per plan. More short: a market open (never while opens are paused). Less short: a
  *    reduce-only close of the difference. Target zero, a flatten, or a long position on a hedge coin: a reduce-only
  *    close of the whole position.
- *  - A frozen coin (an order not yet reconciled, a position the book cannot explain) gets no order, except a whole
- *    reduce-only close of a short when nothing should be hedged on it (target 0, or a flatten).
+ *  - A frozen coin (an order not yet reconciled, a position the book cannot explain) gets no order, except a
+ *    reduce-only close of the short as read when nothing should be hedged on it (target 0, or a flatten) AND the caller
+ *    lists the coin in `frozenClosable` (the hedger's own order in doubt, or a book short at least as large as the
+ *    venue's). A position the book does not explain is never closed.
+ *  - maxMarginUsd is a hard ceiling: over it, a reduce goes out with no band.
  *  - A configured own perp that still holds a short but has lost its mark (or was delisted) keeps the bag: no proxy
  *    hedge is opened on top of it.
  *  - Positions the plan cannot change (frozen, no mark) count against the caps first.
@@ -65,6 +68,15 @@ export interface PlanInput {
   accountValueUsd: number | null;
   /** Coins that must not be traded this plan, with why. */
   frozen: Map<string, string>;
+  /**
+   * Frozen coins whose short the hedger may still close (its own order in doubt, or a book short at least as large as
+   * the venue's): closed whole, at the size read, when nothing should be hedged there. Any other frozen coin is left.
+   */
+  frozenClosable?: Set<string>;
+  /** Coins where no open may be sent (a signed order written off that could still land), with why. */
+  noOpens?: Map<string, string>;
+  /** Margin used by positions on coins the hedger does not manage (counted against the account-value cap). */
+  otherMarginUsd?: number;
   /** Coins the hedger may trade (the proxy, configured perps, coins it traded before). */
   managed: Set<string>;
   flatten?: boolean;
@@ -197,10 +209,19 @@ export function planHedge(inp: PlanInput): Plan {
   };
   if (margin > 0) {
     cap(Math.max(0, cfg.maxMarginUsd - fixedMargin) / margin, "maxMarginUsd");
-    if (inp.accountValueUsd !== null) cap(Math.max(0, 0.9 * inp.accountValueUsd - fixedMargin) / margin, "account value");
+    if (inp.accountValueUsd !== null) cap(Math.max(0, 0.9 * inp.accountValueUsd - fixedMargin - (inp.otherMarginUsd ?? 0)) / margin, "account value");
   }
   if (cfg.maxNotionalUsd !== undefined && notional > 0) cap(Math.max(0, cfg.maxNotionalUsd - fixedNotional) / notional, "maxNotionalUsd");
   factor = Math.max(0, Math.min(1, factor));
+
+  // maxMarginUsd is a hard ceiling: while the margin the positions use now is over it, a reduce goes out with no band.
+  let usedMargin = 0;
+  for (const [coin, szi] of inp.positions) {
+    const px = markets.get(coin)?.markPx ?? null;
+    if (szi === 0 || !inp.managed.has(coin) || px === null || !(px > 0)) continue;
+    usedMargin += (Math.abs(szi) * px) / (levOf(coin) ?? 1);
+  }
+  const overCap = usedMargin > cfg.maxMarginUsd * (1 + 1e-9);
 
   const coins = new Set<string>([...perCoin.keys()]);
   for (const [c, szi] of inp.positions) if (szi !== 0 && inp.managed.has(c)) coins.add(c);
@@ -227,9 +248,10 @@ export function planHedge(inp: PlanInput): Plan {
       line.note = frozen;
       // A whole reduce-only close can neither grow nor flip a short: sent even on a frozen coin when nothing should be
       // hedged there (bags sold or unpriced, or a flatten), so a freeze never keeps a naked short on.
-      if (actual < 0 && (inp.flatten || targetUsd === 0) && m && m.markPx !== null && m.markPx > 0) {
+      if (actual < 0 && (inp.flatten || targetUsd === 0) && inp.frozenClosable?.has(coin) && m && m.markPx !== null && m.markPx > 0) {
+        const size = floorSize(-actual, m.szDecimals);
         line.status = "order";
-        orders.push({ coin, action: "close", side: "long", size: null, reduceOnly: true, reason: inp.flatten ? "flatten_frozen" : "close_frozen", usd: Math.abs(actual) * m.markPx });
+        orders.push({ coin, action: "close", side: "long", size, reduceOnly: true, reason: inp.flatten ? "flatten_frozen" : "close_frozen", usd: Math.abs(actual) * m.markPx });
       }
       continue;
     }
@@ -258,11 +280,11 @@ export function planHedge(inp: PlanInput): Plan {
     const delta = line.targetSz - actual; // < 0: more short
     const deltaUsd = Math.abs(delta) * mark;
     const band = Math.max((cfg.bandPct / 100) * targetUsd, cfg.minOrderUsd);
-    if (deltaUsd <= band || Math.abs(delta) < step / 2) continue;
+    if (Math.abs(delta) < step / 2 || (deltaUsd <= band && !(overCap && delta > 0))) continue;
     if (delta < 0) {
-      if (inp.pauseOpens) {
+      if (inp.pauseOpens || inp.noOpens?.has(coin)) {
         line.status = "paused";
-        line.note = "opens paused";
+        line.note = inp.noOpens?.get(coin) ?? "opens paused";
         continue;
       }
       const size = floorSize(-delta, m.szDecimals);

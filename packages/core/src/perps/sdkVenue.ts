@@ -92,7 +92,7 @@ export function resultOf(r: PerpsActionResult | PerpsReplayResult): PerpOrderRes
     return { status: "unknown", error: `replayed: Candle already holds this client id (status ${rep.status}, venue ${rep.venueStatus ?? "unread"})`, raw: rep };
   }
   const a = r as PerpsActionResult;
-  if (!a.submitted) return { status: "unknown", error: `not submitted${a.submitError ? `: ${a.submitError}` : ""}` };
+  if (!a.submitted) return { status: "unknown", error: `not submitted${a.submitError ? `: ${a.submitError}` : ""}`, ...(a.signature ? { signed: true } : {}) };
   const o = a.outcome;
   if (!o || o.status === "unknown") return { status: "unknown", error: o && "error" in o ? o.error : "no outcome", raw: a.exchange };
   if (o.status === "rejected") return { status: "rejected", error: o.error, raw: a.exchange };

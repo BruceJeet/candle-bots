@@ -102,6 +102,8 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
   only(raw, ["mode", "network", "apiUrl", "apiKeyEnv", "rpcUrlEnv", "stateDir", "loopMs", "spot", "perps", "hedge", "alerts", "$schema", "comment"], w);
   const mode = str(raw, "mode", w) as Config["mode"];
   if (mode !== "dry" && mode !== "live") throw new ConfigError('config.mode: "dry" or "live"');
+  // A live run names its network: a live config never trades mainnet by default.
+  if (mode === "live" && raw.network === undefined) throw new ConfigError('config.network: required in live mode ("mainnet" or "testnet")');
   const network = str(raw, "network", w, { def: "mainnet" }) as Config["network"];
   if (network !== "mainnet" && network !== "testnet") throw new ConfigError('config.network: "mainnet" or "testnet"');
   const apiUrl = str(raw, "apiUrl", w, { def: "https://api.alpha.candle.tv" })!;
@@ -198,7 +200,7 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
     maxMarginUsd: num(h, "maxMarginUsd", "config.hedge", { min: 0 }),
     ...(maxNotionalUsd !== undefined ? { maxNotionalUsd } : {}),
     minBagUsd: num(h, "minBagUsd", "config.hedge", { min: 0, def: 20 }),
-    unpricedCloseSec: num(h, "unpricedCloseSec", "config.hedge", { min: 10, max: 86_400, int: true, def: 60 }),
+    unpricedCloseSec: num(h, "unpricedCloseSec", "config.hedge", { min: 10, max: 86_400, int: true, def: 300 }),
     beta,
   };
   if (hedge.unpricedCloseSec * 1000 < loopMs) throw new ConfigError("config.hedge.unpricedCloseSec: shorter than one loop (loopMs): every bag would count as unpriced");

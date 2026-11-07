@@ -63,7 +63,11 @@ export interface PerpOrderRequest {
 export type PerpOrderResult =
   | { status: "filled"; oid: number | null; filledSz: string; avgPx: number | null; raw?: unknown }
   | { status: "rejected"; error: string; raw?: unknown }
-  | { status: "unknown"; error: string; raw?: unknown };
+  /**
+   * `signed`: the action was signed but not submitted (a submit that failed). The signature stays valid on Hyperliquid
+   * for its nonce window (Candle perps builds carry no expiry), so the order could still land if anyone holds it.
+   */
+  | { status: "unknown"; error: string; raw?: unknown; signed?: boolean };
 
 /** The venue's record of an order by client id. `unknownOid`: the venue never saw it. */
 export type PerpOrderStatus =

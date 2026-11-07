@@ -16,7 +16,7 @@
     "maxLeverage": 3,
     "maxMarginUsd": 100,
     "minBagUsd": 20,
-    "unpricedCloseSec": 60
+    "unpricedCloseSec": 300
   },
   "alerts": {}
 }
