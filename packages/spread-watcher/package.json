@@ -1,0 +1,64 @@
+{
+  "name": "candle-spread-watcher",
+  "version": "0.1.0",
+  "description": "Watches a coin's price on every venue it trades on (its pump.fun or Candle curve, PumpSwap and Meteora DAMM v2 pools by address, its Hyperliquid perp) and alerts on Telegram, Discord or a webhook when the spread between two venues holds above a threshold, with each venue's SOL depth. Watch-only: no wallet, no key, never trades. Built on candle-bot-core.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/spread-watcher"
+  },
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/spread-watcher#readme",
+  "bugs": {
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
+  },
+  "bin": {
+    "candle-spread-watcher": "bin/candle-spread-watcher"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "candle-bot-core": "0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "candle",
+    "solana",
+    "spread",
+    "arbitrage",
+    "alerts",
+    "pumpswap",
+    "meteora",
+    "hyperliquid",
+    "pump.fun",
+    "memecoin",
+    "bot"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}
