@@ -171,6 +171,9 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
       const creators = watch.creatorsWatched();
       const add = [...creators.keys()].filter((w) => !wallets.watched().includes(w));
       if (add.length) wallets.subscribe(add);
+      // Creators of coins no longer watched (released, sold, closed) are let go.
+      const drop = wallets.watched().filter((w) => !creators.has(w));
+      if (drop.length) wallets.unsubscribe?.(drop);
       for (const g of wallets.drainGaps()) if (!g.recovered) d.log.info("rug_creator_wallet_gap", { creator: g.wallet, reason: g.reason, missing: g.missing ?? null });
       for (const e of wallets.drain()) {
         if (e.side !== "sell" || !creators.get(e.wallet)?.includes(e.mint)) continue;

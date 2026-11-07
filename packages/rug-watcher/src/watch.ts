@@ -503,7 +503,6 @@ export class RugWatch {
     return this.d.ledger.db.prepare("select creator, source from rug_creators where mint = ?").get(mint) as any;
   }
 
-  /** The creator's highest holding while this position was watched (raw), or null before the first read. */
   /** (opt-in walletSource) Each known creator of a watched coin (from config or chain), with its coins. */
   creatorsWatched(): Map<string, string[]> {
     const out = new Map<string, string[]>();
@@ -536,6 +535,7 @@ export class RugWatch {
     return n;
   }
 
+  /** The creator's highest holding while this position was watched (raw), or null before the first read. */
   devHigh(positionId: number): string | null {
     const r = this.d.ledger.db.prepare("select max_raw from rug_dev where position_id = ?").get(positionId) as { max_raw: string } | undefined;
     return r ? r.max_raw : null;
