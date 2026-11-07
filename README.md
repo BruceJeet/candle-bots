@@ -18,6 +18,8 @@ one you want and you get that bot and the core, nothing else.
 | [candle-dip-buyer](packages/dip-buyer/README.md) | Buys pump.fun and PumpSwap coins on a dip from their recent high (optionally once they turn up), on a live price and volume series; exits by a strategy, `fade` reading the series too | `npx candle-dip-buyer scan --config bot.json` (start from `examples/dry.json`) |
 | [candle-spike-rider](packages/spike-rider/README.md) | Buys pump.fun and PumpSwap coins on a volume spike with buyers behind it and the price rising; exits by a strategy, `fade` reading the series too | `npx candle-spike-rider scan --config bot.json` (start from `examples/dry.json`) |
 | [candle-event-bot](packages/event-bot/README.md) | Buys coins tied to a dated event in a window before it, and exits in phases keyed to the event: ride the build-up, hedge at the event, keep a moonshot core | `npx candle-event-bot plan --config bot.json` (start from `examples/dry.json`) |
+| [candle-dca-bot](packages/dca-bot/README.md) | Buys, or sells, a fixed amount of a coin on a timer: schedules on a fixed grid (UTC time of day optional) that never fire twice for one slot, also across a restart; price, impact and budget guards; optional exits on what it bought. Candle coins, pump.fun curves and PumpSwap | `npx candle-dca-bot plan --config bot.json` (start from `examples/dry.json`) |
+| [candle-rebalancer](packages/rebalancer/README.md) | Holds a wallet at target weights across coins and SOL: on a schedule, sells what is over its band, then buys what is under, within a minimum trade size and a cap on SOL moved per run; a coin it cannot price blocks the run | `npx candle-rebalancer plan --config bot.json` (start from `examples/dry.json`) |
 
 Under them:
 

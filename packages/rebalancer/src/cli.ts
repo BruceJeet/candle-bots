@@ -14,7 +14,7 @@ minimum trade size and a cap on SOL moved per run. A coin it cannot price blocks
 
   candle-rebalancer run    --config bot.json [--mode dry|live]   run the bot
   candle-rebalancer plan   --config bot.json                     the full plan for the wallet now (fresh reads; never
-                                                                 trades, writes nothing)
+                                                                 trades, books nothing)
   candle-rebalancer status --config bot.json                     print status.json (weights, last plan, runs, lots)
   candle-rebalancer sell   <mint> --config bot.json [--fraction 1]   sell over every lot of the coin
 

@@ -179,7 +179,8 @@ export function plan(i: PlanInput): Plan {
         dropped.push({ mint: r.mint, side: "buy", sol: Math.max(0, sol), why: sol > 0 ? `under minTradeSol ${i.minTradeSol}${limit ? ` (limited by ${limit})` : ""}` : `nothing left: ${limit}` });
         continue;
       }
-      const lamports = BigInt(Math.floor(sol * LAMPORTS));
+      // Rounded down; within 1e-6 lamports of a whole one counts as it (0.15 - 0.1 is 0.04999999999999999 in floats).
+      const lamports = BigInt(Math.floor(sol * LAMPORTS + 1e-6));
       orders.push({ mint: r.mint, side: "buy", sol, lamports, why });
       budget -= sol;
       funds -= sol;

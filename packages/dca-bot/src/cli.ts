@@ -17,7 +17,7 @@ catch-up run, "missed": "once"). Guards: a price cap, an impact cap, a budget pe
 
   candle-dca-bot run    --config bot.json [--mode dry|live]   run the bot
   candle-dca-bot plan   --config bot.json                     what each schedule would do now, and when it would first
-                                                              run (fresh reads; never trades, writes nothing)
+                                                              run (fresh reads; never trades, books nothing)
   candle-dca-bot status --config bot.json                     print status.json (schedules, runs, lots)
   candle-dca-bot sell   <mint> --config bot.json [--fraction 1]   sell over every lot of the coin
 

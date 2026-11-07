@@ -10,7 +10,7 @@
  *    policy (`missed`) says what happens: `skip` (default) runs nothing for them and waits for the next slot; `once`
  *    runs one catch-up run now, however many were missed. A slot whose time is still within `graceSec` (plus the
  *    jitter) is on time, not missed.
- *  - **The grid.** Without `atUtc` the first run is due when the schedule is first stored (the first start), then every
+ *  - **The grid.** Without `atUtc` the first run is due when the schedule is first stored (the bot's first `due()`), then every
  *    `everySec`. With `atUtc` ("HH:MM" or "HH:MM:SS", UTC) the slots are that time of day plus whole multiples of
  *    `everySec`, counted from 1970-01-01; `everySec` must then divide a day or be whole days. A slot is never moved by
  *    a late run: the next slot is always the grid's.
@@ -74,7 +74,7 @@ export function parseSchedule(o: Obj, where: string): ScheduleSpec {
     if (!(DAY_SEC % everySec === 0 || everySec % DAY_SEC === 0)) throw new ConfigError(`${where}.everySec: with atUtc it must divide a day (86400 s) or be whole days`);
   }
   const jitterSec = num(o, "jitterSec", where, { min: 0, int: true, def: 0 });
-  const graceSec = num(o, "graceSec", where, { min: 0, int: true, def: Math.min(60, Math.floor(everySec / 4)) });
+  const graceSec = num(o, "graceSec", where, { min: 0, int: true, def: Math.min(60, Math.floor(everySec / 2)) });
   if (jitterSec + graceSec >= everySec) throw new ConfigError(`${where}: jitterSec + graceSec must be under everySec`);
   const missed = (str(o, "missed", where, { def: "skip" }) as MissedPolicy);
   if (missed !== "skip" && missed !== "once") throw new ConfigError(`${where}.missed: "skip" (default) or "once"`);
@@ -187,7 +187,19 @@ export class Scheduler {
       this.specs.set(s.id, s);
     }
     d.ledger.db.exec(TABLES);
+  }
+
+  private synced = false;
+
+  /**
+   * Store each configured schedule, or re-anchor a changed one. Called by the first `due()` (and `nextAt()`), not by the
+   * constructor: a schedule's first slot (without atUtc) is when the bot is first ready to run it, not when it was
+   * built (a bot that reads the chain before its first run would otherwise miss that slot).
+   */
+  start(): void {
+    if (this.synced) return;
     this.sync();
+    this.synced = true;
   }
 
   private jitter(s: ScheduleSpec): number {
@@ -244,6 +256,7 @@ export class Scheduler {
    * policy. A schedule with a run in flight, or ended, is passed over.
    */
   due(): Run[] {
+    this.start();
     const out: Run[] = [];
     for (const s of this.specs.values()) {
       const r = this.claimOne(s);
@@ -333,6 +346,7 @@ export class Scheduler {
 
   /** The next time a schedule fires (ms), or null when it has ended or has a run in flight. */
   nextAt(id: string): number | null {
+    this.start();
     const r = this.row(id);
     return !r || r.ended !== null || r.inflight_run !== null ? null : r.fire_at_ms;
   }
