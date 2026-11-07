@@ -25,7 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import type { Alerter } from "./alerts.ts";
 import { ConfigError, deepFreeze, type Config } from "./config.ts";
-import { readControl, type AdoptionHook, type Engine } from "./engine.ts";
+import { readControl, TRIGGER_TIMEOUT_MS, type AdoptionHook, type Engine } from "./engine.ts";
 import type { Ledger, OrderRow, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
 import { decodeMint, junkReason } from "./market/mint.ts";
@@ -115,7 +115,7 @@ export function ordersSummary(ledger: Ledger, ids: number[]): { status: "done" |
  * one (the part is a fraction to 1e-6, so up to 1e-6 of that lot may stay unsold). Returns the orders booked and the
  * raw amount they cover.
  */
-export async function sellLots(engine: Engine, ledger: Ledger, dry: boolean, mint: string, amountRaw: bigint, reason: string, manual = false, onOrder?: (id: number) => void): Promise<{ orders: number[]; placedRaw: bigint; why: string[] }> {
+export async function sellLots(engine: Engine, ledger: Ledger, dry: boolean, mint: string, amountRaw: bigint, reason: string, manual = false, onOrder?: (id: number) => void, shouldStop?: () => boolean): Promise<{ orders: number[]; placedRaw: bigint; why: string[]; stopped?: boolean }> {
   const lots = lotsOf(ledger, dry, mint).sort((a, b) => {
     const d = BigInt(b.remaining_raw) - BigInt(a.remaining_raw);
     return d > 0n ? 1 : d < 0n ? -1 : a.id - b.id;
@@ -135,6 +135,8 @@ export async function sellLots(engine: Engine, ledger: Ledger, dry: boolean, min
     const take = left < rem ? left : rem;
     const fraction = take >= rem ? 1 : Number((take * 1_000_000n) / rem) / 1_000_000;
     if (!(fraction > 0)) continue;
+    // STOP: nothing more is booked (an order booked now would run at the next start, its guards stale by then).
+    if (shouldStop?.()) return { orders, placedRaw: placed, why: [...why, "STOP"], stopped: true };
     const id = await engine.placeSell(lot, fraction, reason, manual);
     if (id === null) {
       why.push(`lot ${lot.id}: sell not booked (see alerts)`);
@@ -508,7 +510,7 @@ export class LotExits implements ExitStrategy {
   }
 }
 
-/** How long a poll of a lots bot waits for its run work before it returns (under the engine's trigger timeout). */
+/** How long a poll of a lots bot waits for its run work before it returns (capped at half the engine's trigger timeout). */
 export const POLL_BUDGET_MS = 5_000;
 
 /**
@@ -523,9 +525,13 @@ export class PollWork<T> {
   private stopping = false;
   private budgetMs: number;
   private log: Logger;
-  constructor(log: Logger, budgetMs = POLL_BUDGET_MS) {
+  /** The budget is at most half the engine's trigger timeout (default TRIGGER_TIMEOUT_MS, 10 s), so a poll always answers in time. */
+  constructor(log: Logger, budgetMs = POLL_BUDGET_MS, triggerTimeoutMs = TRIGGER_TIMEOUT_MS) {
     this.log = log;
-    this.budgetMs = budgetMs;
+    this.budgetMs = Math.max(0, Math.min(budgetMs, Math.floor(triggerTimeoutMs / 2)));
+  }
+  get budget(): number {
+    return this.budgetMs;
   }
   /** Start `step` unless work is in hand; wait for it up to the budget; return what is queued. */
   async poll(step: (push: (c: T) => void) => Promise<void>, wake: () => void): Promise<T[]> {

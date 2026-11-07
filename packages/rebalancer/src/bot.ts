@@ -126,8 +126,10 @@ export interface RebalanceDeps {
   sched: Scheduler;
   lots: WalletLots;
   now?: () => number;
-  /** How long a poll waits for its run work (default POLL_BUDGET_MS, 5 s). */
+  /** How long a poll waits for its run work (default POLL_BUDGET_MS, 5 s; at most half of triggerTimeoutMs). */
   pollBudgetMs?: number;
+  /** The engine's trigger timeout (default TRIGGER_TIMEOUT_MS, 10 s): the poll budget is at most half of it. */
+  triggerTimeoutMs?: number;
 }
 
 export class RebalanceTrigger implements Trigger {
@@ -150,7 +152,7 @@ export class RebalanceTrigger implements Trigger {
     this.d = d;
     this.now = d.now ?? Date.now;
     this.dry = d.cfg.mode === "dry";
-    this.work = new PollWork<Candidate>(d.log, d.pollBudgetMs);
+    this.work = new PollWork<Candidate>(d.log, d.pollBudgetMs, d.triggerTimeoutMs);
   }
 
   private end(run: number, status: "done" | "skipped" | "failed" | "blocked" | "interrupted", detail: string): void {
@@ -162,6 +164,16 @@ export class RebalanceTrigger implements Trigger {
     const fields = planFields(p);
     this.lastPlan = { run, phase, at: new Date(this.now()).toISOString(), plan: fields };
     this.d.log.info(this.dry ? "dry_rebalance_plan" : "rebalance_plan", { run, phase, ...fields, text: planText(p) });
+  }
+
+  /** A run that threw: ended failed with the orders it booked (they run on through the core), alerted. */
+  private fail(run: number, e: unknown): void {
+    const loc = this.local.get(run);
+    const ids = [...new Set([...(loc?.sells ?? []), ...runBuyOrders(this.d.ledger, this.dry, SCHEDULE_ID, run).map((o) => o.id)])];
+    const why = String((e as Error)?.message ?? e).slice(0, 300);
+    this.d.log.error("rebalance_run_failed", { run, error: String((e as Error)?.stack ?? e).slice(0, 1000), orders: ids });
+    this.d.alerter.raise(`rebalance:run_failed`, `rebalance run ${run} failed: ${why}${ids.length ? `; its orders ${ids.join(", ")} go on` : "; nothing booked"}`);
+    this.end(run, "failed", `${why}${ids.length ? `; orders ${ids.join(", ")}` : ""}`);
   }
 
   private block(run: number, why: string): void {
@@ -192,7 +204,11 @@ export class RebalanceTrigger implements Trigger {
       if (loc.phase === "planning") continue;
       if (loc.phase === "sells") {
         if (!ordersEnded(this.d.ledger, loc.sells)) continue;
-        out.push(...(await this.buyPhase(r, loc, ctx)));
+        try {
+          out.push(...(await this.buyPhase(r, loc, ctx)));
+        } catch (e) {
+          this.fail(r.run, e);
+        }
         continue;
       }
       if (loc.awaiting.size) {
@@ -264,7 +280,11 @@ export class RebalanceTrigger implements Trigger {
         continue;
       }
       this.stats.runs++;
-      for (const c of await this.sellPhase(r, ctx)) push(c);
+      try {
+        for (const c of await this.sellPhase(r, ctx)) push(c);
+      } catch (e) {
+        this.fail(r.run, e);
+      }
     }
   }
 
@@ -292,16 +312,23 @@ export class RebalanceTrigger implements Trigger {
     if (sells.length && this.engine!.sellsPaused()) loc.skips.push("sells: PAUSE_SELLS");
     else
       for (const o of sells) {
+        // STOP: nothing more is booked (an order booked now would run at the next start, on this plan's old prices).
+        if (ctx.shouldStop()) break;
         const res = await sellLots(this.engine!, this.d.ledger, this.dry, o.mint, o.raw!, `rebalance run ${r.run}: ${o.why}`, false, (id) => {
           loc.sells.push(id);
           this.d.sched.setRef(SCHEDULE_ID, r.run, { sells: loc.sells });
-        });
+        }, ctx.shouldStop);
         if (res.orders.length) loc.soldSol += o.sol * (Number(res.placedRaw) / Number(o.raw!));
         if (res.why.length) loc.skips.push(`sell ${o.mint}: ${res.why.join("; ")}`);
         this.stats.sells += res.orders.length;
       }
     loc.phase = "sells";
     this.d.sched.setRef(SCHEDULE_ID, r.run, { sells: loc.sells });
+    if (ctx.shouldStop()) {
+      // Orders booked before STOP run on (settled at the next start); with none the run ends here.
+      if (!loc.sells.length) this.end(r.run, "interrupted", "STOP before the run placed anything");
+      return [];
+    }
     if (loc.sells.length) return [];
     return this.buyPhase(r, loc, ctx);
   }
@@ -384,14 +411,14 @@ export async function makeBot(ctx: Ctx, ledger: Ledger, d: { now?: () => number;
   return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, strategy, ...d });
 }
 
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number; pollBudgetMs?: number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number; pollBudgetMs?: number; triggerTimeoutMs?: number }): Built {
   const { cfg, ledger } = d;
   const r = cfg.rebalance;
   const lots = new WalletLots({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, mints: Object.keys(r.targets), enabled: r.walletLots, excludeStateDirs: r.excludeStateDirs, minValueSol: r.minValueSol, maxTransferFeeBps: r.maxTransferFeeBps, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   const sched = new Scheduler({ ledger, specs: [r.schedule], dry: cfg.mode === "dry", log: d.log, ...(d.now ? { now: d.now } : {}), ...(d.random ? { random: d.random } : {}) });
-  const trigger = new RebalanceTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}), ...(d.pollBudgetMs !== undefined ? { pollBudgetMs: d.pollBudgetMs } : {}) });
+  const trigger = new RebalanceTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}), ...(d.pollBudgetMs !== undefined ? { pollBudgetMs: d.pollBudgetMs } : {}), ...(d.triggerTimeoutMs !== undefined ? { triggerTimeoutMs: d.triggerTimeoutMs } : {}) });
   // The exit is hold (the config allows no other): lots are sold only by runs, and by `sell`.
-  const engine = new Engine({ cfg, ledger, trigger, executor: d.executor, strategy: new LotExits(d.strategy, lots), rpc: d.rpc, log: d.log, alerter: d.alerter, venues: { pump: true }, pumpBuys: true, adopter: lots, pauseSells: true, ...(d.now ? { now: d.now } : {}) });
+  const engine = new Engine({ cfg, ledger, trigger, executor: d.executor, strategy: new LotExits(d.strategy, lots), rpc: d.rpc, log: d.log, alerter: d.alerter, venues: { pump: true }, pumpBuys: true, adopter: lots, pauseSells: true, ...(d.now ? { now: d.now } : {}), ...(d.triggerTimeoutMs !== undefined ? { triggerTimeoutMs: d.triggerTimeoutMs } : {}) });
   trigger.engine = engine;
   return { engine, trigger, lots, sched };
 }

@@ -638,8 +638,9 @@ recovery already count every position of a coin, and one attempt per coin runs a
   reads it, fail closed) is never booked, and a wallet lot of it never sold. A wallet lot's mint passes the junk check
   again before each sell. `enabled: false` turns wallet lots off. `ready` turns true once every configured coin has a
   definite answer (a failed read is not one).
-- `PollWork` runs a trigger's run work one step at a time; `poll` waits for it at most `POLL_BUDGET_MS` (5 s, under
-  the trigger timeout), and candidates from a longer step come with the next poll.
+- `PollWork` runs a trigger's run work one step at a time; `poll` waits for it at most `POLL_BUDGET_MS` (5 s), and
+  never more than half the engine's `triggerTimeoutMs` (pass the same value to both). Candidates from a longer step
+  come with the next poll. `sellLots` takes `shouldStop`: after STOP it books nothing more.
 - `LotExits` runs the bot's exit on the lots it bought and holds the wallet lots.
 - `runBuyOrders` finds a run's buys again by the `{ schedule, run }` in their entry context, after a restart too.
 

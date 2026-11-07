@@ -271,10 +271,12 @@ export class Scheduler {
       const r = this.row(s.id);
       if (!r || r.inflight_run !== null || r.ended !== null) return null;
       // The next slot more than one interval ahead (the clock was set back, or a stored row from a later time): the
-      // grid is re-anchored from now, so the schedule does not sit idle until that far slot.
+      // grid is re-anchored one interval from now (with atUtc, the first time-of-day slot from then), so the schedule
+      // neither sits idle until that far slot nor fires at once.
       if (r.next_slot_ms - now > s.everySec * 1000) {
-        const anchor = s.atUtc ? anchorOf(s, now) : now;
-        const next = s.atUtc ? slotAtOrAfter(s, anchor, now) : now;
+        const e = s.everySec * 1000;
+        const anchor = s.atUtc ? anchorOf(s, now) : now + e;
+        const next = s.atUtc ? slotAtOrAfter(s, anchor, now + e) : now + e;
         this.d.ledger.db.prepare("update schedules set anchor_ms = ?, next_slot_ms = ?, fire_at_ms = ?, updated_at = ? where id = ? and dry = ?").run(anchor, next, next + this.jitter(s), now, s.id, this.dry);
         this.d.log?.warn("schedule_reanchored", { schedule: s.id, was: new Date(r.next_slot_ms).toISOString(), nextAt: new Date(next).toISOString() });
         return null;

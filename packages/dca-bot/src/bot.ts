@@ -62,8 +62,10 @@ export interface DcaDeps {
   sched: Scheduler;
   lots: WalletLots;
   now?: () => number;
-  /** How long a poll waits for its run work (default POLL_BUDGET_MS, 5 s). */
+  /** How long a poll waits for its run work (default POLL_BUDGET_MS, 5 s; at most half of triggerTimeoutMs). */
   pollBudgetMs?: number;
+  /** The engine's trigger timeout (default TRIGGER_TIMEOUT_MS, 10 s): the poll budget is at most half of it. */
+  triggerTimeoutMs?: number;
 }
 
 export class DcaTrigger implements Trigger {
@@ -86,7 +88,7 @@ export class DcaTrigger implements Trigger {
     this.now = d.now ?? Date.now;
     this.dry = d.cfg.mode === "dry";
     this.specs = new Map(d.cfg.dca.schedules.map((s) => [s.id, s]));
-    this.work = new PollWork<Candidate>(d.log, d.pollBudgetMs);
+    this.work = new PollWork<Candidate>(d.log, d.pollBudgetMs, d.triggerTimeoutMs);
   }
 
   private key(id: string, run: number): string {
@@ -186,12 +188,27 @@ export class DcaTrigger implements Trigger {
       }
       this.stats.runs++;
       if (s.side === "buy") push({ mint: s.mint, chain: "solana", seenAtMs: this.now(), source: "schedule", reason: `${s.id} run ${r.run}`, meta: { schedule: s.id, run: r.run, startedAt: r.startedAt } });
-      else await this.sellRun(r, s, ctx.rpc);
+      else
+        try {
+          await this.sellRun(r, s, ctx.rpc, ctx.shouldStop);
+        } catch (e) {
+          this.fail(r, e);
+        }
     }
   }
 
+  /** A run that threw: ended failed with the orders it booked (they run on through the core), alerted. */
+  private fail(r: { id: string; run: number; ref?: unknown }, e: unknown): void {
+    const loc = this.local.get(this.key(r.id, r.run));
+    const ids = [...new Set([...(loc?.orders ?? []), ...runBuyOrders(this.d.ledger, this.dry, r.id, r.run).map((o) => o.id)])];
+    const why = String((e as Error)?.message ?? e).slice(0, 300);
+    this.d.log.error("dca_run_failed", { schedule: r.id, run: r.run, error: String((e as Error)?.stack ?? e).slice(0, 1000), orders: ids });
+    this.d.alerter.raise(`dca:${r.id}:run_failed`, `dca ${r.id} run ${r.run} failed: ${why}${ids.length ? `; its orders ${ids.join(", ")} go on` : "; nothing booked"}`);
+    this.end(r, "failed", `${why}${ids.length ? `; orders ${ids.join(", ")}` : ""}`);
+  }
+
   /** A sell run: the guards on a fresh read, then a sell over the coin's lots. */
-  private async sellRun(r: Run, s: DcaSchedule, rpc: Rpc): Promise<void> {
+  private async sellRun(r: Run, s: DcaSchedule, rpc: Rpc, shouldStop: () => boolean = () => false): Promise<void> {
     const skip = (why: string) => {
       this.d.log.info("dca_sell_skip", { schedule: s.id, run: r.run, mint: s.mint, why });
       this.end(r, "skipped", why);
@@ -221,10 +238,12 @@ export class DcaTrigger implements Trigger {
       if (imp > s.maxImpactBps) return skip(`impact ${imp} bps > ${s.maxImpactBps}`);
     }
     const loc = this.local.get(this.key(r.id, r.run))!;
+    if (shouldStop()) return this.end(r, "interrupted", "STOP before the sell was booked; nothing placed");
     const res = await sellLots(this.engine, this.d.ledger, this.dry, s.mint, amount, `dca ${s.id} run ${r.run}`, false, (id) => {
       loc.orders.push(id);
       this.d.sched.setRef(r.id, r.run, { orders: loc.orders });
-    });
+    }, shouldStop);
+    if (!res.orders.length && res.stopped) return this.end(r, "interrupted", "STOP before the sell was booked; nothing placed");
     if (!res.orders.length) return skip(`no sell booked: ${res.why.join("; ") || "nothing to sell"}`);
     loc.state = "booked";
     this.stats.sold++;
@@ -323,13 +342,13 @@ export async function makeBot(ctx: Ctx, ledger: Ledger, d: { now?: () => number;
 }
 
 /** The scheduler, the lots, the trigger and the engine around an executor (a library user, or a test, brings its own). */
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number; pollBudgetMs?: number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number; pollBudgetMs?: number; triggerTimeoutMs?: number }): Built {
   const { cfg, ledger } = d;
   const mints = [...new Set(cfg.dca.schedules.map((s) => s.mint))];
   const lots = new WalletLots({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, mints, enabled: cfg.dca.walletLots, excludeStateDirs: cfg.dca.excludeStateDirs, minValueSol: cfg.dca.minValueSol, maxTransferFeeBps: cfg.dca.maxTransferFeeBps, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   const sched = new Scheduler({ ledger, specs: cfg.dca.schedules, dry: cfg.mode === "dry", log: d.log, ...(d.now ? { now: d.now } : {}), ...(d.random ? { random: d.random } : {}) });
-  const trigger = new DcaTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}), ...(d.pollBudgetMs !== undefined ? { pollBudgetMs: d.pollBudgetMs } : {}) });
-  const engine = new Engine({ cfg, ledger, trigger, executor: d.executor, strategy: new LotExits(d.strategy, lots), rpc: d.rpc, log: d.log, alerter: d.alerter, venues: { pump: true }, pumpBuys: true, adopter: lots, pauseSells: true, ...(d.now ? { now: d.now } : {}) });
+  const trigger = new DcaTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}), ...(d.pollBudgetMs !== undefined ? { pollBudgetMs: d.pollBudgetMs } : {}), ...(d.triggerTimeoutMs !== undefined ? { triggerTimeoutMs: d.triggerTimeoutMs } : {}) });
+  const engine = new Engine({ cfg, ledger, trigger, executor: d.executor, strategy: new LotExits(d.strategy, lots), rpc: d.rpc, log: d.log, alerter: d.alerter, venues: { pump: true }, pumpBuys: true, adopter: lots, pauseSells: true, ...(d.now ? { now: d.now } : {}), ...(d.triggerTimeoutMs !== undefined ? { triggerTimeoutMs: d.triggerTimeoutMs } : {}) });
   trigger.engine = engine;
   return { engine, trigger, lots, sched };
 }
