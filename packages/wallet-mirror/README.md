@@ -20,9 +20,16 @@ Built by [Bruce Jeet](https://github.com/BruceJeet).
 - **What it copies:** by default a leader's **open** (a buy from flat: the leader held at most 1 % of what it holds
   after), once per leader and coin, only if the trade is at most `maxAgeSec` old when seen, on a venue you allow, and
   on a coin the bot can price (so its exits can run). No buy attempt is built after the leader's time plus `maxAgeSec`.
+  Not copied: a coin the leader has already sold out of, or sold below `minLeaderHeldFraction` of its peak, by the
+  time the bot decides; and a buy whose price (the venue's quote for your ticket) is more than `maxOverLeaderBps` over
+  the leader's own fill (its SOL over its tokens; that SOL is all-in: venue fees, tips and platform fees it paid).
 - **What it sells:** when a leader sells, each of your positions copied from that leader sells the same share of what
   the leader held before that sell (a leader that sells out: you sell out). The share comes from the leader's own
-  balance in that transaction. Your `exit` strategy (take profit, stop loss, time, ladder, trail...) runs as well.
+  balance in that transaction. Sells in the same slot as the copied buy count when the leader's balance shows they
+  came after it. Small sells under `minSellFraction` add up and are mirrored together once they pass it. Your `exit`
+  strategy (take profit, stop loss, time, ladder, trail...) runs as well.
+- **Transfers:** a leader moving a coin you hold from it out of its wallet without a trade is alerted (it may sell
+  from another wallet). Nothing is sold for it. To see these, the bot also reads the leaders' token transfers.
 - **Caps:** the core's (`buy.maxOpen`, `buy.lifetimeSol`, `buy.maxPerCoin`, `PAUSE_BUYS`) and per leader
   (`maxEntries`, `maxSol`).
 - **Execution, exits and dry mode** as candle-launch-bot: Candle's trade API from the embedded wallet or a TEE wallet;
@@ -76,6 +83,8 @@ The core's sections (`mode`, `payer`, `apiKeyEnv`, `rpcUrlEnv`, `wallet`, `signe
     "sells": true,
     "sellsFrom": "copied",
     "minSellFraction": 0,
+    "minLeaderHeldFraction": 0.5,
+    "maxOverLeaderBps": 3000,
     "maxImpactBps": 500
   },
   "source": { "fetchPerSec": 1, "fetchBurst": 8, "backfillLimit": 300, "reconcileSec": 300, "poll": false, "pollSec": 15 }
@@ -98,7 +107,9 @@ The core's sections (`mode`, `payer`, `apiKeyEnv`, `rpcUrlEnv`, `wallet`, `signe
 | `mirror.venues` | venues (or the Jupiter route) whose trades are copied (default all) |
 | `mirror.sells` | mirror the leaders' sells (default true) |
 | `mirror.sellsFrom` | `copied` (default): only the leader the position copied; `any`: any listed leader's sell of the coin |
-| `mirror.minSellFraction` | a leader sell of a smaller share is not mirrored (default 0; a sell-out always is) |
+| `mirror.minSellFraction` | leader sells of a smaller share wait and add up; they are mirrored together once they pass it (default 0; a sell-out always is) |
+| `mirror.minLeaderHeldFraction` | skip the copy when the leader, by the time the bot decides, holds less than this share of its peak since the buy (default 0.5; 0 off) |
+| `mirror.maxOverLeaderBps` | skip the copy when your price is more than this many bps over the leader's fill (default 3000) |
 | `mirror.maxImpactBps` | most price impact of the ticket (default 500); also the buy-retry limit |
 | `mirror.checkPrograms`, `extraPrograms`, `sellFloorMarginBps`, `buyFloorMarginBps` | TEE wallet only, as the other bots |
 | `source.rpcUrlEnv` / `wsUrlEnv` | a separate RPC for the watcher (default: the bot's) |
@@ -155,6 +166,8 @@ never copied from it again, and a sell owed for a leader's sell stays owed until
   pool, the pump.fun curve, or PumpSwap) is not bought: its exits could not run.
 - **One entry per coin.** `buy.maxPerCoin` is 1: two leaders opening the same coin give one copy, of whichever the bot
   decides first.
+- **A restart drops undecided buys.** A leader buy seen but not yet decided when the bot stops is not decided after
+  the restart: no buy is made for it (and never a second one). By then it is usually past `maxAgeSec` anyway.
 - **Second token accounts.** The leader's holding comes from the token accounts its transaction lists; a second
   account of the same coin that the transaction does not touch is not seen.
 - **Solana only.**
