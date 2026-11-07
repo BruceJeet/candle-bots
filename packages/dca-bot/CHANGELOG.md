@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-First version, on candle-bot-core with the scheduler and lots (batch 5).
+First release, on candle-bot-core 0.7.0 (pinned exactly; it ships the scheduler and lots).
 
 - Schedules that buy (`sol` per run) or sell (`sol` worth, or a `fraction` of what the bot holds) one coin every
   `everySec`, optionally at a UTC time of day, with jitter, `maxRuns` and `until`.

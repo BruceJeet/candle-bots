@@ -1,5 +1,12 @@
 # Changelog: candle-rug-watcher
 
+## 0.1.2
+
+- On candle-bot-core 0.7.0 (pinned exactly).
+- Opt-in `rules.devDump.walletSource`: each watched coin's creator is followed on chain (the core's wallet watcher).
+  A creator's sell of a watched coin runs that coin's holder poll at once instead of at the next `holdersPollMs`. The
+  dev rule, its reads and its confirming read are unchanged. Off by default: nothing changes for an existing config.
+
 ## 0.1.1
 
 - Pins candle-bot-core 0.6.0 (batch 3: opt-in additions only; no change in this package).

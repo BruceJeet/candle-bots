@@ -646,6 +646,31 @@ recovery already count every position of a coin, and one attempt per coin runs a
 
 candle-dca-bot and candle-rebalancer are built on both.
 
+## Wallet watcher (opt-in)
+
+`sources/wallets` (batch 4) follows chosen wallets on chain and decodes their buys and sells (`market/walletTrade`)
+on the pump.fun curve, PumpSwap, the Candle curve, Meteora DAMM v2 and Jupiter routes, from each transaction's own
+balance changes. SOL is all-in (venue fees, tips and platform fees the wallet paid), less the network fee and rent,
+which are reported apart.
+- One `logsSubscribe` per wallet. After every gap (and at start), a backfill from the verified point: the newest
+  signature up to which every signature of the wallet was listed.
+- Reads go through one paced queue (default 1 per second after a burst of 8; the public RPC allows about that).
+- A gap is reported recovered or not; an event after a hole says `complete: false`.
+- `checkpoint(wallet)` is the restart point: never past a queued transaction.
+- Each event carries its place in its slot; `drainOrders` gives the chain's order of a slot. With `transfers`,
+  `drainMoves` gives token balances that fell without a trade.
+- `sources/walletPositions` (`LeaderBook`) reads open, add, reduce and close from the transaction's own balances.
+  `sources/walletReplay` records and replays. candle-wallet-mirror and the rug watcher's `walletSource` use them.
+
+## Perps and venues (opt-in)
+
+`perps/` (batch 6): a perps venue interface (`perps/venue`) with Hyperliquid through the Candle SDK (`perps/sdkVenue`:
+`perpsOpen`, `perpsClose`, `perpsLeverage` only; public `/info` reads, no key) and a paper venue for dry runs
+(`perps/paper`); a hedge book that records every order before the call and freezes a coin while an order's outcome is
+unknown (`perps/book`); a pure hedge planner (`perps/planner`); a wallet's spot bags priced on their venues
+(`perps/spot`). `market/venues` reads one coin's price on its own venue and on listed PumpSwap and DAMM v2 pools.
+candle-perps-hedger and candle-spread-watcher are built on them.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;
@@ -675,7 +700,7 @@ candle-dca-bot and candle-rebalancer are built on both.
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/strategies/event`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`, `/scheduler`, `/lots`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/strategies/event`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`, `/scheduler`, `/lots`, `/market/walletTrade`, `/sources/wallets`, `/sources/walletPositions`, `/sources/walletReplay`, `/market/venues`, `/perps/venue`, `/perps/sdkVenue`, `/perps/paper`, `/perps/book`, `/perps/planner`, `/perps/spot`, `/perps/wallet`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.

@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-First version, on candle-bot-core with the scheduler and lots (batch 5).
+First release, on candle-bot-core 0.7.0 (pinned exactly; it ships the scheduler and lots).
 
 - Holds a wallet at target weights (coins plus SOL) on a schedule: sells what is over its band first, then, once the
   sells have ended, buys what is under from the wallet as it is then.

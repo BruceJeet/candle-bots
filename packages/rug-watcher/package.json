@@ -1,6 +1,6 @@
 {
   "name": "candle-rug-watcher",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Watches the coins a Solana wallet holds and sells (or alerts) when a rule fires: a liquidity pull, a price crash, the creator dumping, a large holder leaving. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.6.0"
+    "candle-bot-core": "0.7.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

@@ -1,5 +1,33 @@
 # Changelog: candle-bot-core
 
+## 0.7.0
+
+Batches 4 to 6. New modules only, all opt-in: no existing module changed, and nothing changes for an existing bot.
+
+- **Wallet watcher** (batch 4):
+  - `market/walletTrade` decodes one wallet's trade from a transaction's own balance changes, to the lamport. It
+    covers the pump.fun curve, PumpSwap, the Candle curve, Meteora DAMM v2 and Jupiter routes; anything else is
+    skipped with a reason. SOL is all-in, less the network fee and rent (both reported).
+  - `sources/wallets` (`WalletSource`) follows wallets with `logsSubscribe` per wallet, a backfill from the verified
+    point after every gap, a paced read queue (the public RPC allows about 1 read a second), poll mode, and a
+    checkpoint for restarts. A gap is reported recovered or not, never as "no trades". Each trade's place in its slot
+    is reported, and so are the chain's order of a slot and token balances that fall without a trade (opt-in
+    `transfers`).
+  - `sources/walletPositions` (`LeaderBook`): open, add, reduce and close, from the transaction's own balances.
+  - `sources/walletReplay`: record and replay.
+- **Timed runs and lots** (batch 5):
+  - `scheduler`: runs claimed in the ledger before acting, a missed-run policy (`skip` / `once`), a UTC time of day,
+    and jitter.
+  - `lots`: one position per buy, wallet lots booked once per coin, and sells over lots through `Engine.placeSell`.
+    `withLots` lifts `buy.maxPerCoin` for that bot only.
+- **Perps and venues** (batch 6):
+  - `perps/venue` is a perps venue interface, with Hyperliquid through the Candle SDK (`perps/sdkVenue`: `perpsOpen`,
+    `perpsClose` and `perpsLeverage` only; public `/info` reads) and a paper venue for dry runs (`perps/paper`).
+  - `perps/book` records every order before the call; a coin with an order of unknown outcome is frozen.
+  - `perps/planner` is a pure hedge planner: targets, the kill rule for unpriced bags, margin and notional caps.
+  - `perps/spot` is a wallet's spot bags priced on their venues.
+  - `market/venues` gives one coin's price on its own venue and on listed PumpSwap and DAMM v2 pools.
+
 ## 0.6.0
 
 Batch 3. Opt-in; nothing changes for an existing bot. (0.5.0 stays the batch 2 state.)

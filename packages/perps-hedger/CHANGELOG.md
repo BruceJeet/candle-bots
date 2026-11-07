@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-First release. Needs the candle-bot-core release that ships `perps/` (the core is not bumped in this branch).
+First release, on candle-bot-core 0.7.0 (pinned exactly; it ships `perps/`).
 
 - Hedges the spot bags of a Solana wallet (whole wallet or a list) with Hyperliquid perps through the Candle SDK
   (`perpsOpen`, `perpsClose`, `perpsLeverage` only). The hedge is on the coin's own perp when one is named and listed,

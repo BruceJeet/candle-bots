@@ -2,7 +2,7 @@
 
 ## 0.1.0
 
-First release. Needs the candle-bot-core release that ships `market/venues` (the core is not bumped in this branch).
+First release, on candle-bot-core 0.7.0 (pinned exactly; it ships `market/venues`).
 
 - Watch-only: no wallet, no key, never trades.
 - Each coin's price on its own venue, on listed PumpSwap and Meteora DAMM v2 pools, and on its Hyperliquid perp, with
