@@ -1,5 +1,5 @@
 {
-  "comment": "Watch-only: no wallet, no API key, never trades. One coin on its own venue (as the core finds it: pump.fun curve, PumpSwap, Candle curve or its DAMM v2 pool) and its Hyperliquid perp. Add other pools of a coin by address under pools ({ \"venue\": \"pumpswap\" | \"damm\", \"address\": ... }). Add an alerts sink to get the alerts somewhere; without one they go to events.jsonl only.",
+  "comment": "Watch-only: no wallet, no API key, never trades. `check` shows each venue and why one is not read (PUMP is not a pump.fun curve coin, so its own read fails: add its PumpSwap pool by address). One coin on its own venue (as the core finds it: pump.fun curve, PumpSwap, Candle curve or its DAMM v2 pool) and its Hyperliquid perp. Add other pools of a coin by address under pools ({ \"venue\": \"pumpswap\" | \"damm\", \"address\": ... }). Add an alerts sink to get the alerts somewhere; without one they go to events.jsonl only.",
   "mode": "watch",
   "stateDir": "./state-spread",
   "loopMs": 10000,

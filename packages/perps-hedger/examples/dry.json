@@ -5,7 +5,7 @@
   "rpcUrlEnv": "SOLANA_RPC_URL",
   "stateDir": "./state-hedge",
   "loopMs": 15000,
-  "spot": { "wallet": "11111111111111111111111111111111", "mode": "wallet", "maxBags": 50 },
+  "spot": { "wallet": "SysvarC1ock11111111111111111111111111111111", "mode": "wallet", "maxBags": 50 },
   "perps": { "marginMode": "isolated", "slippageBps": 100, "paper": { "startUsd": 1000 } },
   "hedge": {
     "proxy": "SOL",

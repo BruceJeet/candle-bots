@@ -251,7 +251,9 @@ export class Hedger {
       return;
     }
     if (plan.capped) this.d.alerter.raise("perps:capped", `hedge capped by ${plan.capped.by}: targets at ${(plan.capped.factor * 100).toFixed(1)} %`, plan.capped);
-    for (const b of plan.bags) if (b.status === "unpriced" && b.coin) this.d.alerter.raise(`spot:unpriced:${b.mint}`, `${b.mint} cannot be priced: its hedge on ${b.coin} is closed`, { mint: b.mint });
+    // Only a bag that had a price (and so a hedge) is alerted when it loses it; a coin never priced (junk, an airdrop)
+    // is in status.json only.
+    for (const b of plan.bags) if (b.status === "unpriced" && b.coin && this.bags.get(b.mint)?.pricedAt != null) this.d.alerter.raise(`spot:unpriced:${b.mint}`, `${b.mint} cannot be priced: its hedge on ${b.coin} is closed`, { mint: b.mint });
     for (const l of plan.lines) if (l.status === "no_market") this.d.alerter.raise(`perps:no-market:${l.coin}`, `${l.coin}: ${l.note}; no orders on it`, { coin: l.coin });
     for (const o of plan.orders) {
       if (shouldStop()) break;
