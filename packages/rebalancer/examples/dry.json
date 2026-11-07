@@ -1,0 +1,21 @@
+{
+  "comment": "Dry run: plans and trades with paper fills; never trades for real. No API key needed. Set the target coins' mints (and your wallet, and a key for live) before running: the bot refuses to start until they are real addresses. The weights and solWeight sum to 1. Run `plan` first to see the full plan for your wallet.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "buy": { "sol": 0.1, "maxSlippageBps": 500, "maxOpen": 200, "lifetimeSol": 2 },
+  "sell": { "maxSlippageBps": 1000 },
+  "rebalance": {
+    "targets": { "SET_FIRST_COIN_MINT": 0.3, "SET_SECOND_COIN_MINT": 0.2 },
+    "solWeight": 0.5,
+    "bandPct": 5,
+    "minTradeSol": 0.01,
+    "maxSolPerRun": 0.2,
+    "reserveSol": 0.05,
+    "maxImpactBps": 300,
+    "schedule": { "everySec": 21600, "atUtc": "00:00", "jitterSec": 300, "missed": "once" }
+  }
+}
