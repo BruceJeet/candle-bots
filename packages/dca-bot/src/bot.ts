@@ -17,7 +17,7 @@ import { decodeMint } from "candle-bot-core/market/mint";
 import { pumpCurveSell, pumpPoolSell } from "candle-bot-core/market/pump";
 import { parts, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { Scheduler, type Run } from "candle-bot-core/scheduler";
-import { LotExits, WalletLots, lotsOf, lotsSellRequests, ordersEnded, ordersSummary, runBuyOrders, scheduleBuyLamports, sellLots } from "candle-bot-core/lots";
+import { LotExits, PollWork, WalletLots, checkExcludeDirs, lotsOf, lotsSellRequests, ordersEnded, ordersSummary, runBuyOrders, scheduleBuyLamports, sellLots } from "candle-bot-core/lots";
 import type { Ledger } from "candle-bot-core/ledger";
 import type { Rpc } from "candle-bot-core/solana/rpc";
 import type { Logger } from "candle-bot-core/log";
@@ -27,7 +27,8 @@ type Ctx = CoreCtx<Config>;
 
 /** A run of this process: waiting for its buy verdict, or with its orders booked. */
 interface Local {
-  state: "awaiting" | "booked";
+  /** placing: a sell run between its claim and its last order (set before any await). */
+  state: "awaiting" | "placing" | "booked";
   at: number;
   orders: number[];
 }
@@ -61,6 +62,8 @@ export interface DcaDeps {
   sched: Scheduler;
   lots: WalletLots;
   now?: () => number;
+  /** How long a poll waits for its run work (default POLL_BUDGET_MS, 5 s). */
+  pollBudgetMs?: number;
 }
 
 export class DcaTrigger implements Trigger {
@@ -76,12 +79,14 @@ export class DcaTrigger implements Trigger {
   private decimals = new Map<string, number>();
   private specs: Map<string, DcaSchedule>;
   stats = { runs: 0, bought: 0, sold: 0, skipped: 0, interrupted: 0 };
+  private work: PollWork<Candidate>;
 
   constructor(d: DcaDeps) {
     this.d = d;
     this.now = d.now ?? Date.now;
     this.dry = d.cfg.mode === "dry";
     this.specs = new Map(d.cfg.dca.schedules.map((s) => [s.id, s]));
+    this.work = new PollWork<Candidate>(d.log, d.pollBudgetMs);
   }
 
   private key(id: string, run: number): string {
@@ -131,6 +136,7 @@ export class DcaTrigger implements Trigger {
     for (const r of this.d.sched.inflight()) {
       const k = this.key(r.id, r.run);
       const loc = this.local.get(k);
+      if (loc?.state === "placing") continue;
       if (loc?.state === "awaiting") {
         if (this.now() - loc.at > VERDICT_MAX_MS) this.end(r, "failed", "no verdict from the engine");
         continue;
@@ -152,25 +158,36 @@ export class DcaTrigger implements Trigger {
     }
   }
 
+  /**
+   * The run work (requests, settling, claims, sell runs) runs as one PollWork step at a time: a poll waits for it at
+   * most `pollBudgetMs` (under the engine's trigger timeout), and buys made by a step that took longer come with the
+   * next poll. A second poll never starts a second step.
+   */
   async poll(ctx: TriggerContext): Promise<Candidate[]> {
     // Nothing runs before the wallet's bags are booked as lots (a sell must see them; a buy must not come first).
     if (!this.d.lots.ready) return [];
+    return this.work.poll((push) => this.step(ctx, push), () => ctx.wake());
+  }
+
+  stop(): Promise<void> {
+    return this.work.stop();
+  }
+
+  private async step(ctx: TriggerContext, push: (c: Candidate) => void): Promise<void> {
     if (this.engine) await lotsSellRequests(this.engine, this.d.ledger, this.dry, this.d.cfg.stateDir, this.d.log);
     this.settle();
-    const out: Candidate[] = [];
     for (const r of this.d.sched.due()) {
+      const s = this.specs.get(r.id)!;
+      // The run's own entry first, before anything is awaited.
+      this.local.set(this.key(r.id, r.run), { state: s.side === "buy" ? "awaiting" : "placing", at: this.now(), orders: [] });
       if (ctx.shouldStop()) {
         this.end(r, "interrupted", "STOP before the run placed anything");
         continue;
       }
       this.stats.runs++;
-      const s = this.specs.get(r.id)!;
-      if (s.side === "buy") {
-        this.local.set(this.key(r.id, r.run), { state: "awaiting", at: this.now(), orders: [] });
-        out.push({ mint: s.mint, chain: "solana", seenAtMs: this.now(), source: "schedule", reason: `${s.id} run ${r.run}`, meta: { schedule: s.id, run: r.run, startedAt: r.startedAt } });
-      } else await this.sellRun(r, s, ctx.rpc);
+      if (s.side === "buy") push({ mint: s.mint, chain: "solana", seenAtMs: this.now(), source: "schedule", reason: `${s.id} run ${r.run}`, meta: { schedule: s.id, run: r.run, startedAt: r.startedAt } });
+      else await this.sellRun(r, s, ctx.rpc);
     }
-    return out;
   }
 
   /** A sell run: the guards on a fresh read, then a sell over the coin's lots. */
@@ -203,10 +220,13 @@ export class DcaTrigger implements Trigger {
       if (typeof imp !== "number") return skip(`impact cap set, ${imp.why}`);
       if (imp > s.maxImpactBps) return skip(`impact ${imp} bps > ${s.maxImpactBps}`);
     }
-    const res = await sellLots(this.engine, this.d.ledger, this.dry, s.mint, amount, `dca ${s.id} run ${r.run}`);
+    const loc = this.local.get(this.key(r.id, r.run))!;
+    const res = await sellLots(this.engine, this.d.ledger, this.dry, s.mint, amount, `dca ${s.id} run ${r.run}`, false, (id) => {
+      loc.orders.push(id);
+      this.d.sched.setRef(r.id, r.run, { orders: loc.orders });
+    });
     if (!res.orders.length) return skip(`no sell booked: ${res.why.join("; ") || "nothing to sell"}`);
-    this.local.set(this.key(r.id, r.run), { state: "booked", at: this.now(), orders: res.orders });
-    this.d.sched.setRef(r.id, r.run, { orders: res.orders });
+    loc.state = "booked";
     this.stats.sold++;
     this.d.log.info(this.dry ? "dry_dca_sell" : "dca_sell", { schedule: s.id, run: r.run, mint: s.mint, amountRaw: amount, placedRaw: res.placedRaw, orders: res.orders, priceSol: m.priceSol, venue: m.venue });
   }
@@ -215,6 +235,7 @@ export class DcaTrigger implements Trigger {
     const meta = c.meta as { schedule: string; run: number; startedAt: number };
     const s = this.specs.get(meta.schedule);
     if (!s || s.side !== "buy") return { verdict: "skip", reason: "unknown schedule" };
+    if (!this.d.sched.inflight().some((r) => r.id === meta.schedule && r.run === meta.run)) return { verdict: "skip", reason: `run ${meta.run} is no longer in flight` };
     const ticket = lamportsOf(s.sol!);
     const caps = ctx.caps(c.mint);
     if (caps.paused) return { verdict: "skip", reason: "PAUSE_BUYS" };
@@ -289,6 +310,7 @@ export function knownProgramsFor(cfg: Config): Set<string> | undefined {
 /** The engine for a run context: every buy and its retries checked on its venue (Candle curve, DAMM v2, pump.fun). */
 export async function makeBot(ctx: Ctx, ledger: Ledger, d: { now?: () => number; random?: () => number } = {}): Promise<Built> {
   const cfg = ctx.cfg;
+  checkExcludeDirs(cfg.dca.excludeStateDirs, cfg.stateDir, "config.dca.excludeStateDirs");
   const known = knownProgramsFor(cfg);
   const linked = cfg.payer === "linked";
   const decimalsOf = (m: string) => ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6;
@@ -301,12 +323,12 @@ export async function makeBot(ctx: Ctx, ledger: Ledger, d: { now?: () => number;
 }
 
 /** The scheduler, the lots, the trigger and the engine around an executor (a library user, or a test, brings its own). */
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number; pollBudgetMs?: number }): Built {
   const { cfg, ledger } = d;
   const mints = [...new Set(cfg.dca.schedules.map((s) => s.mint))];
-  const lots = new WalletLots({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, mints, minValueSol: cfg.dca.minValueSol, maxTransferFeeBps: cfg.dca.maxTransferFeeBps, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
+  const lots = new WalletLots({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, mints, enabled: cfg.dca.walletLots, excludeStateDirs: cfg.dca.excludeStateDirs, minValueSol: cfg.dca.minValueSol, maxTransferFeeBps: cfg.dca.maxTransferFeeBps, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   const sched = new Scheduler({ ledger, specs: cfg.dca.schedules, dry: cfg.mode === "dry", log: d.log, ...(d.now ? { now: d.now } : {}), ...(d.random ? { random: d.random } : {}) });
-  const trigger = new DcaTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}) });
+  const trigger = new DcaTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}), ...(d.pollBudgetMs !== undefined ? { pollBudgetMs: d.pollBudgetMs } : {}) });
   const engine = new Engine({ cfg, ledger, trigger, executor: d.executor, strategy: new LotExits(d.strategy, lots), rpc: d.rpc, log: d.log, alerter: d.alerter, venues: { pump: true }, pumpBuys: true, adopter: lots, pauseSells: true, ...(d.now ? { now: d.now } : {}) });
   trigger.engine = engine;
   return { engine, trigger, lots, sched };

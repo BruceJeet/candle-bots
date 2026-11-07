@@ -55,6 +55,10 @@ export interface Dca {
   minValueSol: number;
   /** Mints with a transfer fee up to this many bps may be booked and sold (default 0: none). */
   maxTransferFeeBps: number;
+  /** Book the wallet's bags of the schedules' coins as lots (default true). */
+  walletLots: boolean;
+  /** Other bots' state folders on this wallet: their coins are never booked or sold as wallet lots here. */
+  excludeStateDirs: string[];
 }
 
 export type Config = CoreConfig & { dca: Dca };
@@ -67,7 +71,7 @@ const KEYS = [...SCHEDULE_KEYS, "mint", "side", "sol", "fraction", "maxPriceSol"
 const parseDca: SectionParser<Dca> = (raw, core) => {
   const w = "config.dca";
   if (!isObj(raw)) throw new ConfigError(`${w}: required, with "schedules"`);
-  only(raw, ["schedules", "maxImpactBps", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps", "minValueSol", "maxTransferFeeBps"], w);
+  only(raw, ["schedules", "maxImpactBps", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps", "minValueSol", "maxTransferFeeBps", "walletLots", "excludeStateDirs"], w);
   const maxImpactBps = num(raw, "maxImpactBps", w, { min: 0, max: 10_000, int: true, def: 300 });
   const list = raw.schedules;
   if (!Array.isArray(list) || !list.length) throw new ConfigError(`${w}.schedules: a list of at least one schedule`);
@@ -116,6 +120,8 @@ const parseDca: SectionParser<Dca> = (raw, core) => {
     buyFloorMarginBps: num(raw, "buyFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
     minValueSol: num(raw, "minValueSol", w, { min: 0, def: 0.001 }),
     maxTransferFeeBps: num(raw, "maxTransferFeeBps", w, { min: 0, max: 10_000, int: true, def: 0 }),
+    walletLots: bool(raw, "walletLots", w, true),
+    excludeStateDirs: (strList(raw, "excludeStateDirs", w, { def: [] }) ?? []).map((d) => resolve(core.baseDir, d)),
   };
 };
 
@@ -128,7 +134,9 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
   const buys = isObj(d) && Array.isArray(d.schedules) && d.schedules.some((s) => isObj(s) && s.side === "buy");
   if (raw.buy === undefined && buys) throw new ConfigError("config.buy: required when a schedule buys ({ sol: the largest ticket, maxSlippageBps, maxOpen: lots held at once, lifetimeSol: all buys ever })");
   const withDefaults = { ...raw, ...(raw.buy === undefined ? { buy: NO_BUYS } : {}), ...(raw.exit === undefined ? { exit: { strategy: "hold" } } : {}) };
-  return withLots(parseCore(withDefaults, baseDir, SECTIONS) as Config);
+  const cfg = withLots(parseCore(withDefaults, baseDir, SECTIONS) as Config);
+  for (const d of cfg.dca.excludeStateDirs) if (d === cfg.stateDir) throw new ConfigError(`config.dca.excludeStateDirs: "${d}" is this bot's own stateDir`);
+  return cfg;
 }
 
 export function loadConfig(path: string): Config {

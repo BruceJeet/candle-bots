@@ -43,6 +43,10 @@ export interface Rebalance {
   /** A wallet bag worth less than this (SOL) is not booked as a lot. */
   minValueSol: number;
   maxTransferFeeBps: number;
+  /** Book the wallet's bags of the targets as lots (default true). */
+  walletLots: boolean;
+  /** Other bots' state folders on this wallet: their coins are never booked or sold as wallet lots here. */
+  excludeStateDirs: string[];
 }
 
 export type Config = CoreConfig & { rebalance: Rebalance };
@@ -50,7 +54,7 @@ export type Config = CoreConfig & { rebalance: Rebalance };
 const parseRebalance: SectionParser<Rebalance> = (raw, core) => {
   const w = "config.rebalance";
   if (!isObj(raw)) throw new ConfigError(`${w}: required, with "targets", "solWeight", "maxSolPerRun" and "schedule"`);
-  only(raw, ["targets", "solWeight", "bandPct", "minTradeSol", "maxSolPerRun", "reserveSol", "schedule", "maxImpactBps", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps", "minValueSol", "maxTransferFeeBps"], w);
+  only(raw, ["targets", "solWeight", "bandPct", "minTradeSol", "maxSolPerRun", "reserveSol", "schedule", "maxImpactBps", "buyWithinSec", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps", "minValueSol", "maxTransferFeeBps", "walletLots", "excludeStateDirs"], w);
   const t = raw.targets;
   if (!isObj(t) || !Object.keys(t).length) throw new ConfigError(`${w}.targets: an object { "<mint>": weight, ... } with at least one coin`);
   if (Object.keys(t).length > MAX_TARGETS) throw new ConfigError(`${w}.targets: at most ${MAX_TARGETS} coins`);
@@ -86,6 +90,8 @@ const parseRebalance: SectionParser<Rebalance> = (raw, core) => {
     buyFloorMarginBps: num(raw, "buyFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),
     minValueSol: num(raw, "minValueSol", w, { min: 0, def: 0.001 }),
     maxTransferFeeBps: num(raw, "maxTransferFeeBps", w, { min: 0, max: 10_000, int: true, def: 0 }),
+    walletLots: bool(raw, "walletLots", w, true),
+    excludeStateDirs: (strList(raw, "excludeStateDirs", w, { def: [] }) ?? []).map((d) => resolve(core.baseDir, d)),
   };
 };
 
@@ -95,7 +101,9 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
   if (!isObj(raw)) throw new ConfigError("config: must be a JSON object");
   if (raw.exit !== undefined) throw new ConfigError("config.exit: the rebalancer sells only to rebalance; remove the exit section");
   if (isObj(raw.buy) && raw.buy.maxPerCoin !== undefined) throw new ConfigError("config.buy.maxPerCoin: not used here (every buy is its own lot)");
-  return withLots(parseCore({ ...raw, exit: { strategy: "hold" } }, baseDir, SECTIONS) as Config);
+  const cfg = withLots(parseCore({ ...raw, exit: { strategy: "hold" } }, baseDir, SECTIONS) as Config);
+  for (const d of cfg.rebalance.excludeStateDirs) if (d === cfg.stateDir) throw new ConfigError(`config.rebalance.excludeStateDirs: "${d}" is this bot's own stateDir`);
+  return cfg;
 }
 
 export function loadConfig(path: string): Config {

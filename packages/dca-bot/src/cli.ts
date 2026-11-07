@@ -7,7 +7,7 @@ import { buyQuote, readMarkets } from "candle-bot-core/market/reader";
 import { decodeMint } from "candle-bot-core/market/mint";
 import { tokenBalance } from "candle-bot-core/solana/rpc";
 import { Scheduler } from "candle-bot-core/scheduler";
-import { lotsOf, lotsSellRequestName, sellLots } from "candle-bot-core/lots";
+import { checkExcludeDirs, lotsOf, lotsSellRequestName, sellLots } from "candle-bot-core/lots";
 import { loadConfig, ConfigError, type Config, type DcaSchedule } from "./config.ts";
 import { ledgerPath, makeBot, sellImpactBps } from "./bot.ts";
 
@@ -36,6 +36,16 @@ function context(configPath: string, modeOverride?: string): Ctx {
     throw e;
   }
   return coreContext(cfg, modeOverride);
+}
+
+/** The other bots' state folders must each hold a ledger before the bot runs or sells. */
+function checkDirs(ctx: Ctx): Ctx {
+  try {
+    checkExcludeDirs(ctx.cfg.dca.excludeStateDirs, ctx.cfg.stateDir, "config.dca.excludeStateDirs");
+  } catch (e) {
+    die((e as Error).message);
+  }
+  return ctx;
 }
 
 const openLedger = (ctx: Ctx) => () => new Ledger(ledgerPath(ctx.cfg));
@@ -155,7 +165,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const config = opt.config ?? "bot.json";
     switch (cmd) {
       case "run": {
-        const ctx = context(config, opt.mode);
+        const ctx = checkDirs(context(config, opt.mode));
         return run(ctx, openLedger(ctx), async (ledger) => {
           const b = await makeBot(ctx, ledger);
           return { engine: b.engine, trigger: b.trigger };
@@ -167,7 +177,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
         return status(context(config));
       case "sell": {
         if (!pos[1]) die("sell <mint> [--fraction f]");
-        return sellCommand(context(config), pos[1], opt.fraction ? Number(opt.fraction) : 1);
+        return sellCommand(checkDirs(context(config)), pos[1], opt.fraction ? Number(opt.fraction) : 1);
       }
       default:
         die(`unknown command ${cmd}`);

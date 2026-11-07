@@ -633,8 +633,13 @@ recovery already count every position of a coin, and one attempt per coin runs a
   with an order in flight is passed over; a lot sold in part is the last order.
 - `WalletLots` is an adoption hook (`EngineDeps.adopter`): a configured coin the wallet holds, in which the bot has
   never had a position, is booked once as a lot (the balance on chain, the junk check, a priceable venue,
-  `minValueSol`, cost at the mark). Tokens that turn up later are alerted (`coin:<mint>:surplus`), never booked. A
-  wallet lot's mint passes the junk check again before each sell. `ready` turns true after its first step.
+  `minValueSol`, cost at the mark, a token account not frozen). Tokens that turn up later are alerted
+  (`coin:<mint>:surplus`), never booked. `excludeStateDirs`: a coin another bot holds (its ledger read as the Adopter
+  reads it, fail closed) is never booked, and a wallet lot of it never sold. A wallet lot's mint passes the junk check
+  again before each sell. `enabled: false` turns wallet lots off. `ready` turns true once every configured coin has a
+  definite answer (a failed read is not one).
+- `PollWork` runs a trigger's run work one step at a time; `poll` waits for it at most `POLL_BUDGET_MS` (5 s, under
+  the trigger timeout), and candidates from a longer step come with the next poll.
 - `LotExits` runs the bot's exit on the lots it bought and holds the wallet lots.
 - `runBuyOrders` finds a run's buys again by the `{ schedule, run }` in their entry context, after a restart too.
 

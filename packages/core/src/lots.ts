@@ -20,10 +20,11 @@
  * `ready` turns true after the first step: a bot places no order before its wallet lots are booked.
  */
 import { randomUUID } from "node:crypto";
-import { readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, unlinkSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import type { Alerter } from "./alerts.ts";
-import { deepFreeze, type Config } from "./config.ts";
+import { ConfigError, deepFreeze, type Config } from "./config.ts";
 import { readControl, type AdoptionHook, type Engine } from "./engine.ts";
 import type { Ledger, OrderRow, PositionRow } from "./ledger.ts";
 import type { Logger } from "./log.ts";
@@ -114,7 +115,7 @@ export function ordersSummary(ledger: Ledger, ids: number[]): { status: "done" |
  * one (the part is a fraction to 1e-6, so up to 1e-6 of that lot may stay unsold). Returns the orders booked and the
  * raw amount they cover.
  */
-export async function sellLots(engine: Engine, ledger: Ledger, dry: boolean, mint: string, amountRaw: bigint, reason: string, manual = false): Promise<{ orders: number[]; placedRaw: bigint; why: string[] }> {
+export async function sellLots(engine: Engine, ledger: Ledger, dry: boolean, mint: string, amountRaw: bigint, reason: string, manual = false, onOrder?: (id: number) => void): Promise<{ orders: number[]; placedRaw: bigint; why: string[] }> {
   const lots = lotsOf(ledger, dry, mint).sort((a, b) => {
     const d = BigInt(b.remaining_raw) - BigInt(a.remaining_raw);
     return d > 0n ? 1 : d < 0n ? -1 : a.id - b.id;
@@ -140,6 +141,8 @@ export async function sellLots(engine: Engine, ledger: Ledger, dry: boolean, min
       continue;
     }
     orders.push(id);
+    // The caller records each order at once (a run's ref), so a restart mid-way still finds every order booked.
+    onOrder?.(id);
     const booked = BigInt(ledger.order(id)!.amount_raw);
     // A part of a lot is the last order: what the fraction's rounding (1e-6 of the lot) left is not sold from another lot.
     left = take < rem ? 0n : left - booked;
@@ -161,6 +164,13 @@ export interface WalletLotsDeps {
   holds: { reserveMint(mint: string): boolean; releaseMint(mint: string): void; mintBusy(mint: string): boolean; mintEpoch(mint: string): number };
   /** The coins whose wallet bags become lots. */
   mints: string[];
+  /** Wallet lots on (default true). Off: no bag is ever booked; `ready` at once; surplus alerts still run. */
+  enabled?: boolean;
+  /**
+   * Other bots' state folders sharing this wallet: a coin any of them holds is never booked here, and a wallet lot of
+   * it is never sold here. A ledger that cannot be read stops both (fail closed), as the core Adopter does.
+   */
+  excludeStateDirs?: string[];
   /** Smallest bag booked, SOL at the mark (default 0.001). */
   minValueSol?: number;
   /** Transfer-fee mints up to this many bps pass the junk check (default 0). */
@@ -176,6 +186,74 @@ export const LOT_RETRY_MS = 600_000;
 /** Surplus check per coin. */
 export const LOT_SURPLUS_MS = 600_000;
 
+/** Another bot's ledger last read good is trusted this long for a sell check when a fresh read fails. */
+export const LOT_OTHERS_GRACE_MS = 300_000;
+/** A coin whose wallet read failed is read again after this long. */
+export const LOT_READ_RETRY_MS = 60_000;
+/** Not ready (a coin's wallet bag still unread) for this long: alerted. */
+export const LOT_NOT_READY_ALERT_MS = 300_000;
+
+/**
+ * The mints other bots hold, from their ledgers (read-only, a 250 ms busy timeout, closed at once): open positions and
+ * failed buys that may have landed. The same query as the core Adopter's `otherBotsMints`. Throws when one cannot be
+ * read (missing, busy, another layout): the caller fails closed.
+ */
+export function otherBotsMints(dirs: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const dir of dirs) {
+    const path = join(dir, "ledger.sqlite");
+    if (!existsSync(path)) throw new Error(`no ledger.sqlite in ${dir}`);
+    let db: DatabaseSync | null = null;
+    try {
+      db = new DatabaseSync(path, { readOnly: true });
+      db.exec("pragma busy_timeout = 250");
+      const rows = db.prepare(
+        `select distinct p.mint mint from positions p where p.status in ('opening','open','exit_stuck')
+           or (p.status = 'failed' and exists (select 1 from orders o where o.position_id = p.id and o.side = 'buy'
+                 and (o.signature is not null or o.ever_signed = 1) and o.status in ('failed','rejected')))`,
+      ).all() as Array<{ mint: string }>;
+      for (const r of rows) out.add(String(r.mint));
+    } catch (e) {
+      throw new Error(`${dir}: ${String((e as Error)?.message ?? e).slice(0, 160)}`);
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        /* closed */
+      }
+    }
+  }
+  return out;
+}
+
+/** Every excludeStateDirs entry must hold a ledger at start, and none may be the bot's own state folder. */
+export function checkExcludeDirs(dirs: readonly string[], ownStateDir: string, where: string): void {
+  for (const d of dirs) {
+    if (d === ownStateDir) throw new ConfigError(`${where}: "${d}" is this bot's own stateDir`);
+    if (!existsSync(join(d, "ledger.sqlite"))) throw new ConfigError(`${where}: no ledger.sqlite in ${d}`);
+  }
+}
+
+/** The wallet's holding of one mint (both token programs) and whether any of its accounts is frozen; null: unreadable. */
+export async function walletHolding(rpc: Rpc, owner: string, mint: string): Promise<{ amount: bigint; frozen: boolean } | null> {
+  try {
+    const r = await rpc.call<any>("getTokenAccountsByOwner", [owner, { mint }, { encoding: "jsonParsed", commitment: "confirmed" }]);
+    if (!r || !Array.isArray(r.value)) return null;
+    let amount = 0n;
+    let frozen = false;
+    for (const a of r.value) {
+      const info = a?.account?.data?.parsed?.info;
+      const amt = info?.tokenAmount?.amount;
+      if (typeof amt !== "string" || !/^\d+$/.test(amt)) return null;
+      amount += BigInt(amt);
+      if (info?.state === "frozen" && BigInt(amt) > 0n) frozen = true;
+    }
+    return { amount, frozen };
+  } catch {
+    return null;
+  }
+}
+
 export class WalletLots implements AdoptionHook {
   private d: WalletLotsDeps;
   private now: () => number;
@@ -185,8 +263,13 @@ export class WalletLots implements AdoptionHook {
   private checks = new Map<string, { at: number; why: string | null }>();
   private surplusAt = new Map<string, number>();
   private surplusSeen = new Map<string, { at: number; bal: bigint; epoch: number }>();
-  /** True once the first step has run (every configured coin looked at once). */
+  /** True once every configured coin has had a definite answer (booked, or not to be booked); never before. */
   ready = false;
+  /** Coins with a definite answer (L4: a failed read is not one). */
+  private settled = new Set<string>();
+  private firstStepAt: number | null = null;
+  private othersOk: Set<string> | null = null;
+  private othersOkAt = 0;
   /** Positions booked as wallet lots, `mint:openedAt:qty` (the exit wrapper holds them). */
   readonly keys = new Set<string>();
 
@@ -206,24 +289,51 @@ export class WalletLots implements AdoptionHook {
     return [...this.skipped].map(([mint, s]) => ({ mint, why: s.why, until: new Date(s.until).toISOString() }));
   }
 
-  private skip(mint: string, why: string): void {
+  /** A coin not booked now. `transient`: a read failed (looked at again soon; the coin is not settled). */
+  private skip(mint: string, why: string, transient = false): { ok: false; reason: string } {
     const prev = this.skipped.get(mint);
-    this.skipped.set(mint, { until: this.now() + LOT_RETRY_MS, why });
-    if (prev?.why !== why) this.d.log.info("wallet_lot_skip", { mint, why });
+    this.skipped.set(mint, { until: this.now() + (transient ? LOT_READ_RETRY_MS : LOT_RETRY_MS), why });
+    if (!transient) this.settled.add(mint);
+    if (prev?.why !== why) this.d.log.info("wallet_lot_skip", { mint, why, ...(transient ? { transient } : {}) });
+    return { ok: false, reason: why };
+  }
+
+  /** Other bots' mints read now (null when a ledger cannot be read: alerted; the caller fails closed). */
+  private readOthers(): Set<string> | null {
+    const dirs = this.d.excludeStateDirs ?? [];
+    if (!dirs.length) return new Set();
+    try {
+      const got = otherBotsMints(dirs);
+      this.othersOk = got;
+      this.othersOkAt = this.now();
+      return got;
+    } catch (e) {
+      const why = String((e as Error)?.message ?? e);
+      this.d.log.warn("lots_exclude_unreadable", { why });
+      this.d.alerter.raise(`lots:exclude_unreadable`, `cannot read another bot's ledger (${why}): no wallet lot is booked and no wallet lot is sold until it can be read`);
+      return null;
+    }
   }
 
   async step(shouldStop: () => boolean = () => false): Promise<void> {
     if (this.now() < this.nextAt) return;
     this.nextAt = this.now() + (this.d.everyMs ?? 15_000);
+    this.firstStepAt ??= this.now();
     for (const mint of this.d.mints) {
       if (shouldStop()) return;
       try {
         await this.bookOne(mint);
       } catch (e) {
-        this.skip(mint, `read failed (${String((e as Error)?.message ?? e).slice(0, 80)})`);
+        this.skip(mint, `read failed (${String((e as Error)?.message ?? e).slice(0, 80)})`, true);
       }
     }
-    this.ready = true;
+    // Ready only when every coin has a definite answer: a bag whose read failed could still be booked, and a run before
+    // that would buy or sell as if the bag were not there.
+    if (!this.ready) {
+      const open = this.d.enabled === false ? [] : this.d.mints.filter((m) => !this.settled.has(m));
+      if (!open.length) this.ready = true;
+      else if (this.now() - this.firstStepAt >= LOT_NOT_READY_ALERT_MS) this.d.alerter.raise("lots:not_ready", `no run yet: the wallet's bag of ${open.join(", ")} could not be read (${open.map((m) => this.skipped.get(m)?.why ?? "?").join("; ")})`);
+    }
     if (!this.dry) await this.surplus(shouldStop);
   }
 
@@ -247,33 +357,40 @@ export class WalletLots implements AdoptionHook {
 
   /** Book the coin's wallet bag as a lot, if the bot never had a position in it. */
   async bookOne(mint: string): Promise<{ ok: true; positionId: number } | { ok: false; reason: string }> {
-    if (this.d.ledger.entriesForMint(mint, this.dry) > 0) return { ok: false, reason: "the bot has had a position in this coin" };
+    if (this.d.enabled === false) {
+      this.settled.add(mint);
+      return { ok: false, reason: "wallet lots off" };
+    }
+    if (this.d.ledger.entriesForMint(mint, this.dry) > 0) {
+      this.settled.add(mint);
+      return { ok: false, reason: "the bot has had a position in this coin" };
+    }
     const s = this.skipped.get(mint);
     if (s && s.until > this.now()) return { ok: false, reason: s.why };
+    const others = this.readOthers();
+    if (others === null) return this.skip(mint, "another bot's ledger could not be read", true);
+    if (others.has(mint)) return this.skip(mint, "another bot holds an open position in this coin");
     if (!this.d.holds.reserveMint(mint)) return { ok: false, reason: "mint_busy" };
     try {
-      const bal = await tokenBalance(this.d.rpc, this.d.cfg.wallet, mint);
-      if (bal === null) {
-        this.skip(mint, "balance unreadable");
-        return { ok: false, reason: "balance unreadable" };
+      const h = await walletHolding(this.d.rpc, this.d.cfg.wallet, mint);
+      if (h === null) return this.skip(mint, "balance unreadable", true);
+      if (h.amount <= 0n) {
+        this.settled.add(mint);
+        return { ok: false, reason: "not in the wallet" };
       }
-      if (bal <= 0n) return { ok: false, reason: "not in the wallet" };
+      if (h.frozen) return this.skip(mint, "token account frozen");
+      const bal = h.amount;
       const mc = await this.mintCheck(mint);
-      if (mc.why) {
-        this.skip(mint, `junk or unreadable: ${mc.why}`);
-        return { ok: false, reason: mc.why };
-      }
+      if (mc.why) return this.skip(mint, `junk or unreadable: ${mc.why}`, mc.why.startsWith("mint unreadable"));
       const decimals = mc.decimals!;
       const m = (await readMarkets(this.d.rpc, [{ mint, decimals }], this.now(), this.d.venues ?? { pump: true })).get(mint);
-      if (!m || m.priceSol === null || m.problem) {
-        this.skip(mint, `unpriceable: ${m?.problem ?? "no price"}`);
-        return { ok: false, reason: "unpriceable" };
-      }
+      if (!m || m.priceSol === null || m.problem) return this.skip(mint, `unpriceable: ${m?.problem ?? "no price"}`);
       const valueLamports = BigInt(Math.floor((Number(bal) / 10 ** decimals) * m.priceSol * 1e9));
-      if (Number(valueLamports) / 1e9 < (this.d.minValueSol ?? 0.001)) {
-        this.skip(mint, `dust (${Number(valueLamports) / 1e9} SOL)`);
-        return { ok: false, reason: "dust" };
-      }
+      if (Number(valueLamports) / 1e9 < (this.d.minValueSol ?? 0.001)) return this.skip(mint, `dust (${Number(valueLamports) / 1e9} SOL)`);
+      // The other bots' ledgers once more right before booking (the reads above take a while).
+      const again = this.readOthers();
+      if (again === null) return this.skip(mint, "another bot's ledger could not be read", true);
+      if (again.has(mint)) return this.skip(mint, "another bot holds an open position in this coin");
       const now = this.now();
       const id = this.d.ledger.tx(() => {
         if (this.d.ledger.entriesForMint(mint, this.dry) > 0) return null;
@@ -281,6 +398,7 @@ export class WalletLots implements AdoptionHook {
         this.d.ledger.updatePosition(pid, { status: "open", qty_raw: bal.toString(), qty_source: "wallet", remaining_raw: bal.toString(), cost_lamports: valueLamports.toString(), peak_price: m.priceSol ?? 0, last_price: m.priceSol, note: "wallet lot (basis: mark)" });
         return pid;
       });
+      this.settled.add(mint);
       if (id === null) return { ok: false, reason: "the bot has had a position in this coin" };
       this.keys.add(WalletLots.key(mint, now, bal));
       this.skipped.delete(mint);
@@ -292,9 +410,17 @@ export class WalletLots implements AdoptionHook {
     }
   }
 
-  /** Before a wallet lot's sell: its mint passes the junk check again (cached 60 s). Other lots: no check here. */
+  /**
+   * Before a wallet lot's sell: no other bot holds the coin (their ledgers read now; the last good read for
+   * LOT_OTHERS_GRACE_MS when a read fails; past that the sell is refused), and its mint passes the junk check again
+   * (cached 60 s). Lots the bot bought: no check here.
+   */
   async sellCheck(p: PositionRow): Promise<string | null> {
     if (!isWalletLot(p)) return null;
+    const fresh = this.readOthers();
+    const known = fresh ?? (this.now() - this.othersOkAt <= LOT_OTHERS_GRACE_MS ? this.othersOk : null);
+    if (known === null) return "another bot's ledger could not be read";
+    if (known.has(p.mint)) return "another bot holds an open position in this coin";
     const c = this.checks.get(p.mint);
     if (c && this.now() - c.at < 60_000) return c.why;
     return (await this.mintCheck(p.mint)).why;
@@ -379,5 +505,51 @@ export class LotExits implements ExitStrategy {
   }
   onTick(p: PositionView, m: MarketView) {
     return this.lots.keys.has(WalletLots.key(p.mint, p.openedAtMs, p.qtyRaw)) ? HOLD : this.base.onTick(p, m);
+  }
+}
+
+/** How long a poll of a lots bot waits for its run work before it returns (under the engine's trigger timeout). */
+export const POLL_BUDGET_MS = 5_000;
+
+/**
+ * A trigger's run work (reads, sells, plans) outside the engine's trigger timeout: one piece of work at a time (a
+ * poll never starts a second while one runs), awaited by `poll` for at most `budgetMs`. Work that takes longer goes
+ * on in the background; the candidates it makes wait in the queue for the next poll (and wake the engine), so a slow
+ * RPC never drops a buy. `stop()` waits for the work in hand (the runtime awaits it before the ledger closes).
+ */
+export class PollWork<T> {
+  private work: Promise<void> | null = null;
+  private queue: T[] = [];
+  private stopping = false;
+  private budgetMs: number;
+  private log: Logger;
+  constructor(log: Logger, budgetMs = POLL_BUDGET_MS) {
+    this.log = log;
+    this.budgetMs = budgetMs;
+  }
+  /** Start `step` unless work is in hand; wait for it up to the budget; return what is queued. */
+  async poll(step: (push: (c: T) => void) => Promise<void>, wake: () => void): Promise<T[]> {
+    if (!this.work && !this.stopping) {
+      this.work = step((c) => this.queue.push(c))
+        .catch((e) => this.log.error("poll_work_failed", { error: String((e as Error)?.stack ?? e).slice(0, 1000) }))
+        .finally(() => {
+          this.work = null;
+          if (this.queue.length) wake();
+        });
+    }
+    const w = this.work;
+    if (w) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([w, new Promise<void>((res) => (timer = setTimeout(res, this.budgetMs)))]);
+      clearTimeout(timer);
+    }
+    return this.queue.splice(0);
+  }
+  get busy(): boolean {
+    return this.work !== null;
+  }
+  async stop(): Promise<void> {
+    this.stopping = true;
+    await this.work;
   }
 }

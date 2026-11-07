@@ -56,6 +56,8 @@ never traded.
 | `sellFloorMarginBps` / `buyFloorMarginBps` | 200 / 200 | linked payer: the sell and buy floors, as in the other bots |
 | `minValueSol` | 0.001 | the smallest wallet bag booked as a lot |
 | `maxTransferFeeBps` | 0 | a mint with a transfer fee up to this may be booked |
+| `walletLots` | true | book the wallet's bags of the targets as lots |
+| `excludeStateDirs` | [] | other bots' state folders on this wallet (each must hold a ledger at start) |
 
 ## The schedule
 
@@ -74,7 +76,13 @@ becomes a lot: the wallet's balance on chain, if the mint passes the core's junk
 core can price, worth at least `minValueSol`. Its cost is its value at the mark then. Every buy is its own lot after
 that. Sells take the largest lot first. Tokens that turn up later are alerted (`surplus`), never booked: the plan
 values the wallet's balance, but sells only what the bot's lots hold. There is no exit strategy: the rebalancer sells
-only to rebalance (and on `sell`).
+only to rebalance (and on `sell`). A frozen token account is never booked.
+
+**Run the rebalancer on a wallet of its own, or list the other bots' state folders** in `rebalance.excludeStateDirs`:
+a coin any of them holds is never booked as a lot here, and a wallet lot of it is never sold here. A listed ledger
+that cannot be read stops both (fail closed, alerted). `rebalance.walletLots: false` turns wallet lots off: the plan
+still values the wallet's bags, but only the coins the bot bought are sold. A coin whose wallet read fails holds
+every run back until it is read (alerted after 5 min).
 
 ## Dry runs
 
@@ -93,6 +101,11 @@ schedule, the last plan, the lots per target.
 - Prices are spot prices on each coin's venue; the plan does not model a sale's own impact on the value it brings.
   The buy phase reads the wallet again after the sells, so buys spend what the sells really brought.
 - A fraction sold from a lot is exact to 1e-6 of that lot.
+- Every lot counts against `buy.maxOpen`, wallet lots included (each buy is a lot).
+- The schedule's run count and history are kept in the ledger; a new state folder starts them from zero.
+- Use the bot's own `sell` command. A `sell-*.json` request file written by hand (the core's format) sells one lot
+  only.
+- A run's reads are given about 5 s per loop: on a slow RPC its buys come with a later loop, never lost.
 - Spend: `buy.lifetimeSol` counts tickets only; Candle's platform fee (0.25 % a side), network fees and about
   0.002 SOL of token-account rent per new coin come on top.
 

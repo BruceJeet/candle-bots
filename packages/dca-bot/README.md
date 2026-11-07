@@ -77,7 +77,12 @@ order goes through the core: the wallet's balance is read and the sell clamped t
 never had a position, becomes a lot: the wallet's balance on chain, if the mint passes the core's junk check and the
 coin has a venue the core can price, worth at least `dca.minValueSol` (0.001). Its cost is its value at the mark then.
 That happens once per coin; tokens that turn up later are alerted (`surplus`), never booked. A wallet lot is sold only
-by a sell schedule or `sell`, never by the exit strategy.
+by a sell schedule or `sell`, never by the exit strategy. The token account must not be frozen.
+
+**Run each bot on a wallet of its own, or list the other bots' state folders** in `dca.excludeStateDirs`: a coin any
+of them holds is never booked here, and a wallet lot of it is never sold here. A listed ledger that cannot be read
+stops both (fail closed, alerted). `dca.walletLots: false` turns wallet lots off: the bot then sells only what it
+bought. A coin whose wallet read fails holds every run back until it is read (alerted after 5 min).
 
 **The sell impact cap** compares the venue's own gross out (before fees) with the spot value. Only pump.fun curves
 and PumpSwap have that math in the core: on a Candle curve or DAMM v2 coin a schedule with a sell `maxImpactBps` is
@@ -99,6 +104,8 @@ skipped every run ("sell impact not computable"). Leave the cap out for those co
 | `dca.buyFloorMarginBps` | 200 | linked payer: a buy is never signed with a floor under the decision fill less `buy.maxSlippageBps` and this |
 | `dca.minValueSol` | 0.001 | the smallest wallet bag booked as a lot |
 | `dca.maxTransferFeeBps` | 0 | a mint with a transfer fee up to this may be booked |
+| `dca.walletLots` | true | book the wallet's bags of the schedules' coins as lots |
+| `dca.excludeStateDirs` | [] | other bots' state folders on this wallet (each must hold a ledger at start) |
 
 With payer `embedded` the three linked-payer checks do not apply: Candle signs inside the build. A config with only
 sell schedules needs no `buy` section (every buy cap is then zero).
@@ -110,6 +117,13 @@ result and lots, and the budget used.
 ## Known limits
 
 - One buy schedule per coin (the engine keeps one candidate per coin). Merge two buy schedules of a coin into one.
+- Every lot counts against `buy.maxOpen`, wallet lots included: a schedule that buys every hour needs room for its
+  lots.
+- A schedule's run count, history and budget are kept under its `id`: renaming the `id` starts a new schedule (its
+  budget and `maxRuns` count from zero).
+- Use the bot's own `sell` command. A `sell-*.json` request file written by hand (the core's format) sells one lot
+  only.
+- A run's reads are given about 5 s per loop: on a slow RPC its buy comes with a later loop, never lost.
 - Runs fire on the loop (`loopMs`, default 2 s) after their slot; `jitterSec` adds to that.
 - A fraction sold from a lot is exact to 1e-6 of that lot.
 - Spend: `buy.lifetimeSol` and `budgetSol` count tickets only. Candle's platform fee (0.25 % a side), network fees and

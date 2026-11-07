@@ -16,7 +16,7 @@ import { buyQuote, dryPricer, readMarkets, sellFloor } from "candle-bot-core/mar
 import { decodeMint } from "candle-bot-core/market/mint";
 import { parts, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { Scheduler, type Run } from "candle-bot-core/scheduler";
-import { LotExits, WalletLots, isWalletLot, lotsOf, lotsSellRequests, ordersEnded, ordersSummary, runBuyOrders, sellLots } from "candle-bot-core/lots";
+import { LotExits, PollWork, WalletLots, checkExcludeDirs, isWalletLot, lotsOf, lotsSellRequests, ordersEnded, ordersSummary, runBuyOrders, sellLots } from "candle-bot-core/lots";
 import { tokenBalance, type Rpc } from "candle-bot-core/solana/rpc";
 import type { Ledger } from "candle-bot-core/ledger";
 import type { Logger } from "candle-bot-core/log";
@@ -31,7 +31,8 @@ export const VERDICT_MAX_MS = 600_000;
 
 /** A run of this process. */
 interface Local {
-  phase: "sells" | "buys";
+  /** planning: between the claim and the last sell booked (set before any await). */
+  phase: "planning" | "sells" | "buys";
   at: number;
   sells: number[];
   /** Mints whose buy waits for its verdict. */
@@ -125,6 +126,8 @@ export interface RebalanceDeps {
   sched: Scheduler;
   lots: WalletLots;
   now?: () => number;
+  /** How long a poll waits for its run work (default POLL_BUDGET_MS, 5 s). */
+  pollBudgetMs?: number;
 }
 
 export class RebalanceTrigger implements Trigger {
@@ -141,11 +144,13 @@ export class RebalanceTrigger implements Trigger {
   /** The last plan logged (status.json). */
   lastPlan: { run: number; phase: string; at: string; plan: Record<string, unknown> } | null = null;
   stats = { runs: 0, blocked: 0, sells: 0, buys: 0, interrupted: 0 };
+  private work: PollWork<Candidate>;
 
   constructor(d: RebalanceDeps) {
     this.d = d;
     this.now = d.now ?? Date.now;
     this.dry = d.cfg.mode === "dry";
+    this.work = new PollWork<Candidate>(d.log, d.pollBudgetMs);
   }
 
   private end(run: number, status: "done" | "skipped" | "failed" | "blocked" | "interrupted", detail: string): void {
@@ -184,6 +189,7 @@ export class RebalanceTrigger implements Trigger {
         this.end(r.run, s.filled ? "done" : "interrupted", `resumed after a restart (no new orders): ${s.detail}`);
         continue;
       }
+      if (loc.phase === "planning") continue;
       if (loc.phase === "sells") {
         if (!ordersEnded(this.d.ledger, loc.sells)) continue;
         out.push(...(await this.buyPhase(r, loc, ctx)));
@@ -233,19 +239,33 @@ export class RebalanceTrigger implements Trigger {
     return out;
   }
 
+  /**
+   * The run work (reads, plans, sells) runs as one PollWork step at a time: a poll waits for it at most `pollBudgetMs`
+   * (under the engine's trigger timeout); buys planned by a step that took longer come with the next poll. A second
+   * poll never starts a second step.
+   */
   async poll(ctx: TriggerContext): Promise<Candidate[]> {
     if (!this.d.lots.ready || !this.engine) return [];
-    await lotsSellRequests(this.engine, this.d.ledger, this.dry, this.d.cfg.stateDir, this.d.log);
-    const out = await this.settle(ctx);
+    return this.work.poll((push) => this.step(ctx, push), () => ctx.wake());
+  }
+
+  stop(): Promise<void> {
+    return this.work.stop();
+  }
+
+  private async step(ctx: TriggerContext, push: (c: Candidate) => void): Promise<void> {
+    await lotsSellRequests(this.engine!, this.d.ledger, this.dry, this.d.cfg.stateDir, this.d.log);
+    for (const c of await this.settle(ctx)) push(c);
     for (const r of this.d.sched.due()) {
+      // The run's own entry first, before anything is awaited.
+      this.local.set(r.run, { phase: "planning", at: this.now(), sells: [], awaiting: new Set(), soldSol: 0, skips: [] });
       if (ctx.shouldStop()) {
         this.end(r.run, "interrupted", "STOP before the run placed anything");
         continue;
       }
       this.stats.runs++;
-      out.push(...(await this.sellPhase(r, ctx)));
+      for (const c of await this.sellPhase(r, ctx)) push(c);
     }
-    return out;
   }
 
   /** Phase 1: the plan and the sells. No sells: straight on to the buys. */
@@ -267,18 +287,20 @@ export class RebalanceTrigger implements Trigger {
       this.block(r.run, `no price for ${p.blocked.join(", ")}`);
       return [];
     }
-    const loc: Local = { phase: "sells", at: this.now(), sells: [], awaiting: new Set(), soldSol: 0, skips: [] };
-    this.local.set(r.run, loc);
+    const loc = this.local.get(r.run)!;
     const sells = p.orders.filter((o) => o.side === "sell");
     if (sells.length && this.engine!.sellsPaused()) loc.skips.push("sells: PAUSE_SELLS");
     else
       for (const o of sells) {
-        const res = await sellLots(this.engine!, this.d.ledger, this.dry, o.mint, o.raw!, `rebalance run ${r.run}: ${o.why}`);
-        loc.sells.push(...res.orders);
+        const res = await sellLots(this.engine!, this.d.ledger, this.dry, o.mint, o.raw!, `rebalance run ${r.run}: ${o.why}`, false, (id) => {
+          loc.sells.push(id);
+          this.d.sched.setRef(SCHEDULE_ID, r.run, { sells: loc.sells });
+        });
         if (res.orders.length) loc.soldSol += o.sol * (Number(res.placedRaw) / Number(o.raw!));
         if (res.why.length) loc.skips.push(`sell ${o.mint}: ${res.why.join("; ")}`);
         this.stats.sells += res.orders.length;
       }
+    loc.phase = "sells";
     this.d.sched.setRef(SCHEDULE_ID, r.run, { sells: loc.sells });
     if (loc.sells.length) return [];
     return this.buyPhase(r, loc, ctx);
@@ -287,6 +309,7 @@ export class RebalanceTrigger implements Trigger {
   async decide(c: Candidate, ctx: TriggerContext): Promise<Verdict> {
     const meta = c.meta as { run: number; lamports: string; why: string; decidedAt: number };
     const ticket = BigInt(meta.lamports);
+    if (!this.d.sched.inflight().some((r) => r.run === meta.run)) return { verdict: "skip", reason: `run ${meta.run} is no longer in flight` };
     const caps = ctx.caps(c.mint);
     if (caps.paused) return { verdict: "skip", reason: "PAUSE_BUYS" };
     if (this.now() > meta.decidedAt + this.d.cfg.rebalance.buyWithinSec * 1000) return { verdict: "skip", reason: `stale: over buyWithinSec ${this.d.cfg.rebalance.buyWithinSec} s since the plan` };
@@ -349,6 +372,7 @@ export function knownProgramsFor(cfg: Config): Set<string> | undefined {
 export async function makeBot(ctx: Ctx, ledger: Ledger, d: { now?: () => number; random?: () => number } = {}): Promise<Built> {
   const cfg = ctx.cfg;
   const r = cfg.rebalance;
+  checkExcludeDirs(r.excludeStateDirs, cfg.stateDir, "config.rebalance.excludeStateDirs");
   const known = knownProgramsFor(cfg);
   const linked = cfg.payer === "linked";
   const decimalsOf = (m: string) => ledger.allPositions().find((p) => p.mint === m)?.decimals ?? 6;
@@ -360,12 +384,12 @@ export async function makeBot(ctx: Ctx, ledger: Ledger, d: { now?: () => number;
   return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, strategy, ...d });
 }
 
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Rpc; log: Logger; alerter: Alerter; executor: Executor; strategy: ExitStrategy; now?: () => number; random?: () => number; pollBudgetMs?: number }): Built {
   const { cfg, ledger } = d;
   const r = cfg.rebalance;
-  const lots = new WalletLots({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, mints: Object.keys(r.targets), minValueSol: r.minValueSol, maxTransferFeeBps: r.maxTransferFeeBps, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
+  const lots = new WalletLots({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, mints: Object.keys(r.targets), enabled: r.walletLots, excludeStateDirs: r.excludeStateDirs, minValueSol: r.minValueSol, maxTransferFeeBps: r.maxTransferFeeBps, venues: { pump: true }, ...(d.now ? { now: d.now } : {}) });
   const sched = new Scheduler({ ledger, specs: [r.schedule], dry: cfg.mode === "dry", log: d.log, ...(d.now ? { now: d.now } : {}), ...(d.random ? { random: d.random } : {}) });
-  const trigger = new RebalanceTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}) });
+  const trigger = new RebalanceTrigger({ cfg, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, sched, lots, ...(d.now ? { now: d.now } : {}), ...(d.pollBudgetMs !== undefined ? { pollBudgetMs: d.pollBudgetMs } : {}) });
   // The exit is hold (the config allows no other): lots are sold only by runs, and by `sell`.
   const engine = new Engine({ cfg, ledger, trigger, executor: d.executor, strategy: new LotExits(d.strategy, lots), rpc: d.rpc, log: d.log, alerter: d.alerter, venues: { pump: true }, pumpBuys: true, adopter: lots, pauseSells: true, ...(d.now ? { now: d.now } : {}) });
   trigger.engine = engine;
