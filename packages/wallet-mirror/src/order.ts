@@ -4,11 +4,12 @@
  *
  *   1. the chain's order, when every trade has its place from a signature list ("rpc");
  *   2. otherwise the trades' own balances: the order in which each trade's before-balance equals the previous one's
- *      after-balance (and the first's equals the leader's balance before the slot, when that is known). Taken when
- *      exactly one order fits;
- *   3. otherwise the order the notifications arrived in, if every trade has one and it fits the balances (or no order
- *      fits them at all);
- *   4. otherwise unknown: the caller owes nothing on it and alerts.
+ *      after-balance, and, when the leader's balance before the slot is known, the first's before-balance equals it.
+ *      Taken when exactly one order fits;
+ *   3. otherwise, when several orders fit, the order the notifications arrived in if it is one of them;
+ *   4. otherwise unknown (no order fits, which means something moved the balance between the trades, such as a
+ *      transfer; or several fit and arrival does not pick one): the caller owes nothing on it and alerts, until the
+ *      chain's order arrives from a signature list.
  */
 import type { LeaderTradeRow } from "./ledger.ts";
 
@@ -47,16 +48,15 @@ export function chains(rows: LeaderTradeRow[], cap = 50): LeaderTradeRow[][] {
 export function orderSlot(rows: LeaderTradeRow[], priorAfter: bigint | null): LeaderTradeRow[] | null {
   if (rows.length <= 1) return [...rows];
   if (rows.every((r) => r.slot_pos_from === "rpc" && r.slot_pos !== null)) return [...rows].sort((a, b) => a.slot_pos! - b.slot_pos!);
-  const found = rows.length <= MAX_CHAIN ? chains(rows) : [];
-  if (priorAfter !== null) {
-    const fit = found.filter((c) => before(c[0]) === priorAfter);
-    if (fit.length === 1) return fit[0];
-  }
+  let found = rows.length <= MAX_CHAIN ? chains(rows) : [];
+  // The leader's balance before the slot, when known, must start the chain: a chain that does not start there is a
+  // false fit (a balance moved between the trades), not an order.
+  if (priorAfter !== null) found = found.filter((c) => before(c[0]) === priorAfter);
   if (found.length === 1) return found[0];
-  if (rows.every((r) => r.slot_pos_from === "arrival" && r.slot_pos !== null)) {
+  if (found.length > 1 && rows.every((r) => r.slot_pos_from === "arrival" && r.slot_pos !== null)) {
     const arrived = [...rows].sort((a, b) => a.slot_pos! - b.slot_pos!);
     const sig = (c: LeaderTradeRow[]) => c.map((r) => r.signature).join(",");
-    if (!found.length || found.some((c) => sig(c) === sig(arrived))) return arrived;
+    if (found.some((c) => sig(c) === sig(arrived))) return arrived;
   }
   return null;
 }
