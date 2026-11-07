@@ -12,6 +12,7 @@ import { dryPricer, sellFloor, type MarketRead, type ReadOptions } from "candle-
 import { HolderPoller, creatorOf, type HolderSource } from "candle-bot-core/sources/holders";
 import { parts, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import { httpRpc } from "candle-bot-core/solana/rpc";
+import { WalletSource, type WalletFeed } from "candle-bot-core/sources/wallets";
 import type { Ledger } from "candle-bot-core/ledger";
 import { ConfigError, type Config } from "./config.ts";
 import { RugWatch } from "./watch.ts";
@@ -57,8 +58,16 @@ export class WatcherTrigger implements Trigger {
   adopter: Adopter | null = null;
   watch: RugWatch | null = null;
   engine: Engine | null = null;
+  /** (opt-in rules.devDump.walletSource) The creators' wallet source; started and stopped with the run. */
+  wallets: WalletFeed | null = null;
   constructor(cfg: Config) {
     this.cfg = cfg;
+  }
+  async start(): Promise<void> {
+    await this.wallets?.start();
+  }
+  async stop(): Promise<void> {
+    await this.wallets?.stop();
   }
   poll(): Candidate[] {
     return [];
@@ -105,7 +114,7 @@ export function checkExcludeDirs(cfg: Config): void {
 }
 
 /** The engine for this config: executor (pump dry pricing; the signing checks for a linked wallet), adopter, watcher. */
-export async function makeWatcher(ctx: Ctx, ledger: Ledger): Promise<Built> {
+export async function makeWatcher(ctx: Ctx, ledger: Ledger, o: { wallets?: WalletFeed } = {}): Promise<Built> {
   const cfg = ctx.cfg;
   checkExcludeDirs(cfg);
   // Holder reads on their own RPC when one is named (they are heavy, and a rate limit on them must not reach sells).
@@ -129,11 +138,13 @@ export async function makeWatcher(ctx: Ctx, ledger: Ledger): Promise<Built> {
     maxBuyImpactBps: 0,
     executor: (d) => new Executor({ ...d, dry: dryPricer(ctx.rpc, ctx.client, decimalsOf, { pump: true }), ...(known ? { knownPrograms: known } : {}), ...(cfg.payer === "linked" ? { sellFloor: sellFloor(ctx.rpc, cfg.sell.maxSlippageBps, cfg.watch.sellFloorMarginBps) } : {}) }),
   });
-  return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, fallback, holders: new HolderPoller(holdersRpc), holdersRpc, ...(confirmHolders ? { confirmHolders } : {}) });
+  // (opt-in) The creators followed on chain, on the holder RPC (its reads are paced: 1 per second by default).
+  const wallets = o.wallets ?? (cfg.rules.devDump?.walletSource ? new WalletSource({ rpc: holdersRpc, wsUrl: ctx.wsUrl, log: ctx.log }) : undefined);
+  return assemble({ cfg, ledger, rpc: ctx.rpc, log: ctx.log, alerter, executor, fallback, holders: new HolderPoller(holdersRpc), holdersRpc, ...(confirmHolders ? { confirmHolders } : {}), ...(wallets ? { wallets } : {}) });
 }
 
 /** The adopter, watcher, trigger and engine around an executor (a library user, or a test, brings its own parts). */
-export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log: Ctx["log"]; alerter: Alerter; executor: Executor; fallback: ExitStrategy; holders?: HolderSource; confirmHolders?: HolderSource; holdersRpc?: Ctx["rpc"]; now?: () => number; clock?: () => number }): Built {
+export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log: Ctx["log"]; alerter: Alerter; executor: Executor; fallback: ExitStrategy; holders?: HolderSource; confirmHolders?: HolderSource; holdersRpc?: Ctx["rpc"]; now?: () => number; clock?: () => number; wallets?: WalletFeed }): Built {
   const { cfg, ledger } = d;
   const adopter = new Adopter({
     cfg, adoption: cfg.adoption, ledger, rpc: d.rpc, log: d.log, alerter: d.alerter, holds: d.executor, venues: VENUES, now: d.now,
@@ -152,6 +163,23 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
   });
   const positionOf = (mint: string) => adopter.managed().find((r) => r.mint === mint)?.position;
   const exit = new RugExit(d.fallback, watch, positionOf);
+  // (opt-in) A creator's sell of a watched coin, seen on chain, brings that coin's next holder poll forward.
+  const wallets = d.cfg.rules.devDump?.walletSource ? d.wallets : undefined;
+  const followCreators = () => {
+    if (!wallets) return;
+    try {
+      const creators = watch.creatorsWatched();
+      const add = [...creators.keys()].filter((w) => !wallets.watched().includes(w));
+      if (add.length) wallets.subscribe(add);
+      for (const g of wallets.drainGaps()) if (!g.recovered) d.log.info("rug_creator_wallet_gap", { creator: g.wallet, reason: g.reason, missing: g.missing ?? null });
+      for (const e of wallets.drain()) {
+        if (e.side !== "sell" || !creators.get(e.wallet)?.includes(e.mint)) continue;
+        watch.pollSoon(e.mint, `creator ${e.wallet} sold (${e.signature})`);
+      }
+    } catch (e) {
+      d.log.error("rug_creator_wallets_failed", { error: String((e as Error)?.message ?? e).slice(0, 300) });
+    }
+  };
   // The watcher runs in the adoption step of each full cycle, after the adopter, whatever the adopter did.
   const hook: AdoptionHook = {
     async step(shouldStop) {
@@ -159,6 +187,7 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
         await adopter.step(shouldStop);
       } finally {
         watch.observe();
+        followCreators();
         await watch.poll(shouldStop);
       }
     },
@@ -169,6 +198,7 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
   trigger.adopter = adopter;
   trigger.watch = watch;
   trigger.engine = engine;
+  trigger.wallets = wallets ?? null;
   return { engine, trigger, adopter, watch, exit };
 }
 
