@@ -1,0 +1,63 @@
+{
+  "name": "candle-wallet-mirror",
+  "version": "0.1.0",
+  "description": "Copies the trades of the wallets you list on Candle: a fixed ticket (or a share of the leader's SOL) per copied buy, once per coin, the leader's sells mirrored as the same share of what it held, your exit strategy alongside. Watches leaders on chain (pump.fun, PumpSwap, Candle curve, Meteora DAMM v2, Jupiter routes); a watch-only mode alerts without a wallet. Built on candle-bot-core.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/wallet-mirror"
+  },
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/wallet-mirror#readme",
+  "bugs": {
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
+  },
+  "bin": {
+    "candle-wallet-mirror": "bin/candle-wallet-mirror"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "candle-bot-core": "0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "candle",
+    "solana",
+    "copy-trading",
+    "wallet",
+    "mirror",
+    "trading-bot",
+    "pump.fun",
+    "pumpswap",
+    "memecoin",
+    "bot"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}

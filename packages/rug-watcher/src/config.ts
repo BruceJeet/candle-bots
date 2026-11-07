@@ -22,7 +22,13 @@ export type WindowRule = Action & { dropPct: number; windowSec: number };
  * ourWallets: wallets of our own besides `wallet` (another bot's, a launch helper's): the rule is off for a coin one
  * of them created, and they never count as large holders.
  */
-export type DevRule = Action & { soldPct?: number; floorPct?: number; creators: Record<string, string>; confirmAfterMs: number; ourWallets: string[] };
+export type DevRule = Action & { soldPct?: number; floorPct?: number; creators: Record<string, string>; confirmAfterMs: number; ourWallets: string[];
+  /**
+   * (opt-in) Follow each watched coin's creator on chain (core sources/wallets): a sell of the coin by the creator polls
+   * that coin's holders and creator at once instead of at the next holdersPollMs. The rule itself is unchanged (the
+   * same reads, the same confirming read): this only makes the read come sooner. Absent or false: off.
+   */
+  walletSource?: boolean };
 /** exclude: wallets never counted as large holders (an exchange, a locker that is a plain wallet). */
 export type HolderRule = Action & { topN: number; soldPctOfSupply: number; windowSec: number; exclude: string[] };
 
@@ -81,7 +87,7 @@ const parseRules: SectionParser<Rules> = (raw) => {
   if (raw.devDump !== undefined) {
     const r = raw.devDump;
     if (!isObj(r)) throw new ConfigError(`${w}.devDump: an object`);
-    only(r, ["soldPct", "floorPct", "creators", "confirmAfterMs", "ourWallets", "sell", "alertOnly"], `${w}.devDump`);
+    only(r, ["soldPct", "floorPct", "creators", "confirmAfterMs", "ourWallets", "sell", "alertOnly", "walletSource"], `${w}.devDump`);
     const creators: Record<string, string> = {};
     const cr = r.creators === undefined ? {} : r.creators;
     if (!isObj(cr)) throw new ConfigError(`${w}.devDump.creators: an object { "<mint>": "<creator wallet>" }`);
@@ -97,6 +103,7 @@ const parseRules: SectionParser<Rules> = (raw) => {
       ...(soldPct !== undefined ? { soldPct } : {}), ...(floorPct !== undefined ? { floorPct } : {}), creators,
       confirmAfterMs: num(r, "confirmAfterMs", `${w}.devDump`, { min: 0, max: 120_000, int: true, def: 5_000 }),
       ourWallets: strList(r, "ourWallets", `${w}.devDump`, { def: [], address: true })!,
+      ...(bool(r, "walletSource", `${w}.devDump`, false) ? { walletSource: true } : {}),
       ...action(r, `${w}.devDump`),
     };
     checkAction(out.devDump, `${w}.devDump`);

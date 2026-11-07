@@ -169,7 +169,7 @@ candle-exit-manager's), a `buy` section is refused.
 | `rules.*.sell` | share of what remains to sell when the rule fires (0 to 1, default 1) |
 | `rules.*.alertOnly` | alert, never sell (default false) |
 | `liquidityPull`, `priceCrash` | `dropPct` (1 to 99), `windowSec` (5 to 86400) |
-| `devDump` | `soldPct` and/or `floorPct` (% of supply); `creators` by hand; `confirmAfterMs` (0 to 120000, default 5000); `ourWallets` |
+| `devDump` | `soldPct` and/or `floorPct` (% of supply); `creators` by hand; `confirmAfterMs` (0 to 120000, default 5000); `ourWallets`; `walletSource` (opt-in, default false: each creator is followed on chain, and its sell of a watched coin runs that coin's holder poll at once instead of at the next `holdersPollMs`; the rule and its confirming read are unchanged) |
 | `holderExit` | `topN` (1 to 20, default 10), `soldPctOfSupply`, `windowSec` (default 600), `exclude` |
 | `watch.holdersPollMs` | how often each coin's holders are read (min 2000, default 15000) |
 | `watch.maxCoinsPerPoll` | coins read in one poll (default 10); the rest wait for the next |

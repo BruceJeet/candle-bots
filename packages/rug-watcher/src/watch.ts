@@ -503,6 +503,38 @@ export class RugWatch {
     return this.d.ledger.db.prepare("select creator, source from rug_creators where mint = ?").get(mint) as any;
   }
 
+  /** (opt-in walletSource) Each known creator of a watched coin (from config or chain), with its coins; null when unread. */
+  creatorsWatched(): Map<string, string[]> | null {
+    const out = new Map<string, string[]>();
+    let open: PositionRow[];
+    try {
+      open = this.d.managed();
+    } catch {
+      return null;
+    }
+    const ours = new Set([this.d.cfg.wallet, ...(this.d.cfg.rules.devDump?.ourWallets ?? [])]);
+    for (const p of open) {
+      const row = this.creatorRow(p.mint);
+      if (!row || ours.has(row.creator)) continue;
+      const l = out.get(row.creator) ?? [];
+      if (!l.includes(p.mint)) l.push(p.mint);
+      out.set(row.creator, l);
+    }
+    return out;
+  }
+
+  /** (opt-in walletSource) Poll this coin's holders and creator in the next poll, whatever holdersPollMs says. */
+  pollSoon(mint: string, why: string): number {
+    let n = 0;
+    for (const p of this.d.managed()) {
+      if (p.mint !== mint) continue;
+      this.state(p.id).nextPollAt = 0;
+      n++;
+    }
+    if (n) this.d.log.info("rug_poll_soon", { mint, why, positions: n });
+    return n;
+  }
+
   /** The creator's highest holding while this position was watched (raw), or null before the first read. */
   devHigh(positionId: number): string | null {
     const r = this.d.ledger.db.prepare("select max_raw from rug_dev where position_id = ?").get(positionId) as { max_raw: string } | undefined;

@@ -1,0 +1,11 @@
+{
+  "comment": "Watch-only: no wallet, no API key, never trades. Alerts on the listed wallets' buys and sells. Add an alerts sink (Telegram, Discord, a webhook or a command) to get them somewhere; without one they go to events.jsonl only. The public RPC works for a few wallets; for more, name your own RPC in rpcUrlEnv.",
+  "mode": "watch",
+  "stateDir": "./state-watch",
+  "loopMs": 1000,
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "leaders": [{ "address": "11111111111111111111111111111112", "label": "example" }],
+  "source": { "fetchPerSec": 1 },
+  "notify": { "buys": true, "sells": true, "opensOnly": false, "minSol": 0, "gaps": true },
+  "alerts": {}
+}
