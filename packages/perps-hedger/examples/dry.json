@@ -1,0 +1,22 @@
+{
+  "comment": "Dry run: real Hyperliquid and Solana reads, paper perps, no key. Set spot.wallet to the wallet whose bags you want hedged. For live: mode live, apiKeyEnv, perps.wallet (the EVM TEE wallet's 0x address) and perps.signer; start on testnet.",
+  "mode": "dry",
+  "network": "mainnet",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "stateDir": "./state-hedge",
+  "loopMs": 15000,
+  "spot": { "wallet": "11111111111111111111111111111111", "mode": "wallet", "maxBags": 50 },
+  "perps": { "marginMode": "isolated", "slippageBps": 100, "paper": { "startUsd": 1000 } },
+  "hedge": {
+    "proxy": "SOL",
+    "ratio": 1,
+    "coins": {},
+    "bandPct": 20,
+    "minOrderUsd": 11,
+    "maxLeverage": 3,
+    "maxMarginUsd": 100,
+    "minBagUsd": 20,
+    "unpricedCloseSec": 60
+  },
+  "alerts": {}
+}
