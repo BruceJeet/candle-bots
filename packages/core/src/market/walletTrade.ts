@@ -234,6 +234,35 @@ export function decodeWalletTrade(tx: any, wallet: string, signature?: string): 
   };
 }
 
+/**
+ * (batch 4) The wallet's token balances that changed in a transaction, per mint (wrapped SOL aside), summed over its
+ * token accounts the transaction lists; [] for an unreadable or failed transaction. For a move that is not a trade.
+ */
+export function walletTokenDeltas(tx: any, wallet: string): Array<{ mint: string; beforeRaw: bigint; afterRaw: bigint }> {
+  if (!tx?.meta || (tx.meta.err !== null && tx.meta.err !== undefined)) return [];
+  let pre: TokenRow[];
+  let post: TokenRow[];
+  try {
+    pre = tokenRows(tx.meta.preTokenBalances);
+    post = tokenRows(tx.meta.postTokenBalances);
+  } catch {
+    return [];
+  }
+  const sum = (rows: TokenRow[]) => {
+    const m = new Map<string, bigint>();
+    for (const r of rows) if (r.owner === wallet) m.set(r.mint, (m.get(r.mint) ?? 0n) + r.amount);
+    return m;
+  };
+  const a = sum(pre);
+  const b = sum(post);
+  return [...new Set([...a.keys(), ...b.keys()])].filter((m) => m !== WSOL).map((m) => ({ mint: m, beforeRaw: a.get(m) ?? 0n, afterRaw: b.get(m) ?? 0n })).filter((x) => x.beforeRaw !== x.afterRaw);
+}
+
+/** Token-program transfer instructions in the logs (a wallet may move tokens without trading). */
+export function logsShowTransfer(logs: readonly string[]): boolean {
+  return logs.some((l) => l === "Program log: Instruction: Transfer" || l === "Program log: Instruction: TransferChecked");
+}
+
 /** Whether a transaction's logs show a known venue or router being invoked (cheap pre-filter before fetching it). */
 export function logsInvokeVenue(logs: readonly string[]): boolean {
   for (const l of logs) {

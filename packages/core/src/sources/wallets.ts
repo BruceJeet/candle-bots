@@ -31,7 +31,7 @@
 import type { Logger } from "../log.ts";
 import { multiLogs, type MultiLogsHandlers, type MultiLogsOptions, type MultiLogsSocket } from "../solana/logs-multi.ts";
 import type { Rpc } from "../solana/rpc.ts";
-import { decodeWalletTrade, logsInvokeVenue, type WalletTrade } from "../market/walletTrade.ts";
+import { decodeWalletTrade, logsInvokeVenue, logsShowTransfer, walletTokenDeltas, type WalletTrade } from "../market/walletTrade.ts";
 
 export interface WalletEvent extends WalletTrade {
   /** False when the source missed something of this wallet (an unrecovered gap, an unread transaction) since its previous event. */
@@ -52,6 +52,19 @@ export interface WalletGap {
   recovered: boolean;
   /** For an unrecovered gap: what was not read. */
   missing?: string;
+}
+
+/** (opt-in `transfers`) A followed wallet's token balance fell in a transaction that is not a trade (a transfer out). */
+export interface WalletMove {
+  wallet: string;
+  mint: string;
+  beforeRaw: bigint;
+  afterRaw: bigint;
+  signature: string;
+  slot: number;
+  blockTime: number | null;
+  /** Why the decoder did not take it as a trade. */
+  reason: string;
 }
 
 /** A transaction of a followed wallet that is not a trade the decoder classifies (logged; counted per reason). */
@@ -93,6 +106,11 @@ export interface WalletSourceOptions {
   backfillLimit?: number;
   /** Fetch only transactions whose logs invoke a known venue or router (default true; a backfill has no logs and fetches all). */
   prefilter?: boolean;
+  /**
+   * Also report token balances that fall without a trade (drainMoves): the pre-filter then lets token transfers through
+   * too (more reads: any transfer to or from the wallet is fetched). Default false.
+   */
+  transfers?: boolean;
   /** Where each wallet's backfill starts at start (the consumer's newest handled signature). */
   since?: Record<string, Anchor>;
   /** getTransaction tries for a signature the node does not return yet (default 5, waits 0.5, 1, 2, 4 s). */
@@ -160,6 +178,10 @@ export interface WalletFeed {
   stop(): Promise<void>;
   drain(): WalletEvent[];
   drainGaps(): WalletGap[];
+  /** (opt-in) Token balances that fell without a trade. */
+  drainMoves?(): WalletMove[];
+  /** Stop following these wallets. */
+  unsubscribe?(wallets: string[]): void;
   onNew: (() => void) | null;
   head(wallet: string): Anchor | null;
   /** Where a restart should read back from (everything up to it read and handled). Optional: a feed without one is never resumed. */
@@ -182,6 +204,7 @@ export class WalletSource implements WalletFeed {
   private queue: Job[] = [];
   private events: WalletEvent[] = [];
   private gapsOut: WalletGap[] = [];
+  private movesOut: WalletMove[] = [];
   private socket: MultiLogsSocket | null = null;
   private running = false;
   private stopped = false;
@@ -262,6 +285,12 @@ export class WalletSource implements WalletFeed {
     const g = this.gapsOut;
     this.gapsOut = [];
     return g;
+  }
+
+  drainMoves(): WalletMove[] {
+    const m = this.movesOut;
+    this.movesOut = [];
+    return m;
   }
 
   queued(): number {
@@ -347,7 +376,7 @@ export class WalletSource implements WalletFeed {
       this.advance(s, { signature, slot });
       return;
     }
-    if (this.o.prefilter && !logsInvokeVenue(logs) && !logs.some((l) => l === "Log truncated")) {
+    if (this.o.prefilter && !logsInvokeVenue(logs) && !(this.o.transfers && logsShowTransfer(logs)) && !logs.some((l) => l === "Log truncated")) {
       this.stats.prefiltered++;
       this.markSeen(key(wallet, signature));
       this.advance(s, { signature, slot });
@@ -677,6 +706,13 @@ export class WalletSource implements WalletFeed {
       this.stats.skipped++;
       this.stats.skipReasons[d.reason.replace(/ \(.*$/, "")] = (this.stats.skipReasons[d.reason.replace(/ \(.*$/, "")] ?? 0) + 1;
       this.o.log.info("wallet_tx_skipped", { wallet, signature, reason: d.reason });
+      if (this.o.transfers) {
+        for (const x of walletTokenDeltas(tx, wallet)) {
+          if (x.afterRaw >= x.beforeRaw) continue;
+          this.movesOut.push({ wallet, mint: x.mint, beforeRaw: x.beforeRaw, afterRaw: x.afterRaw, signature, slot: Number(tx?.slot ?? 0), blockTime: typeof tx?.blockTime === "number" ? tx.blockTime : null, reason: d.reason });
+          this.notify();
+        }
+      }
       return null;
     }
     const e: WalletEvent = { ...d.trade, complete: !s.dirty, seenAtMs: this.now(), via };

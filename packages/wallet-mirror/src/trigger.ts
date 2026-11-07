@@ -23,7 +23,7 @@ import { buyQuote, readMarkets, sellFloor, type MarketRead } from "candle-bot-co
 import { parts, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import type { Rpc } from "candle-bot-core/solana/rpc";
 import { LeaderBook } from "candle-bot-core/sources/walletPositions";
-import type { WalletEvent, WalletFeed, WalletGap } from "candle-bot-core/sources/wallets";
+import type { WalletEvent, WalletFeed, WalletGap, WalletMove } from "candle-bot-core/sources/wallets";
 import type { Config, Leader } from "./config.ts";
 import type { Ledger, PositionRow } from "./ledger.ts";
 
@@ -105,6 +105,7 @@ export class MirrorTrigger implements Trigger {
 
   poll(ctx: TriggerContext): Candidate[] {
     for (const g of this.d.source.drainGaps()) this.onGap(g);
+    for (const mv of this.d.source.drainMoves?.() ?? []) this.onMove(mv);
     this.buffer.push(...this.d.source.drain());
     const out: Candidate[] = [];
     // One event at a time: an event leaves the buffer only once it is recorded (or dropped as a repeat), so a failed
@@ -214,6 +215,27 @@ export class MirrorTrigger implements Trigger {
         }
       }
     }
+  }
+
+  /**
+   * A leader's balance of a coin fell without a trade (a transfer out). Alerted when we hold that coin from that leader
+   * (or from any leader with sellsFrom any): the leader may sell from another wallet. Nothing is sold for it.
+   */
+  private onMove(mv: WalletMove): void {
+    if (!this.leaders.has(mv.wallet)) return;
+    const dry = this.d.cfg.mode === "dry" ? 1 : 0;
+    const held = this.d.ledger.positionsByStatus("opening", "open", "exit_stuck").filter((p) => {
+      if (p.dry !== dry || p.mint !== mv.mint) return false;
+      try {
+        return this.d.cfg.mirror.sellsFrom === "any" || JSON.parse(p.launch_json)?.leader === mv.wallet;
+      } catch {
+        return false;
+      }
+    });
+    this.d.log.info("leader_moved_out", { leader: mv.wallet, mint: mv.mint, beforeRaw: mv.beforeRaw.toString(), afterRaw: mv.afterRaw.toString(), signature: mv.signature, held: held.map((p) => p.id) });
+    if (!held.length) return;
+    const pct = mv.beforeRaw > 0n ? Math.round(Number(((mv.beforeRaw - mv.afterRaw) * 10_000n) / mv.beforeRaw) / 100) : 100;
+    this.d.alerter.raise(`leader:${mv.wallet}:move:${mv.signature}`, `leader ${this.label(mv.wallet)} moved ${pct} % of ${mv.mint} out without a trade (${mv.signature}); position ${held.map((p) => p.id).join(", ")} is held, and nothing is sold for it`);
   }
 
   private onGap(g: WalletGap): void {

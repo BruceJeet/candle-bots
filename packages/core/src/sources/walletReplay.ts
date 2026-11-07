@@ -11,7 +11,7 @@
  */
 import { appendFileSync } from "node:fs";
 import { decodeWalletTrade } from "../market/walletTrade.ts";
-import type { Anchor, RecordedTx, WalletEvent, WalletFeed, WalletGap, WalletSkip } from "./wallets.ts";
+import type { Anchor, RecordedTx, WalletEvent, WalletFeed, WalletGap, WalletMove, WalletSkip } from "./wallets.ts";
 
 /** A recorder that appends one JSON line per fetched transaction to `path`. */
 export function walletRecorder(path: string): (r: RecordedTx) => void {
@@ -53,6 +53,7 @@ export class ReplayWallets implements WalletFeed {
   private i = 0;
   private out: WalletEvent[] = [];
   private gaps: WalletGap[] = [];
+  private moves: WalletMove[] = [];
   private follow = new Set<string>();
   private heads = new Map<string, Anchor>();
   onNew: (() => void) | null = null;
@@ -90,9 +91,10 @@ export class ReplayWallets implements WalletFeed {
     }
     if (n) this.onNew?.();
   }
-  /** Add an event or a gap by hand (tests). */
-  push(e: WalletEvent | WalletGap): void {
-    if ("signature" in e) {
+  /** Add an event, a gap or a move by hand (tests). */
+  push(e: WalletEvent | WalletGap | WalletMove): void {
+    if ("beforeRaw" in e) this.moves.push(e);
+    else if ("signature" in e) {
       this.out.push(e);
       this.heads.set(e.wallet, { signature: e.signature, blockTime: e.blockTime });
     } else this.gaps.push(e);
@@ -107,6 +109,14 @@ export class ReplayWallets implements WalletFeed {
     const g = this.gaps;
     this.gaps = [];
     return g;
+  }
+  drainMoves(): WalletMove[] {
+    const m = this.moves;
+    this.moves = [];
+    return m;
+  }
+  unsubscribe(wallets: string[]): void {
+    for (const w of wallets) this.follow.delete(w);
   }
   head(wallet: string): Anchor | null {
     return this.heads.get(wallet) ?? null;
