@@ -23,7 +23,8 @@
  * returns), the gap is reported unrecovered (drainGaps) and the wallet's next event says `complete: false`. A gap is
  * never reported as "no trades".
  *
- * Every signature is handled once per process (a bounded seen set). A consumer that must never act twice across
+ * Every (wallet, signature) is handled once per process (a bounded seen set): a transaction that touches two followed
+ * wallets is decoded for each of them (fetched once: recent transactions are kept in a small cache). A consumer that must never act twice across
  * restarts keeps its own record of what it acted on (the mirror's ledger does) and passes the newest signature it
  * handled per wallet as `since`, so a restart backfills from there.
  */
@@ -168,12 +169,16 @@ export interface WalletFeed {
   readonly stats?: unknown;
 }
 
+const key = (wallet: string, signature: string) => `${wallet}:${signature}`;
+
 export class WalletSource implements WalletFeed {
   readonly o: Required<Pick<WalletSourceOptions, "fetchPerSec" | "fetchBurst" | "pollMs" | "reconcileMs" | "backfillLimit" | "prefilter" | "fetchTries" | "maxSeen">> & WalletSourceOptions;
   private now: () => number;
   private sleep: (ms: number) => Promise<void>;
   private wallets = new Map<string, WalletState>();
   private seen = new Set<string>();
+  /** Recently fetched transactions by signature: a transaction that touches several followed wallets is fetched once. */
+  private txCache = new Map<string, unknown>();
   private queue: Job[] = [];
   private events: WalletEvent[] = [];
   private gapsOut: WalletGap[] = [];
@@ -335,16 +340,16 @@ export class WalletSource implements WalletFeed {
 
   private onLogs(wallet: string, signature: string, err: unknown, logs: string[], slot: number): void {
     const s = this.state(wallet);
-    if (!s || this.seen.has(signature)) return;
+    if (!s || this.seen.has(key(wallet, signature))) return;
     this.stats.notifications++;
     if (err !== null && err !== undefined) {
-      this.markSeen(signature);
+      this.markSeen(key(wallet, signature));
       this.advance(s, { signature, slot });
       return;
     }
     if (this.o.prefilter && !logsInvokeVenue(logs) && !logs.some((l) => l === "Log truncated")) {
       this.stats.prefiltered++;
-      this.markSeen(signature);
+      this.markSeen(key(wallet, signature));
       this.advance(s, { signature, slot });
       return;
     }
@@ -397,8 +402,12 @@ export class WalletSource implements WalletFeed {
           this.gapsOut.push({ wallet, fromMs: gap.fromMs, toMs: to, reason: gap.reason, recovered: true });
         }
       } else {
+        // Reported once; the newest signatures were queued, and reads go on from the newest listed (not the old anchor,
+        // which would report the same hole on every read).
         this.stats.gapsUnrecovered++;
         s.dirty = true;
+        s.verified = r.newest ?? s.verified;
+        this.mark(s);
         this.gapsOut.push({ wallet, fromMs: gap.fromMs, toMs: to, reason: gap.reason, recovered: false, missing: r.why });
         this.o.log.warn("wallet_gap_unrecovered", { wallet, reason: gap.reason, from: new Date(gap.fromMs).toISOString(), missing: r.why });
       }
@@ -412,7 +421,7 @@ export class WalletSource implements WalletFeed {
    * Read the wallet's signatures newer than `anchor` (or, with no anchor, the newest one only, as the new anchor) and
    * queue those not seen, oldest first. ok: every signature since the anchor (or since `fromMs`) was listed.
    */
-  private async readSince(wallet: string, anchor: Anchor | null, via: WalletEvent["via"]): Promise<{ ok: true; newest: Anchor | null } | { ok: false; why: string; retry: boolean }> {
+  private async readSince(wallet: string, anchor: Anchor | null, via: WalletEvent["via"]): Promise<{ ok: true; newest: Anchor | null } | { ok: false; why: string; retry: boolean; newest?: Anchor | null }> {
     const s = this.state(wallet);
     if (!s) return { ok: true, newest: null };
     const found: Array<{ signature: string; slot: number; err: unknown; blockTime: number | null }> = [];
@@ -446,14 +455,14 @@ export class WalletSource implements WalletFeed {
       // No anchor: the newest signature becomes it (nothing older is read: watching starts now).
       const n = found[0];
       if (n) this.advance(s, { signature: n.signature, slot: n.slot, blockTime: n.blockTime });
-      for (const x of found) this.markSeen(x.signature);
+      for (const x of found) this.markSeen(key(wallet, x.signature));
       return { ok: true, newest: n ? { signature: n.signature, blockTime: n.blockTime } : null };
     }
     const newest = found[0] ? { signature: found[0].signature, blockTime: found[0].blockTime } : null;
     for (const x of found.reverse()) {
-      if (this.seen.has(x.signature)) continue;
+      if (this.seen.has(key(wallet, x.signature))) continue;
       if (x.err !== null) {
-        this.markSeen(x.signature);
+        this.markSeen(key(wallet, x.signature));
         this.advance(s, { signature: x.signature, slot: x.slot, blockTime: x.blockTime });
         continue;
       }
@@ -463,7 +472,7 @@ export class WalletSource implements WalletFeed {
       }
       this.enqueue(wallet, x.signature, via, x.slot, x.blockTime);
     }
-    return reached ? { ok: true, newest } : { ok: false, why: `more than ${this.o.backfillLimit} signatures since the last one read`, retry: false };
+    return reached ? { ok: true, newest } : { ok: false, why: `more than ${this.o.backfillLimit} signatures since the last one read`, retry: false, newest };
   }
 
   private async pollLoop(): Promise<void> {
@@ -481,7 +490,7 @@ export class WalletSource implements WalletFeed {
           if (this.now() - s.polledAt < every) continue;
           s.polledAt = this.now();
           s.reading = true;
-          let failed: { why: string; retry: boolean } | null = null;
+          let failed: { why: string; retry: boolean; newest?: Anchor | null } | null = null;
           const from = s.okAt;
           try {
             // From the verified point, not the head: a signature the socket skipped behind a newer one is still listed.
@@ -496,8 +505,11 @@ export class WalletSource implements WalletFeed {
           }
           if (!failed) continue;
           if (!failed.retry) {
-            // More signatures than one read may take: the newest were queued, the rest are lost. Reported as such.
+            // More signatures than one read may take: the newest were queued, the rest are lost. Reported once; reads
+            // go on from the newest listed.
             s.dirty = true;
+            s.verified = failed.newest ?? s.verified;
+            this.mark(s);
             s.okAt = this.now();
             this.stats.gapsUnrecovered++;
             this.gapsOut.push({ wallet: w, fromMs: from, toMs: this.now(), reason: this.o.wsUrl ? "reconcile" : "poll", recovered: false, missing: failed.why });
@@ -545,8 +557,8 @@ export class WalletSource implements WalletFeed {
 
   private enqueue(wallet: string, signature: string, via: WalletEvent["via"], slot: number, blockTime: number | null = null): void {
     const s = this.state(wallet);
-    if (!s || this.seen.has(signature)) return;
-    this.markSeen(signature);
+    if (!s || this.seen.has(key(wallet, signature))) return;
+    this.markSeen(key(wallet, signature));
     this.advance(s, { signature, slot, blockTime });
     this.queue.push({ wallet, signature, via, tries: 0, notBefore: 0 });
     s.pending++;
@@ -609,7 +621,8 @@ export class WalletSource implements WalletFeed {
   }
 
   private async fetchOne(job: Job): Promise<void> {
-    let tx: any;
+    let tx: any = this.txCache.get(job.signature);
+    if (tx) return this.deliver(job, tx);
     try {
       tx = await this.call("getTransaction", [job.signature, { encoding: "json", maxSupportedTransactionVersion: 1, commitment: "confirmed" }]);
     } catch (e) {
@@ -618,6 +631,12 @@ export class WalletSource implements WalletFeed {
       return this.retry(job, `read failed (${String((e as Error)?.message ?? e).slice(0, 120)})`);
     }
     if (!tx) return this.retry(job, "not found");
+    this.txCache.set(job.signature, tx);
+    if (this.txCache.size > 256) this.txCache.delete(this.txCache.keys().next().value!);
+    return this.deliver(job, tx);
+  }
+
+  private deliver(job: Job, tx: any): void {
     this.stats.fetched++;
     if (this.o.record) {
       try {

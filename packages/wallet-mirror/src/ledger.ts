@@ -116,12 +116,25 @@ export class Ledger extends CoreLedger {
     return r ? JSON.parse(r.v) : null;
   }
 
-  /** Leader sells of a coin after a slot, by any of `leaders`, oldest first. */
-  leaderSellsAfter(mint: string, leaders: string[], slot: number): LeaderTradeRow[] {
+  /**
+   * Leader sells of a coin after a copied buy, by any of `leaders`, in chain order. After = a later slot, or the same
+   * slot: for the copied leader only a sell whose before-balance is at least the buy's after-balance (it holds the
+   * bought tokens, so it came after); another leader's same-slot sell counts. The buy's own signature never does.
+   * Within a slot, sells are ordered by the leader's before-balance, highest first (each sell lowers it).
+   */
+  leaderSellsAfter(mint: string, leaders: string[], buy: { leader: string; slot: number; signature: string; heldAfterRaw: bigint }): LeaderTradeRow[] {
     if (!leaders.length) return [];
-    return this.db
-      .prepare(`select * from leader_trades where mint = ? and side = 'sell' and slot > ? and leader in (${leaders.map(() => "?").join(",")}) order by slot, seen_at`)
-      .all(mint, slot, ...leaders) as unknown as LeaderTradeRow[];
+    const rows = this.db
+      .prepare(`select * from leader_trades where mint = ? and side = 'sell' and slot >= ? and signature != ? and leader in (${leaders.map(() => "?").join(",")})`)
+      .all(mint, buy.slot, buy.signature, ...leaders) as unknown as LeaderTradeRow[];
+    return rows
+      .filter((r) => r.slot > buy.slot || r.leader !== buy.leader || BigInt(r.held_before) >= buy.heldAfterRaw)
+      .sort((a, b) => a.slot - b.slot || (BigInt(b.held_before) > BigInt(a.held_before) ? 1 : BigInt(b.held_before) < BigInt(a.held_before) ? -1 : a.seen_at - b.seen_at));
+  }
+
+  /** The leader's trades of a coin from a slot on (both sides), for its holding since a buy. */
+  leaderTradesFrom(leader: string, mint: string, slot: number): LeaderTradeRow[] {
+    return this.db.prepare("select * from leader_trades where leader = ? and mint = ? and slot >= ? order by slot, seen_at").all(leader, mint, slot) as unknown as LeaderTradeRow[];
   }
 
   copied(leader: string, mint: string): boolean {

@@ -42,6 +42,10 @@ export interface Mirror {
   minSellFraction: number;
   /** Most price impact of our ticket at the buy (bps). */
   maxImpactBps: number;
+  /** A leader that has sold below this share of its peak holding since its buy is not copied (0..1). */
+  minLeaderHeldFraction: number;
+  /** Most our price may be above the leader's fill price (bps). */
+  maxOverLeaderBps: number;
   /** TEE wallet (payer linked) only: the programs a build may call (as the other bots). */
   checkPrograms: boolean;
   extraPrograms: string[];
@@ -105,7 +109,7 @@ const parseMirror: SectionParser<Mirror> = (raw, core) => {
   const w = "config.mirror";
   const m = raw === undefined ? {} : raw;
   if (!isObj(m)) throw new ConfigError(`${w}: must be an object`);
-  only(m, ["ticket", "copy", "openDustPct", "maxAgeSec", "minLeaderSol", "venues", "sells", "sellsFrom", "minSellFraction", "maxImpactBps", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps"], w);
+  only(m, ["ticket", "copy", "openDustPct", "maxAgeSec", "minLeaderSol", "venues", "sells", "sellsFrom", "minSellFraction", "maxImpactBps", "minLeaderHeldFraction", "maxOverLeaderBps", "checkPrograms", "extraPrograms", "sellFloorMarginBps", "buyFloorMarginBps"], w);
   const t = m.ticket === undefined ? {} : m.ticket;
   if (!isObj(t)) throw new ConfigError(`${w}.ticket: must be an object`);
   only(t, ["mode", "fraction", "minSol"], `${w}.ticket`);
@@ -136,6 +140,8 @@ const parseMirror: SectionParser<Mirror> = (raw, core) => {
     sellsFrom,
     minSellFraction: num(m, "minSellFraction", w, { min: 0, max: 1, def: 0 }),
     maxImpactBps: num(m, "maxImpactBps", w, { min: 0, max: 10_000, int: true, def: 500 }),
+    minLeaderHeldFraction: num(m, "minLeaderHeldFraction", w, { min: 0, max: 1, def: 0.5 }),
+    maxOverLeaderBps: num(m, "maxOverLeaderBps", w, { min: 0, max: 1_000_000, int: true, def: 3000 }),
     checkPrograms: bool(m, "checkPrograms", w, true),
     extraPrograms,
     sellFloorMarginBps: num(m, "sellFloorMarginBps", w, { min: 0, max: 10_000, int: true, def: 200 }),

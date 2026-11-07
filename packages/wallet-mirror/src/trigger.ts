@@ -19,7 +19,7 @@ import { Engine, Executor, loadStrategy, type Alerter, type Candidate, type Exit
 import { lamportsOf } from "candle-bot-core/engine";
 import { KNOWN_PROGRAMS } from "candle-bot-core/exec/trader";
 import type { Logger } from "candle-bot-core/log";
-import { readMarkets, sellFloor, type MarketRead } from "candle-bot-core/market/reader";
+import { buyQuote, readMarkets, sellFloor, type MarketRead } from "candle-bot-core/market/reader";
 import { parts, type Ctx as CoreCtx } from "candle-bot-core/runtime";
 import type { Rpc } from "candle-bot-core/solana/rpc";
 import { LeaderBook } from "candle-bot-core/sources/walletPositions";
@@ -40,6 +40,8 @@ export interface LeaderBuy {
   kind: string;
   leaderSolRaw: string;
   leaderTokenRaw: string;
+  /** The leader's balance after this buy (raw), to order same-slot sells after it. */
+  leaderHeldAfterRaw?: string;
   decimals: number;
 }
 
@@ -122,8 +124,11 @@ export class MirrorTrigger implements Trigger {
       if (c) out.push(c);
     }
     this.owed(ctx);
-    // The restart point: what the source has read and handled for each leader, never past a queued transaction.
+    // The restart point: what the source has read and handled for each leader, never past a queued transaction, and
+    // not for a leader with events still waiting here (a failed write): a restart then reads them again.
+    const waiting = new Set(this.buffer.map((e) => e.wallet));
     for (const w of this.leaders.keys()) {
+      if (waiting.has(w)) continue;
       const cp = this.d.source.checkpoint?.(w) ?? null;
       if (cp) this.d.ledger.putCursor(w, cp.signature, cp.blockTime ?? null, this.now());
     }
@@ -153,7 +158,7 @@ export class MirrorTrigger implements Trigger {
       this.d.log.info("leader_buy_not_copied", { leader: e.wallet, mint: e.mint, why: "an add to a bag the leader already held (mirror.copy: opens)" });
       return null;
     }
-    const meta: LeaderBuy = { leader: e.wallet, label: this.leaders.get(e.wallet)?.label ?? null, signature: e.signature, slot: e.slot, blockTime: e.blockTime, venue: e.venue, kind: move.kind, leaderSolRaw: e.solRaw.toString(), leaderTokenRaw: e.tokenRaw.toString(), decimals: e.decimals };
+    const meta: LeaderBuy = { leader: e.wallet, label: this.leaders.get(e.wallet)?.label ?? null, signature: e.signature, slot: e.slot, blockTime: e.blockTime, venue: e.venue, kind: move.kind, leaderSolRaw: e.solRaw.toString(), leaderTokenRaw: e.tokenRaw.toString(), leaderHeldAfterRaw: e.heldAfterRaw.toString(), decimals: e.decimals };
     return { mint: e.mint, chain: "solana", seenAtMs: e.seenAtMs, source: "chain", reason: `${this.label(e.wallet)} ${move.kind} ${fmt(sol(e.solRaw))} SOL on ${e.venue}`, meta };
   }
 
@@ -181,12 +186,31 @@ export class MirrorTrigger implements Trigger {
       }
       if (!entry.leader || typeof entry.slot !== "number") continue;
       const from = m.sellsFrom === "copied" ? [entry.leader] : [...this.leaders.keys()];
-      for (const t of this.d.ledger.leaderSellsAfter(p.mint, from, entry.slot)) {
-        const fraction = t.kind === "close" ? 1 : t.fraction ?? 1;
-        if (t.kind !== "close" && fraction < m.minSellFraction) continue;
+      const buy = { leader: entry.leader, slot: entry.slot, signature: entry.signature ?? "", heldAfterRaw: BigInt(entry.leaderHeldAfterRaw ?? "0") };
+      // Small sells (under minSellFraction) add up: once what they leave together falls to 1 - minSellFraction, they
+      // are owed together (and compound in the exit). Recomputed from the ledger each poll: the same trades give the
+      // same groups, and a row already owed is not owed again.
+      let small: Array<{ t: (typeof rows)[number]; f: number }> = [];
+      const rows = this.d.ledger.leaderSellsAfter(p.mint, from, buy);
+      const oweOne = (t: (typeof rows)[number], fraction: number) => {
         if (this.d.ledger.addMirrorSell({ positionId: p.id, leader: t.leader, signature: t.signature, mint: p.mint, fraction, kind: t.kind, now })) {
           this.stats.sellsOwed++;
           this.d.log.info("mirror_sell_owed", { position: p.id, mint: p.mint, leader: t.leader, kind: t.kind, fraction, signature: t.signature });
+        }
+      };
+      for (const t of rows) {
+        const fraction = t.kind === "close" ? 1 : t.fraction ?? 1;
+        if (t.kind === "close" || fraction >= m.minSellFraction) {
+          for (const x of small) oweOne(x.t, x.f);
+          small = [];
+          oweOne(t, fraction);
+          continue;
+        }
+        small.push({ t, f: fraction });
+        const keep = small.reduce((k, x) => k * (1 - x.f), 1);
+        if (1 - keep >= m.minSellFraction) {
+          for (const x of small) oweOne(x.t, x.f);
+          small = [];
         }
       }
     }
@@ -224,9 +248,17 @@ export class MirrorTrigger implements Trigger {
     const leaderSol = sol(b.leaderSolRaw);
     if (leaderSol < m.minLeaderSol) return skip(`leader bought ${fmt(leaderSol)} SOL < mirror.minLeaderSol ${m.minLeaderSol}`);
     if (this.d.ledger.copied(b.leader, c.mint)) return skip("this coin was copied from this leader before");
-    // The leader already sold out of it (a later trade recorded): nothing left to follow.
-    const h = this.book.holding(b.leader, c.mint);
-    if (h && h.heldRaw === 0n && h.lastSlot > b.slot) return skip("the leader already sold out of this coin");
+    // What the leader did with this bag since the buy (recorded trades after it, in chain order: same-slot ones by the
+    // leader's balances). Sold out: nothing left to follow. Sold below minLeaderHeldFraction of its peak: not copied.
+    const after = this.d.ledger.leaderTradesFrom(b.leader, c.mint, b.slot).filter((t) => t.signature !== b.signature && (t.slot > b.slot || BigInt(t.held_before) >= BigInt(b.leaderHeldAfterRaw ?? "0")));
+    if (after.length) {
+      after.sort((x, y) => x.slot - y.slot || (BigInt(y.held_before) > BigInt(x.held_before) ? 1 : BigInt(y.held_before) < BigInt(x.held_before) ? -1 : 0));
+      const now = BigInt(after[after.length - 1].held_after);
+      if (now === 0n) return skip("the leader already sold out of this coin");
+      let peak = BigInt(b.leaderHeldAfterRaw ?? "0");
+      for (const t of after) for (const v of [BigInt(t.held_before), BigInt(t.held_after)]) if (v > peak) peak = v;
+      if (peak > 0n && Number((now * 1_000_000n) / peak) / 1e6 < m.minLeaderHeldFraction) return skip(`the leader already sold down to ${Math.round(Number((now * 10_000n) / peak) / 100)} % of its peak (mirror.minLeaderHeldFraction ${m.minLeaderHeldFraction})`);
+    }
     const l = this.leaders.get(b.leader)!;
     // A venue the bot can price: without one, its exits (and the mirrored sells) would be held.
     let mk: MarketRead | undefined;
@@ -247,6 +279,10 @@ export class MirrorTrigger implements Trigger {
     if (l.maxSol !== undefined) want = Math.min(want, l.maxSol - sol(used.lamports));
     if (!(want >= m.ticket.minSol)) return skip(l.maxSol !== undefined && l.maxSol - sol(used.lamports) < m.ticket.minSol ? `leader cap: ${fmt(sol(used.lamports))} SOL used (maxSol ${l.maxSol})` : `ticket ${fmt(want)} SOL < mirror.ticket.minSol ${m.ticket.minSol}`);
     const lamports = lamportsOf(want);
+    // The price guard: our fill (the venue's quote for our ticket, else its spot price) against the leader's own fill
+    // (its SOL leg over its token leg; the SOL leg is all-in: venue fees, tips and platform fees it paid).
+    const over = this.overLeaderBps(mk, lamports, b);
+    if (over !== null && over > m.maxOverLeaderBps) return skip(`our price is ${over} bps over the leader's fill (mirror.maxOverLeaderBps ${m.maxOverLeaderBps})`);
     this.reserved.set(c.mint, { leader: b.leader, lamports });
     // The leader's own price as the trigger's expected fill (the engine keeps the smaller of this and its own read).
     const expectedOutRaw = BigInt(b.leaderSolRaw) > 0n ? (BigInt(b.leaderTokenRaw) * lamports) / BigInt(b.leaderSolRaw) : null;
@@ -260,6 +296,20 @@ export class MirrorTrigger implements Trigger {
       context: { ...b, leaderAgeMsAtDecision: ageMs },
       log: { leader: b.leader, leaderSignature: b.signature, leaderSol, venue: b.venue, ageMs },
     };
+  }
+
+  /** Our price over the leader's, bps (null when neither a quote nor a spot price can say). */
+  private overLeaderBps(mk: MarketRead, lamports: bigint, b: LeaderBuy): number | null {
+    const lsol = BigInt(b.leaderSolRaw);
+    const ltok = BigInt(b.leaderTokenRaw);
+    if (!(lsol > 0n && ltok > 0n)) return null;
+    const leader = Number(lsol) / Number(ltok); // lamports per raw token
+    let ours: number | null = null;
+    const q = buyQuote(mk, lamports);
+    if (!("why" in q) && q.expectedOutRaw > 0n) ours = Number(lamports) / Number(q.expectedOutRaw);
+    else if (mk.priceSol !== null && mk.priceSol > 0) ours = (mk.priceSol * 1e9) / 10 ** b.decimals;
+    if (ours === null) return null;
+    return Math.round((ours / leader - 1) * 10_000);
   }
 
   /** A leader's usage: the ledger's, plus buys decided and not yet booked (dropped once the ledger has the coin). */
