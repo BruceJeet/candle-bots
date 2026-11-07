@@ -66,7 +66,7 @@ export class HedgeBook {
   constructor(path: string, now: () => number = Date.now) {
     this.db = new DatabaseSync(path);
     this.db.exec(TABLES);
-    // (audit fixes) Whether an order was signed but not submitted: added to a book made before it.
+    // Whether an order was signed but not submitted: a column added to a book made before it.
     const cols = (this.db.prepare("pragma table_info(hedge_orders)").all() as any[]).map((c) => c.name);
     if (!cols.includes("signed")) this.db.exec("alter table hedge_orders add column signed integer not null default 0");
     this.now = now;
