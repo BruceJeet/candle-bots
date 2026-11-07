@@ -1,0 +1,64 @@
+{
+  "name": "candle-dca-bot",
+  "version": "0.1.0",
+  "description": "Buys or sells a fixed amount of a Solana coin on a timer (dollar-cost averaging): schedules that survive a restart without firing twice, price and impact guards, a budget, optional exits. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BruceJeet/candle-bots.git",
+    "directory": "packages/dca-bot"
+  },
+  "homepage": "https://github.com/BruceJeet/candle-bots/tree/main/packages/dca-bot#readme",
+  "bugs": {
+    "url": "https://github.com/BruceJeet/candle-bots/issues"
+  },
+  "bin": {
+    "candle-dca-bot": "bin/candle-dca-bot"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "examples",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p .",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "candle-bot-core": "0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  },
+  "keywords": [
+    "candle",
+    "solana",
+    "trading-bot",
+    "dca",
+    "dollar-cost-averaging",
+    "scheduler",
+    "pump.fun",
+    "pumpswap",
+    "memecoin",
+    "bot",
+    "agent"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  }
+}

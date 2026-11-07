@@ -1,0 +1,18 @@
+{
+  "comment": "Dry run: runs the schedules with paper fills; never trades. No API key needed. Set each schedule's mint (and your wallet, and a key for live) before running: the bot refuses to start until the mints are real addresses. The sell schedule sells from the lots the bot holds: the wallet's bag of the coin, booked when the bot starts, and what it bought.",
+  "mode": "dry",
+  "payer": "embedded",
+  "apiKeyEnv": "CANDLE_API_KEY",
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "wallet": "11111111111111111111111111111111",
+  "stateDir": "./state-dry",
+  "buy": { "sol": 0.01, "maxSlippageBps": 500, "maxOpen": 100, "lifetimeSol": 0.3 },
+  "sell": { "maxSlippageBps": 1000 },
+  "dca": {
+    "maxImpactBps": 300,
+    "schedules": [
+      { "id": "daily-buy", "mint": "SET_THE_COIN_MINT", "side": "buy", "sol": 0.01, "everySec": 86400, "atUtc": "14:00", "jitterSec": 600, "maxRuns": 30, "budgetSol": 0.3 },
+      { "id": "weekly-trim", "mint": "SET_ANOTHER_COIN_MINT", "side": "sell", "fraction": 0.1, "everySec": 604800, "missed": "once", "minPriceSol": 0 }
+    ]
+  }
+}

@@ -612,6 +612,40 @@ can never trade.
 { botTokenEnv, chatIdEnv }`, posted through the Bot API. Besides those, there are the existing `webhookEnv` and
 `command`.
 
+## Timed runs and lots (opt-in)
+
+`scheduler` (batch 5): a `Scheduler` runs schedules on a fixed grid, every `everySec` (at least 10 s), optionally
+anchored to a UTC time of day (`atUtc`), with `jitterSec`, `maxRuns` and `until`. `parseSchedule` reads one from a
+config object.
+- **Claimed before acting.** `due()` claims each due run in one ledger transaction (run count, run in flight, next
+  slot) before the bot acts on it. A restart finds the run in flight (`inflight()`), never due again; the bot settles
+  it and calls `finish(id, run, status, detail)`. `setRef` keeps what the bot needs for that (its orders).
+- **A run in flight blocks the next** of its schedule.
+- **Missed slots** (the bot down, or a run still in flight): `missed: "skip"` (default) runs nothing for them;
+  `"once"` runs one catch-up run however many were missed. A slot within `graceSec` plus the jitter is on time.
+- Jitter is drawn once per slot and stored. A changed grid re-anchors after the last slot run; the history stays.
+- Two tables in the bot's ledger (`schedules`, `schedule_runs`), created by the Scheduler; dry and live rows apart.
+
+`lots`: for a bot that buys one coin many times, one position per buy (a lot). `withLots(cfg)` lifts
+`buy.maxPerCoin` for that bot (the parser keeps 1 for every other bot). The sell clamp, the surplus check and the buy
+recovery already count every position of a coin, and one attempt per coin runs at a time.
+- `sellLots(engine, ...)` sells an amount over a coin's lots through `Engine.placeSell`, the largest lot first; a lot
+  with an order in flight is passed over; a lot sold in part is the last order.
+- `WalletLots` is an adoption hook (`EngineDeps.adopter`): a configured coin the wallet holds, in which the bot has
+  never had a position, is booked once as a lot (the balance on chain, the junk check, a priceable venue,
+  `minValueSol`, cost at the mark, a token account not frozen). Tokens that turn up later are alerted
+  (`coin:<mint>:surplus`), never booked. `excludeStateDirs`: a coin another bot holds (its ledger read as the Adopter
+  reads it, fail closed) is never booked, and a wallet lot of it never sold. A wallet lot's mint passes the junk check
+  again before each sell. `enabled: false` turns wallet lots off. `ready` turns true once every configured coin has a
+  definite answer (a failed read is not one).
+- `PollWork` runs a trigger's run work one step at a time; `poll` waits for it at most `POLL_BUDGET_MS` (5 s), and
+  never more than half the engine's `triggerTimeoutMs` (pass the same value to both). Candidates from a longer step
+  come with the next poll. `sellLots` takes `shouldStop`: after STOP it books nothing more.
+- `LotExits` runs the bot's exit on the lots it bought and holds the wallet lots.
+- `runBuyOrders` finds a run's buys again by the `{ schedule, run }` in their entry context, after a restart too.
+
+candle-dca-bot and candle-rebalancer are built on both.
+
 ## How money is handled
 
 - **Quantity is what the chain says.** Fills are booked from the transaction's balance changes, never the quote;
@@ -641,7 +675,7 @@ can never trade.
 The root export is the API above. Every module is also importable on its own path, the same version:
 `candle-bot-core/ledger`, `/engine`, `/trigger`, `/config`, `/runtime`, `/exec/executor`, `/exec/trader`,
 `/exec/fills`, `/market/reader`, `/market/curve`, `/market/pump`, `/market/mint`, `/adopt/adopter`, `/solana/rpc`, `/solana/pda`, `/solana/base58`, `/solana/logs-ws`,
-`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/strategies/event`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`.
+`/strategies/load`, `/strategies/types`, `/sources/candleLaunches`, `/sources/holders`, `/sources/series`, `/sources/logsSeries`, `/sources/candleFeed`, `/sources/watchlist`, `/sources/replay`, `/sources/stack`, `/seriesBuy`, `/strategies/fade`, `/strategies/event`, `/market/indicators`, `/market/pumpEvents`, `/solana/logs-multi`, `/watch`, `/alerts`, `/log`, `/redact`, `/scheduler`, `/lots`.
 
 In a checkout of the repo, the `source` export condition (`node --conditions=source`) resolves them to the
 TypeScript sources, so nothing needs building while you work.
