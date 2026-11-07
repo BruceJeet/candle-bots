@@ -17,7 +17,11 @@
  *  - Orders: one per coin per plan. More short: a market open (never while opens are paused). Less short: a
  *    reduce-only close of the difference. Target zero, a flatten, or a long position on a hedge coin: a reduce-only
  *    close of the whole position.
- *  - A frozen coin (an order not yet reconciled, a position the book cannot explain) gets no order.
+ *  - A frozen coin (an order not yet reconciled, a position the book cannot explain) gets no order, except a whole
+ *    reduce-only close of a short when nothing should be hedged on it (target 0, or a flatten).
+ *  - A configured own perp that still holds a short but has lost its mark (or was delisted) keeps the bag: no proxy
+ *    hedge is opened on top of it.
+ *  - Positions the plan cannot change (frozen, no mark) count against the caps first.
  *  - Only `managed` coins are ever traded: a position on any other coin is not the hedger's.
  */
 import { floorSize, type PerpMarket } from "./venue.ts";
@@ -116,12 +120,15 @@ export interface Plan {
 }
 
 /** The instrument a bag is hedged with, given what the venue lists now. */
-export function instrumentFor(mint: string, cfg: HedgeConfig, markets: Map<string, PerpMarket>): { coin: string | null; ratio: number; own: boolean; note?: string } {
+export function instrumentFor(mint: string, cfg: HedgeConfig, markets: Map<string, PerpMarket>, positions: Map<string, number> = new Map()): { coin: string | null; ratio: number; own: boolean; hold?: boolean; note?: string } {
   const spec = cfg.coins[mint];
   if (spec && spec.perp === null) return { coin: null, ratio: 0, own: false, note: "perp: null (not hedged)" };
   if (spec?.perp) {
     const m = markets.get(spec.perp);
     if (m && !m.delisted && m.markPx !== null && m.markPx > 0) return { coin: spec.perp, ratio: spec.ratio ?? 1, own: true };
+    // The own perp still holds a short: the bag stays on it (no proxy hedge on top). A delisted market with a mark gets
+    // a target of 0 there, so the short is closed first; with no mark nothing can be sent until it has one.
+    if ((positions.get(spec.perp) ?? 0) !== 0) return { coin: spec.perp, ratio: 0, own: true, hold: true, note: `own perp ${spec.perp} ${!m ? "not listed" : m.delisted ? "delisted" : "has no mark"} but holds a position: no proxy hedge until it is closed` };
     return { coin: cfg.proxy, ratio: cfg.ratio, own: false, note: `own perp ${spec.perp} ${!m ? "not listed" : m.delisted ? "delisted" : "has no mark"}: proxy ${cfg.proxy}` };
   }
   return { coin: cfg.proxy, ratio: spec?.ratio ?? cfg.ratio, own: false };
@@ -132,13 +139,13 @@ export function planHedge(inp: PlanInput): Plan {
   const bags: PlanBag[] = [];
   const perCoin = new Map<string, { usd: number; mints: string[] }>();
   for (const b of inp.bags) {
-    const ins = instrumentFor(b.mint, cfg, markets);
+    const ins = instrumentFor(b.mint, cfg, markets, inp.positions);
     // A fitted beta applies to proxy hedges only (it is fitted against the proxy), and never to a configured ratio.
     const ratio = !ins.own && ins.coin !== null && cfg.coins[b.mint]?.ratio === undefined && b.beta !== undefined && b.beta !== null ? b.beta : ins.ratio;
     const fresh = b.valueUsd !== null && b.pricedAt !== null && inp.now - b.pricedAt <= cfg.unpricedCloseSec * 1000;
     let status: BagStatus;
     let hedgeUsd = 0;
-    if (ins.coin === null) status = "unhedged";
+    if (ins.coin === null || ins.hold) status = "unhedged";
     else if (inp.flatten) status = "flatten";
     else if (!fresh) status = "unpriced";
     else if (b.valueUsd! < cfg.minBagUsd) status = "dust";
@@ -160,11 +167,23 @@ export function planHedge(inp: PlanInput): Plan {
     const m = markets.get(coin);
     return m ? Math.max(1, Math.min(cfg.maxLeverage, m.maxLeverage)) : null;
   };
+  // Positions this plan cannot change (frozen coins, coins with no mark) still use margin: counted first.
+  const stuck = (coin: string) => inp.frozen.has(coin) || !(markets.get(coin)?.markPx! > 0);
+  let fixedNotional = 0;
+  let fixedMargin = 0;
+  for (const [coin, szi] of inp.positions) {
+    if (szi === 0 || !inp.managed.has(coin) || !stuck(coin)) continue;
+    const m = markets.get(coin);
+    const px = m?.markPx ?? null;
+    if (px === null || !(px > 0)) continue; // no mark: its size in USD is unknown
+    fixedNotional += Math.abs(szi) * px;
+    fixedMargin += (Math.abs(szi) * px) / (levOf(coin) ?? 1);
+  }
   let notional = 0;
   let margin = 0;
   for (const [coin, e] of perCoin) {
     const lev = levOf(coin);
-    if (lev === null || e.usd <= 0) continue;
+    if (lev === null || e.usd <= 0 || stuck(coin)) continue;
     notional += e.usd;
     margin += e.usd / lev;
   }
@@ -177,10 +196,10 @@ export function planHedge(inp: PlanInput): Plan {
     }
   };
   if (margin > 0) {
-    cap(cfg.maxMarginUsd / margin, "maxMarginUsd");
-    if (inp.accountValueUsd !== null) cap(Math.max(0, (0.9 * inp.accountValueUsd) / margin), "account value");
+    cap(Math.max(0, cfg.maxMarginUsd - fixedMargin) / margin, "maxMarginUsd");
+    if (inp.accountValueUsd !== null) cap(Math.max(0, 0.9 * inp.accountValueUsd - fixedMargin) / margin, "account value");
   }
-  if (cfg.maxNotionalUsd !== undefined && notional > 0) cap(cfg.maxNotionalUsd / notional, "maxNotionalUsd");
+  if (cfg.maxNotionalUsd !== undefined && notional > 0) cap(Math.max(0, cfg.maxNotionalUsd - fixedNotional) / notional, "maxNotionalUsd");
   factor = Math.max(0, Math.min(1, factor));
 
   const coins = new Set<string>([...perCoin.keys()]);
@@ -206,6 +225,12 @@ export function planHedge(inp: PlanInput): Plan {
     if (frozen) {
       line.status = "frozen";
       line.note = frozen;
+      // A whole reduce-only close can neither grow nor flip a short: sent even on a frozen coin when nothing should be
+      // hedged there (bags sold or unpriced, or a flatten), so a freeze never keeps a naked short on.
+      if (actual < 0 && (inp.flatten || targetUsd === 0) && m && m.markPx !== null && m.markPx > 0) {
+        line.status = "order";
+        orders.push({ coin, action: "close", side: "long", size: null, reduceOnly: true, reason: inp.flatten ? "flatten_frozen" : "close_frozen", usd: Math.abs(actual) * m.markPx });
+      }
       continue;
     }
     if (!m || m.markPx === null || !(m.markPx > 0)) {
@@ -241,7 +266,7 @@ export function planHedge(inp: PlanInput): Plan {
         continue;
       }
       const size = floorSize(-delta, m.szDecimals);
-      if (size === "0") continue;
+      if (size === "0" || Number(size) * mark < cfg.minOrderUsd) continue;
       line.status = "order";
       orders.push({ coin, action: "open", side: "short", size, reduceOnly: false, reason: actual === 0 ? "hedge" : "add", usd: Number(size) * mark });
     } else {

@@ -1,0 +1,13 @@
+{
+  "comment": "Watch-only: no wallet, no API key, never trades. One coin on its own venue (as the core finds it: pump.fun curve, PumpSwap, Candle curve or its DAMM v2 pool) and its Hyperliquid perp. Add other pools of a coin by address under pools ({ \"venue\": \"pumpswap\" | \"damm\", \"address\": ... }). Add an alerts sink to get the alerts somewhere; without one they go to events.jsonl only.",
+  "mode": "watch",
+  "stateDir": "./state-spread",
+  "loopMs": 10000,
+  "rpcUrlEnv": "SOLANA_RPC_URL",
+  "coins": [
+    { "mint": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn", "label": "PUMP", "own": true, "pools": [], "perp": "PUMP" }
+  ],
+  "perps": { "network": "mainnet", "everySec": 30 },
+  "rules": { "minSpreadBps": 300, "minReads": 3, "minDepthSol": 5, "perps": true, "cooldownMin": 30 },
+  "alerts": {}
+}

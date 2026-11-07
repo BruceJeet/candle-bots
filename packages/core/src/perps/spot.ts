@@ -22,6 +22,8 @@ export interface SpotBag {
   /** SOL per whole token on the venue read, null when it could not be priced (`problem` says why). */
   priceSol: number | null;
   venue: string;
+  /** SOL in the coin's venue (curve reserve or pool vault), null when unread. */
+  liquiditySol: number | null;
   problem?: string;
 }
 
@@ -34,6 +36,8 @@ export interface SpotReadOptions {
   /** At most this many coins are priced per read (a wallet full of airdrops must not flood the RPC). */
   maxBags: number;
   now?: () => number;
+  /** Called with the number of candidate coins when there are more than maxBags (the rest are not read). */
+  onTruncated?: (candidates: number) => void;
 }
 
 /** The wallet's balances per mint (both token programs). Throws when either read fails. */
@@ -61,22 +65,27 @@ export async function walletBalances(rpc: Rpc, wallet: string): Promise<Map<stri
 export async function readSpotBags(rpc: Rpc, o: SpotReadOptions): Promise<SpotBag[]> {
   const bal = await walletBalances(rpc, o.wallet);
   const wanted = o.mode === "list" ? o.mints : [...bal.keys()].filter((m) => (bal.get(m)?.amount ?? 0n) > 0n);
-  const mints = [...new Set(wanted)].filter((m) => !o.exclude.has(m)).sort().slice(0, o.maxBags);
+  const all = [...new Set(wanted)].filter((m) => !o.exclude.has(m)).sort();
+  // Listed mints first, then the rest (a wallet full of dust must not push a listed bag out of the read).
+  const listed = new Set(o.mints);
+  const mints = [...all.filter((m) => listed.has(m)), ...all.filter((m) => !listed.has(m))].slice(0, o.maxBags);
+  if (all.length > o.maxBags) o.onTruncated?.(all.length);
   const coins = mints.map((mint) => ({ mint, decimals: bal.get(mint)?.decimals ?? 6 }));
   let reads = new Map<string, MarketRead>();
   let readError: string | null = null;
   try {
-    reads = await readMarkets(rpc, coins.filter((c) => (bal.get(c.mint)?.amount ?? 0n) > 0n), (o.now ?? Date.now)(), { pump: true });
+    reads = await readMarkets(rpc, coins.filter((c) => (bal.get(c.mint)?.amount ?? 0n) > 0n), (o.now ?? Date.now)(), { pump: true, reserves: true });
   } catch (e) {
     readError = String((e as Error)?.message ?? e).slice(0, 200);
   }
   return coins.map((c) => {
     const qtyRaw = bal.get(c.mint)?.amount ?? 0n;
-    if (qtyRaw === 0n) return { mint: c.mint, qtyRaw, decimals: c.decimals, priceSol: null, venue: "none", problem: "not held" };
+    if (qtyRaw === 0n) return { mint: c.mint, qtyRaw, decimals: c.decimals, priceSol: null, venue: "none", liquiditySol: null, problem: "not held" };
     const m = reads.get(c.mint);
-    if (!m) return { mint: c.mint, qtyRaw, decimals: c.decimals, priceSol: null, venue: "unknown", problem: readError ?? "unread" };
+    if (!m) return { mint: c.mint, qtyRaw, decimals: c.decimals, priceSol: null, venue: "unknown", liquiditySol: null, problem: readError ?? "unread" };
     const ok = m.priceSol !== null && Number.isFinite(m.priceSol) && m.priceSol > 0;
-    return { mint: c.mint, qtyRaw, decimals: c.decimals, priceSol: ok ? m.priceSol : null, venue: m.venue, ...(ok ? {} : { problem: m.problem ?? "no price" }) };
+    const liquiditySol = m.quoteLiquidityLamports !== undefined && m.quoteLiquidityLamports !== null ? Number(m.quoteLiquidityLamports) / 1e9 : null;
+    return { mint: c.mint, qtyRaw, decimals: c.decimals, priceSol: ok ? m.priceSol : null, venue: m.venue, liquiditySol, ...(ok ? {} : { problem: m.problem ?? "no price" }) };
   });
 }
 

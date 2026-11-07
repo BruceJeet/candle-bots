@@ -162,6 +162,11 @@ export class HedgeBook {
     return +v.toPrecision(12);
   }
 
+  /** Whether a venue order id is one of the book's orders. */
+  hasOid(oid: number): boolean {
+    return !!this.db.prepare("select 1 from hedge_orders where oid = ?").get(oid);
+  }
+
   coins(): string[] {
     return (this.db.prepare("select distinct coin from hedge_orders order by coin").all() as any[]).map((r) => r.coin);
   }

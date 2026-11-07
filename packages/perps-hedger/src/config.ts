@@ -24,6 +24,8 @@ export interface SpotSection {
   mints: string[];
   exclude: string[];
   maxBags: number;
+  /** A bag whose venue holds less SOL than this is not hedged (an airdropped coin on a thin pool). */
+  minLiquiditySol: number;
 }
 
 export interface PerpsSection {
@@ -113,7 +115,7 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
   // spot
   const sp = raw.spot;
   if (!isObj(sp)) throw new ConfigError("config.spot: required object { wallet, mode }");
-  only(sp, ["wallet", "mode", "mints", "exclude", "maxBags"], "config.spot");
+  only(sp, ["wallet", "mode", "mints", "exclude", "maxBags", "minLiquiditySol"], "config.spot");
   const spotWallet = str(sp, "wallet", "config.spot")!;
   if (asAddress(spotWallet) !== spotWallet) throw new ConfigError("config.spot.wallet: not a Solana address");
   const spotMode = str(sp, "mode", "config.spot", { def: "wallet" }) as SpotSection["mode"];
@@ -122,7 +124,7 @@ export function parseConfig(raw: unknown, baseDir = process.cwd()): Config {
   if (spotMode === "list" && !mints.length) throw new ConfigError("config.spot.mints: list mode needs at least one mint");
   if (new Set(mints).size !== mints.length) throw new ConfigError("config.spot.mints: a mint is listed twice");
   const exclude = [...new Set([...DEFAULT_SPOT_EXCLUDE, ...strList(sp, "exclude", "config.spot", { def: [], address: true })!])];
-  const spot: SpotSection = { wallet: spotWallet, mode: spotMode, mints, exclude, maxBags: num(sp, "maxBags", "config.spot", { min: 1, max: 200, int: true, def: 50 }) };
+  const spot: SpotSection = { wallet: spotWallet, mode: spotMode, mints, exclude, maxBags: num(sp, "maxBags", "config.spot", { min: 1, max: 200, int: true, def: 50 }), minLiquiditySol: num(sp, "minLiquiditySol", "config.spot", { min: 0, def: 5 }) };
 
   // perps
   const pp = raw.perps === undefined ? {} : raw.perps;

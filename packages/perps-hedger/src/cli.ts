@@ -30,7 +30,8 @@ rebalanced outside a band, within a max leverage and a max margin; reduce-only c
   candle-perps-hedger status  --config hedge.json                print status.json
   candle-perps-hedger flatten --config hedge.json                close every hedge (reduce-only) and hold flat: writes FLATTEN
   candle-perps-hedger resume  --config hedge.json                remove FLATTEN and PAUSE_OPENS
-  candle-perps-hedger accept  <coin> --config hedge.json         (stopped) take over the account's position in <coin> as the hedger's
+  candle-perps-hedger accept  <coin> --config hedge.json         (stopped) take over the account's position in <coin> as the hedger's;
+                                                                 from then on the hedger sizes it to the bags (it may reduce or close it)
 
 Start from examples/dry.json. Controls in the state folder: STOP (stop), PAUSE_OPENS (no new or larger hedges; closes
 still run), FLATTEN (close every hedge). Docs: the README.
@@ -227,7 +228,7 @@ async function planOnce(ctx: Ctx): Promise<number> {
   const plan = planHedge({
     now, markets, managed, frozen, cfg: cfg.hedge, accountValueUsd: account.accountValueUsd,
     positions: new Map(account.positions.map((p) => [p.coin, p.szi])),
-    bags: bags.filter((b) => b.qtyRaw > 0n).map((b) => ({ mint: b.mint, valueUsd: solUsd === null ? null : bagUsd(b, solUsd), pricedAt: b.priceSol === null ? null : now })),
+    bags: bags.filter((b) => b.qtyRaw > 0n && !(b.liquiditySol !== null && b.liquiditySol < cfg.spot.minLiquiditySol)).map((b) => ({ mint: b.mint, valueUsd: solUsd === null ? null : bagUsd(b, solUsd), pricedAt: b.priceSol === null ? null : now })),
     flatten: existsSync(join(cfg.stateDir, "FLATTEN")), pauseOpens: existsSync(join(cfg.stateDir, "PAUSE_OPENS")),
   });
   process.stdout.write(JSON.stringify({ mode: cfg.mode, network: cfg.network, solUsd, account, orders: plan.orders, lines: plan.lines, bags: plan.bags.map((b) => ({ ...b, venue: bags.find((x) => x.mint === b.mint)?.venue })), capped: plan.capped, frozen: Object.fromEntries(frozen), note: "plan only: nothing was sent" }, null, 2) + "\n");

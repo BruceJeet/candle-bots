@@ -52,6 +52,9 @@ export class Hedger {
   private nextFillsAt = 0;
   private nextSampleAt = 0;
   private spotOkAt: number | null = null;
+  private readonly startedAt: number;
+  /** Bags left out this read: a venue thinner than spot.minLiquiditySol. */
+  thin: Array<{ mint: string; liquiditySol: number }> = [];
   lastPlan: Plan | null = null;
   lastAccount: PerpAccount | null = null;
   lastMarkets: Map<string, PerpMarket> | null = null;
@@ -62,6 +65,7 @@ export class Hedger {
   constructor(d: HedgerDeps) {
     this.d = d;
     this.now = d.now ?? Date.now;
+    this.startedAt = this.now();
     d.book.checkIdentity({ mode: d.cfg.mode, network: d.cfg.network, account: d.venue.kind === "live" ? d.cfg.perps.wallet ?? "" : `paper:${d.cfg.perps.wallet ?? "none"}` });
   }
 
@@ -81,15 +85,20 @@ export class Hedger {
     const t = this.now();
     let fresh: SpotBag[];
     try {
-      fresh = await (this.d.spot ?? readSpotBags)(this.d.rpc, { wallet: this.d.cfg.spot.wallet, mode: this.d.cfg.spot.mode, mints: this.d.cfg.spot.mints, exclude: new Set(this.d.cfg.spot.exclude), maxBags: this.d.cfg.spot.maxBags, now: this.now });
+      fresh = await (this.d.spot ?? readSpotBags)(this.d.rpc, { wallet: this.d.cfg.spot.wallet, mode: this.d.cfg.spot.mode, mints: this.d.cfg.spot.mints, exclude: new Set(this.d.cfg.spot.exclude), maxBags: this.d.cfg.spot.maxBags, now: this.now, onTruncated: (n) => this.d.alerter.raise("spot:truncated", `the wallet holds ${n} candidate coins; only ${this.d.cfg.spot.maxBags} are read (spot.maxBags): list the coins to hedge (spot.mode "list")`) });
     } catch (e) {
       this.d.log.warn("spot_read_failed", { error: String((e as Error)?.message ?? e).slice(0, 300) });
       return;
     }
     this.spotOkAt = t;
     const next = new Map<string, BagState>();
+    this.thin = [];
     for (const b of fresh) {
       if (b.qtyRaw === 0n) continue; // sold or sent away: no hedge needed
+      if (b.liquiditySol !== null && b.liquiditySol < this.d.cfg.spot.minLiquiditySol) {
+        this.thin.push({ mint: b.mint, liquiditySol: b.liquiditySol });
+        continue; // a thin venue: its mid is no value to hedge (an airdrop, a drained pool)
+      }
       const prev = this.bags.get(b.mint);
       const usd = b.priceSol !== null && solUsd !== null && solUsd > 0 ? b.priceSol * solUsd : null;
       if (usd !== null) next.set(b.mint, { bag: b, coinUsd: usd, pricedAt: t });
@@ -104,6 +113,15 @@ export class Hedger {
     for (const row of this.d.book.unresolved()) {
       try {
         const st = await this.d.venue.orderStatus(row.client_id);
+        if (!st.found && this.now() - row.created_at >= this.d.cfg.perps.settleSec * 1000) {
+          // Before writing it off: no fill on the coin since the order from an order the book does not know (a
+          // signed order that landed late would show there).
+          const odd = (await this.d.venue.fills(row.created_at - 5_000)).filter((f) => f.coin === row.coin && !this.d.book.hasOid(f.oid));
+          if (odd.length) {
+            this.d.alerter.raise(`perps:unexplained-fill:${row.coin}`, `${row.coin}: order ${row.id} (client id ${row.client_id}) has no venue record, but ${odd.length} fill(s) on ${row.coin} since it came from orders the book does not know (oid ${odd.map((f) => f.oid).join(", ")}): it stays in doubt and ${row.coin} stays frozen`, { coin: row.coin });
+            continue;
+          }
+        }
         const done = this.d.book.resolve(row.id, st, this.d.cfg.perps.settleSec * 1000);
         if (done) {
           const r = this.d.book.order(row.id)!;
@@ -155,13 +173,17 @@ export class Hedger {
         continue;
       }
       const m = this.mismatch.get(coin);
-      if (!m || m.venue !== venue || m.book !== book) {
+      if (!m) {
         this.mismatch.set(coin, { since: t, reads: 1, venue, book });
         // Not confirmed yet: no order on it either, until the reads agree or the difference holds.
         frozen.set(coin, `position ${venue} differs from the book's ${book}: checking`);
         continue;
       }
+      // The timer runs while the two differ at all (a position changing on every read, as in a liquidation in steps,
+      // still alerts).
       m.reads++;
+      m.venue = venue;
+      m.book = book;
       frozen.set(coin, `position ${venue} differs from the book's ${book}`);
       if (t - m.since >= this.d.cfg.perps.mismatchSec * 1000)
         this.d.alerter.raise(`perps:mismatch:${coin}`, `${coin}: the account holds ${venue} but the hedge book made ${book}. The hedger leaves ${coin} alone until this is explained; \`accept ${coin}\` (bot stopped) takes the position over as the hedger's`, { coin, venue, book });
@@ -202,8 +224,13 @@ export class Hedger {
     this.lastAccount = account;
     const solUsd = markets.get("SOL")?.markPx ?? null;
     await this.readSpot(solUsd);
-    if (this.spotOkAt !== null && this.now() - this.spotOkAt > this.d.cfg.hedge.unpricedCloseSec * 1000)
-      this.d.alerter.raise("spot:read", `cannot read the spot wallet since ${new Date(this.spotOkAt).toISOString()}: its bags count as unpriced and their hedges are closed`);
+    const graceMs = this.d.cfg.hedge.unpricedCloseSec * 1000;
+    const lastOk = this.spotOkAt ?? this.startedAt;
+    if (this.now() - lastOk > graceMs)
+      this.d.alerter.raise("spot:read", `cannot read the spot wallet since ${this.spotOkAt === null ? "the start" : new Date(this.spotOkAt).toISOString()}: its bags count as unpriced and their hedges are closed`);
+    // Never read the wallet since the start: no bags known yet, so no plan (it would close every hedge) until the
+    // grace runs out; then the kill rule applies as for an unpriced bag.
+    const blind = this.spotOkAt === null && this.now() - this.startedAt <= graceMs;
     await this.reconcile();
     const managed = this.managed();
     await this.bookHistory(managed);
@@ -219,6 +246,10 @@ export class Hedger {
     const positions = new Map(account.positions.map((p) => [p.coin, p.szi]));
     const plan = planHedge({ now: t, bags, markets, positions, accountValueUsd: account.accountValueUsd, frozen: this.frozen, managed, flatten: this.control("FLATTEN"), pauseOpens: this.control("PAUSE_OPENS"), cfg: this.d.cfg.hedge });
     this.lastPlan = plan;
+    if (blind) {
+      this.d.log.warn("spot_not_read_yet", { sinceStartMs: this.now() - this.startedAt });
+      return;
+    }
     if (plan.capped) this.d.alerter.raise("perps:capped", `hedge capped by ${plan.capped.by}: targets at ${(plan.capped.factor * 100).toFixed(1)} %`, plan.capped);
     for (const b of plan.bags) if (b.status === "unpriced" && b.coin) this.d.alerter.raise(`spot:unpriced:${b.mint}`, `${b.mint} cannot be priced: its hedge on ${b.coin} is closed`, { mint: b.mint });
     for (const l of plan.lines) if (l.status === "no_market") this.d.alerter.raise(`perps:no-market:${l.coin}`, `${l.coin}: ${l.note}; no orders on it`, { coin: l.coin });
@@ -274,6 +305,7 @@ export class Hedger {
       bags: (this.lastPlan?.bags ?? []).map((b) => ({ ...b, venue: this.bags.get(b.mint)?.bag.venue ?? null, pricedAt: this.bags.get(b.mint)?.pricedAt ? new Date(this.bags.get(b.mint)!.pricedAt!).toISOString() : null })),
       capped: this.lastPlan?.capped ?? null,
       frozen: Object.fromEntries(this.frozen),
+      thin: this.thin,
       unresolved: book.unresolved().map((r) => ({ id: r.id, coin: r.coin, status: r.status, clientId: r.client_id })),
       book: Object.fromEntries([...this.managed()].map((c) => [c, book.expected(c)])),
       totals: { ...tot, net: tot.closedPnl - tot.fees + tot.funding },
