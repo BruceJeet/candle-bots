@@ -8,9 +8,10 @@
  * How it sees a wallet's transactions:
  *   - logsSubscribe with `mentions: [wallet]` (one subscription per wallet, core solana/logs-multi). A notification's
  *     logs are checked first: only a transaction that invokes a known venue or router is fetched (`prefilter`).
- *   - Each subscription is anchored: before it is confirmed, the wallet's newest signature is read. When the
- *     subscription is confirmed (at start, and after every reconnect), the signatures since the anchor are read with
- *     getSignaturesForAddress and fetched (`via: "backfill"`).
+ *   - When a subscription is confirmed (at start, and after every reconnect), the signatures since the wallet's
+ *     verified point are read with getSignaturesForAddress and fetched (`via: "backfill"`). The verified point is the
+ *     newest signature up to which every signature of the wallet was listed by such a read (`since` at a restart).
+ *     With no point yet (a first start), the newest signature at confirmation becomes it: watching starts there.
  *   - Without a websocket, the same read runs every `pollMs` (`via: "poll"`); with one, every `reconcileMs` as a safety
  *     net (a transaction the socket missed is logged, wallet_logs_missed).
  *   - Every fetch goes through one paced queue (`fetchPerSec`, a burst of `fetchBurst`, backoff on HTTP 429): the public
@@ -120,6 +121,12 @@ interface WalletState {
   /** Last poll or reconcile started (ms), and the last one that read everything. */
   polledAt: number;
   okAt: number;
+  /** Every signature of the wallet up to this one was listed by a read (backfill, poll, reconcile): reads start here. */
+  verified: Anchor | null;
+  /** Jobs of this wallet in the fetch queue. */
+  pending: number;
+  /** The verified point at a moment no job of the wallet was queued: everything up to it was handled (restart point). */
+  checkpoint: Anchor | null;
 }
 
 interface Gap {
@@ -154,6 +161,8 @@ export interface WalletFeed {
   drainGaps(): WalletGap[];
   onNew: (() => void) | null;
   head(wallet: string): Anchor | null;
+  /** Where a restart should read back from (everything up to it read and handled). Optional: a feed without one is never resumed. */
+  checkpoint?(wallet: string): Anchor | null;
   openGaps(): Array<{ wallet: string; fromMs: number; reason: string }>;
   watched(): string[];
   readonly stats?: unknown;
@@ -202,7 +211,7 @@ export class WalletSource implements WalletFeed {
     for (const w of wallets) {
       if (this.wallets.has(w)) continue;
       const since = this.o.since?.[w];
-      this.wallets.set(w, { head: since ? { ...since, slot: 0 } : null, dirty: false, gap: null, nextGap: null, reading: false, polledAt: 0, okAt: this.now() });
+      this.wallets.set(w, { head: since ? { ...since, slot: 0 } : null, dirty: false, gap: null, nextGap: null, reading: false, polledAt: 0, okAt: this.now(), verified: since ?? null, pending: 0, checkpoint: since ?? null });
       added = true;
     }
     if (added && this.running) this.attach();
@@ -222,6 +231,15 @@ export class WalletSource implements WalletFeed {
   head(wallet: string): Anchor | null {
     const h = this.wallets.get(wallet)?.head;
     return h ? { signature: h.signature, blockTime: h.blockTime ?? null } : null;
+  }
+
+  /**
+   * The point a restart should read back from (`since`): every signature of the wallet up to it was read and handled.
+   * Behind `head` by design: it moves only when the wallet has nothing queued.
+   */
+  checkpoint(wallet: string): Anchor | null {
+    const c = this.wallets.get(wallet)?.checkpoint;
+    return c ? { signature: c.signature, blockTime: c.blockTime ?? null } : null;
   }
 
   /** Open gaps now (wallet, since when, why). */
@@ -343,7 +361,7 @@ export class WalletSource implements WalletFeed {
       if (!s.nextGap) s.nextGap = { fromMs: at, reason, anchor: s.gap.anchor, ended: false, tries: 0, retryAt: 0 };
       return;
     }
-    s.gap = { fromMs: at, reason, anchor: s.head ? { signature: s.head.signature, blockTime: s.head.blockTime ?? null } : null, ended: !this.o.wsUrl, tries: 0, retryAt: 0 };
+    s.gap = { fromMs: at, reason, anchor: s.verified ?? (s.head ? { signature: s.head.signature, blockTime: s.head.blockTime ?? null } : null), ended: !this.o.wsUrl, tries: 0, retryAt: 0 };
     if (reason !== "subscribing" && reason !== "starting") this.o.log.info("wallet_gap_open", { wallet, reason, from: new Date(at).toISOString() });
   }
 
@@ -367,7 +385,11 @@ export class WalletSource implements WalletFeed {
       const to = this.now();
       s.gap = s.nextGap;
       s.nextGap = null;
-      if (r.ok) s.okAt = to;
+      if (r.ok) {
+        s.okAt = to;
+        s.verified = r.newest ?? gap.anchor ?? s.verified;
+        this.mark(s);
+      }
       if (r.ok) {
         // A start with no anchor reads nothing back: there is nothing before watching began to miss.
         if (gap.anchor || (gap.reason !== "subscribing" && gap.reason !== "starting")) {
@@ -390,9 +412,9 @@ export class WalletSource implements WalletFeed {
    * Read the wallet's signatures newer than `anchor` (or, with no anchor, the newest one only, as the new anchor) and
    * queue those not seen, oldest first. ok: every signature since the anchor (or since `fromMs`) was listed.
    */
-  private async readSince(wallet: string, anchor: Anchor | null, via: WalletEvent["via"]): Promise<{ ok: true } | { ok: false; why: string; retry: boolean }> {
+  private async readSince(wallet: string, anchor: Anchor | null, via: WalletEvent["via"]): Promise<{ ok: true; newest: Anchor | null } | { ok: false; why: string; retry: boolean }> {
     const s = this.state(wallet);
-    if (!s) return { ok: true };
+    if (!s) return { ok: true, newest: null };
     const found: Array<{ signature: string; slot: number; err: unknown; blockTime: number | null }> = [];
     let before: string | undefined;
     let reached = false;
@@ -425,8 +447,9 @@ export class WalletSource implements WalletFeed {
       const n = found[0];
       if (n) this.advance(s, { signature: n.signature, slot: n.slot, blockTime: n.blockTime });
       for (const x of found) this.markSeen(x.signature);
-      return { ok: true };
+      return { ok: true, newest: n ? { signature: n.signature, blockTime: n.blockTime } : null };
     }
+    const newest = found[0] ? { signature: found[0].signature, blockTime: found[0].blockTime } : null;
     for (const x of found.reverse()) {
       if (this.seen.has(x.signature)) continue;
       if (x.err !== null) {
@@ -440,7 +463,7 @@ export class WalletSource implements WalletFeed {
       }
       this.enqueue(wallet, x.signature, via, x.slot, x.blockTime);
     }
-    return reached ? { ok: true } : { ok: false, why: `more than ${this.o.backfillLimit} signatures since the last one read`, retry: false };
+    return reached ? { ok: true, newest } : { ok: false, why: `more than ${this.o.backfillLimit} signatures since the last one read`, retry: false };
   }
 
   private async pollLoop(): Promise<void> {
@@ -461,9 +484,13 @@ export class WalletSource implements WalletFeed {
           let failed: { why: string; retry: boolean } | null = null;
           const from = s.okAt;
           try {
-            const r = await this.readSince(w, s.head, "poll");
-            if (r.ok) s.okAt = this.now();
-            else failed = r;
+            // From the verified point, not the head: a signature the socket skipped behind a newer one is still listed.
+            const r = await this.readSince(w, s.verified ?? s.head, "poll");
+            if (r.ok) {
+              s.okAt = this.now();
+              s.verified = r.newest ?? s.verified;
+              this.mark(s);
+            } else failed = r;
           } finally {
             s.reading = false;
           }
@@ -488,6 +515,18 @@ export class WalletSource implements WalletFeed {
 
   // ---------------------------------------------------------------- the fetch queue
 
+  /** The checkpoint follows the verified point whenever the wallet has nothing queued. */
+  private mark(s: WalletState): void {
+    if (s.pending === 0 && s.verified) s.checkpoint = s.verified;
+  }
+
+  private done(job: Job): void {
+    const s = this.state(job.wallet);
+    if (!s) return;
+    s.pending = Math.max(0, s.pending - 1);
+    this.mark(s);
+  }
+
   private markSeen(sig: string): void {
     this.seen.add(sig);
     if (this.seen.size > this.o.maxSeen) {
@@ -510,6 +549,7 @@ export class WalletSource implements WalletFeed {
     this.markSeen(signature);
     this.advance(s, { signature, slot, blockTime });
     this.queue.push({ wallet, signature, via, tries: 0, notBefore: 0 });
+    s.pending++;
     this.wakeQueue?.();
   }
 
@@ -550,7 +590,9 @@ export class WalletSource implements WalletFeed {
   private async fetchLoop(): Promise<void> {
     while (!this.stopped) {
       const t = this.now();
-      const i = this.queue.findIndex((j) => j.notBefore <= t);
+      // Live notifications first: a long backfill must not age a fresh trade past a consumer's limit.
+      let i = this.queue.findIndex((j) => j.notBefore <= t && j.via === "logs");
+      if (i < 0) i = this.queue.findIndex((j) => j.notBefore <= t);
       if (i < 0) {
         const next = this.queue.length ? Math.max(10, Math.min(...this.queue.map((j) => j.notBefore)) - t) : 1000;
         await new Promise<void>((r) => {
@@ -584,7 +626,11 @@ export class WalletSource implements WalletFeed {
         this.o.log.warn("wallets_record_failed", { error: String((e as Error)?.message ?? e).slice(0, 200) });
       }
     }
-    this.handle(job.wallet, job.signature, job.via, tx);
+    try {
+      this.handle(job.wallet, job.signature, job.via, tx);
+    } finally {
+      this.done(job);
+    }
   }
 
   private retry(job: Job, why: string): void {
@@ -596,6 +642,7 @@ export class WalletSource implements WalletFeed {
       this.o.log.warn("wallet_tx_unread", { wallet: job.wallet, signature: job.signature, why });
       this.gapsOut.push({ wallet: job.wallet, fromMs: this.now(), toMs: this.now(), reason: "transaction unread", recovered: false, missing: `${job.signature}: ${why}` });
       this.notify();
+      this.done(job);
       return;
     }
     job.notBefore = this.now() + 500 * 2 ** (job.tries - 1);

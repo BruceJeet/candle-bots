@@ -70,7 +70,11 @@ export class MirrorTrigger implements Trigger {
   private d: MirrorDeps;
   private now: () => number;
   private leaders: Map<string, Leader>;
-  readonly book: LeaderBook;
+  book: LeaderBook;
+  /** Events drained from the source and not yet recorded. */
+  private buffer: WalletEvent[] = [];
+  /** Buys decided and not yet booked, per coin: they count toward their leader's caps until the ledger shows them. */
+  private reserved = new Map<string, { leader: string; lamports: bigint }>();
   private readMarket: MarketReader;
   readonly stats = { leaderTrades: 0, repeats: 0, buysSeen: 0, sellsSeen: 0, sellsOwed: 0, gapsRecovered: 0, gapsUnrecovered: 0 };
   private lastGaps: WalletGap[] = [];
@@ -99,59 +103,91 @@ export class MirrorTrigger implements Trigger {
 
   poll(ctx: TriggerContext): Candidate[] {
     for (const g of this.d.source.drainGaps()) this.onGap(g);
+    this.buffer.push(...this.d.source.drain());
     const out: Candidate[] = [];
-    for (const e of this.d.source.drain()) {
-      if (!this.leaders.has(e.wallet)) continue;
-      if (this.d.ledger.hasLeaderTrade(e.wallet, e.signature)) {
-        this.stats.repeats++;
-        continue;
+    // One event at a time: an event leaves the buffer only once it is recorded (or dropped as a repeat), so a failed
+    // write (a busy or full disk) keeps it and the rest for the next poll.
+    while (this.buffer.length) {
+      const e = this.buffer[0];
+      let c: Candidate | null;
+      try {
+        c = this.take(e);
+      } catch (err) {
+        // The book was changed in memory before the write failed: back to what the ledger holds.
+        this.book = LeaderBook.fromJSON(this.d.ledger.leaderBook(), { openDustPct: this.d.cfg.mirror.openDustPct });
+        this.d.log.error("leader_trade_record_failed", { leader: e.wallet, signature: e.signature, error: String((err as Error)?.message ?? err).slice(0, 300), left: this.buffer.length });
+        break;
       }
-      const move = this.book.apply(e);
-      if (!this.d.ledger.recordLeaderTrade(e, move, this.book.toJSON())) {
-        this.stats.repeats++;
-        continue;
-      }
-      this.stats.leaderTrades++;
-      this.d.log.info("leader_trade", { leader: e.wallet, mint: e.mint, side: e.side, kind: move.kind, sol: sol(e.solRaw), venue: e.venue, signature: e.signature, via: e.via, complete: e.complete, fraction: move.fraction, tracked: move.tracked });
-      if (e.side === "buy") {
-        this.stats.buysSeen++;
-        if (this.d.cfg.mirror.copy === "opens" && move.kind !== "open") {
-          this.d.log.info("leader_buy_not_copied", { leader: e.wallet, mint: e.mint, why: "an add to a bag the leader already held (mirror.copy: opens)" });
-          continue;
-        }
-        const meta: LeaderBuy = { leader: e.wallet, label: this.leaders.get(e.wallet)?.label ?? null, signature: e.signature, slot: e.slot, blockTime: e.blockTime, venue: e.venue, kind: move.kind, leaderSolRaw: e.solRaw.toString(), leaderTokenRaw: e.tokenRaw.toString(), decimals: e.decimals };
-        out.push({ mint: e.mint, chain: "solana", seenAtMs: e.seenAtMs, source: "chain", reason: `${this.label(e.wallet)} ${move.kind} ${fmt(sol(e.solRaw))} SOL on ${e.venue}`, meta });
-      } else {
-        this.stats.sellsSeen++;
-        this.owe(ctx, e, move.kind, move.fraction ?? 1);
-      }
+      this.buffer.shift();
+      if (c) out.push(c);
+    }
+    this.owed(ctx);
+    // The restart point: what the source has read and handled for each leader, never past a queued transaction.
+    for (const w of this.leaders.keys()) {
+      const cp = this.d.source.checkpoint?.(w) ?? null;
+      if (cp) this.d.ledger.putCursor(w, cp.signature, cp.blockTime ?? null, this.now());
     }
     return out;
   }
 
-  /** A leader's sell: each of our positions in the coin it applies to owes the same share. */
-  private owe(ctx: TriggerContext, e: WalletEvent, kind: string, fraction: number): void {
-    const m = this.d.cfg.mirror;
-    if (!m.sells) return;
-    if (kind !== "close" && fraction < m.minSellFraction) {
-      this.d.log.info("leader_sell_not_mirrored", { leader: e.wallet, mint: e.mint, fraction, why: `below mirror.minSellFraction ${m.minSellFraction}` });
-      return;
+  /** Record one leader trade (once) and say whether it is a copy candidate. */
+  private take(e: WalletEvent): Candidate | null {
+    if (!this.leaders.has(e.wallet)) return null;
+    if (this.d.ledger.hasLeaderTrade(e.wallet, e.signature)) {
+      this.stats.repeats++;
+      return null;
     }
+    const move = this.book.apply(e);
+    if (!this.d.ledger.recordLeaderTrade(e, move, this.book.toJSON())) {
+      this.stats.repeats++;
+      return null;
+    }
+    this.stats.leaderTrades++;
+    this.d.log.info("leader_trade", { leader: e.wallet, mint: e.mint, side: e.side, kind: move.kind, sol: sol(e.solRaw), venue: e.venue, signature: e.signature, via: e.via, complete: e.complete, fraction: move.fraction, tracked: move.tracked });
+    if (e.side === "sell") {
+      this.stats.sellsSeen++;
+      return null;
+    }
+    this.stats.buysSeen++;
+    if (this.d.cfg.mirror.copy === "opens" && move.kind !== "open") {
+      this.d.log.info("leader_buy_not_copied", { leader: e.wallet, mint: e.mint, why: "an add to a bag the leader already held (mirror.copy: opens)" });
+      return null;
+    }
+    const meta: LeaderBuy = { leader: e.wallet, label: this.leaders.get(e.wallet)?.label ?? null, signature: e.signature, slot: e.slot, blockTime: e.blockTime, venue: e.venue, kind: move.kind, leaderSolRaw: e.solRaw.toString(), leaderTokenRaw: e.tokenRaw.toString(), decimals: e.decimals };
+    return { mint: e.mint, chain: "solana", seenAtMs: e.seenAtMs, source: "chain", reason: `${this.label(e.wallet)} ${move.kind} ${fmt(sol(e.solRaw))} SOL on ${e.venue}`, meta };
+  }
+
+  /**
+   * The sells our positions owe, from the leader trades recorded (not from the events as they come): every leader sell
+   * of the coin after the buy we copied (later slot), by the copied leader (or any listed leader with sellsFrom any),
+   * is owed once per position. So a sell that arrived before our position was booked (in the same batch, while the
+   * buy was being decided, or by a backfill) is owed as soon as the position exists. Owed sells of a position that
+   * closed or failed are finished.
+   */
+  private owed(ctx: TriggerContext): void {
+    const m = this.d.cfg.mirror;
+    const now = this.now();
+    for (const s of this.d.ledger.allPendingMirrorSells()) {
+      const p = this.d.ledger.position(s.position_id);
+      if (!p || p.status === "closed" || p.status === "failed") this.d.ledger.finishMirrorSell(s.id, "position closed", now);
+    }
+    if (!m.sells) return;
     for (const p of ctx.ledger.positions("opening", "open", "exit_stuck")) {
-      if (p.mint !== e.mint) continue;
       let entry: Partial<LeaderBuy> = {};
       try {
         entry = JSON.parse(p.launch_json) ?? {};
       } catch {
         /* a position without a leader context: not ours to mirror */
       }
-      if (!entry.leader) continue;
-      if (m.sellsFrom === "copied" && entry.leader !== e.wallet) continue;
-      // A sell older than the buy we copied (a backfill can deliver it late) is not about our position.
-      if (entry.leader === e.wallet && typeof entry.slot === "number" && e.slot < entry.slot) continue;
-      if (this.d.ledger.addMirrorSell({ positionId: p.id, leader: e.wallet, signature: e.signature, mint: e.mint, fraction: kind === "close" ? 1 : fraction, kind, now: this.now() })) {
-        this.stats.sellsOwed++;
-        this.d.log.info("mirror_sell_owed", { position: p.id, mint: e.mint, leader: e.wallet, kind, fraction: kind === "close" ? 1 : fraction, signature: e.signature });
+      if (!entry.leader || typeof entry.slot !== "number") continue;
+      const from = m.sellsFrom === "copied" ? [entry.leader] : [...this.leaders.keys()];
+      for (const t of this.d.ledger.leaderSellsAfter(p.mint, from, entry.slot)) {
+        const fraction = t.kind === "close" ? 1 : t.fraction ?? 1;
+        if (t.kind !== "close" && fraction < m.minSellFraction) continue;
+        if (this.d.ledger.addMirrorSell({ positionId: p.id, leader: t.leader, signature: t.signature, mint: p.mint, fraction, kind: t.kind, now })) {
+          this.stats.sellsOwed++;
+          this.d.log.info("mirror_sell_owed", { position: p.id, mint: p.mint, leader: t.leader, kind: t.kind, fraction, signature: t.signature });
+        }
       }
     }
   }
@@ -188,17 +224,10 @@ export class MirrorTrigger implements Trigger {
     const leaderSol = sol(b.leaderSolRaw);
     if (leaderSol < m.minLeaderSol) return skip(`leader bought ${fmt(leaderSol)} SOL < mirror.minLeaderSol ${m.minLeaderSol}`);
     if (this.d.ledger.copied(b.leader, c.mint)) return skip("this coin was copied from this leader before");
+    // The leader already sold out of it (a later trade recorded): nothing left to follow.
+    const h = this.book.holding(b.leader, c.mint);
+    if (h && h.heldRaw === 0n && h.lastSlot > b.slot) return skip("the leader already sold out of this coin");
     const l = this.leaders.get(b.leader)!;
-    const used = this.d.ledger.leaderUsage(b.leader, ctx.dry);
-    if (l.maxEntries !== undefined && used.entries >= l.maxEntries) return skip(`leader cap: ${used.entries} entries (maxEntries ${l.maxEntries})`);
-    // The ticket.
-    const cap = this.d.cfg.buy.sol;
-    let want: number;
-    if (m.ticket.mode === "fixed") want = l.sol ?? cap;
-    else want = Math.min(cap, leaderSol * (l.fraction ?? m.ticket.fraction));
-    if (l.maxSol !== undefined) want = Math.min(want, l.maxSol - sol(used.lamports));
-    if (!(want >= m.ticket.minSol)) return skip(l.maxSol !== undefined && l.maxSol - sol(used.lamports) < m.ticket.minSol ? `leader cap: ${fmt(sol(used.lamports))} SOL used (maxSol ${l.maxSol})` : `ticket ${fmt(want)} SOL < mirror.ticket.minSol ${m.ticket.minSol}`);
-    const lamports = lamportsOf(want);
     // A venue the bot can price: without one, its exits (and the mirrored sells) would be held.
     let mk: MarketRead | undefined;
     try {
@@ -207,6 +236,18 @@ export class MirrorTrigger implements Trigger {
       return { verdict: "wait", reason: `market read failed (${String((e as Error)?.message ?? e).slice(0, 80)})` };
     }
     if (!mk || mk.priceSol === null || mk.problem) return skip(`no venue the bot can price (${mk?.problem ?? (mk ? "no price" : "unread")}); its exits would be held`);
+    // From here to the reservation nothing awaits: decides run side by side (concurrency), and each must see the
+    // others' reserved tickets in its leader's caps.
+    const used = this.usage(b.leader, ctx.dry);
+    if (l.maxEntries !== undefined && used.entries >= l.maxEntries) return skip(`leader cap: ${used.entries} entries (maxEntries ${l.maxEntries})`);
+    const cap = this.d.cfg.buy.sol;
+    let want: number;
+    if (m.ticket.mode === "fixed") want = l.sol ?? cap;
+    else want = Math.min(cap, leaderSol * (l.fraction ?? m.ticket.fraction));
+    if (l.maxSol !== undefined) want = Math.min(want, l.maxSol - sol(used.lamports));
+    if (!(want >= m.ticket.minSol)) return skip(l.maxSol !== undefined && l.maxSol - sol(used.lamports) < m.ticket.minSol ? `leader cap: ${fmt(sol(used.lamports))} SOL used (maxSol ${l.maxSol})` : `ticket ${fmt(want)} SOL < mirror.ticket.minSol ${m.ticket.minSol}`);
+    const lamports = lamportsOf(want);
+    this.reserved.set(c.mint, { leader: b.leader, lamports });
     // The leader's own price as the trigger's expected fill (the engine keeps the smaller of this and its own read).
     const expectedOutRaw = BigInt(b.leaderSolRaw) > 0n ? (BigInt(b.leaderTokenRaw) * lamports) / BigInt(b.leaderSolRaw) : null;
     return {
@@ -221,9 +262,28 @@ export class MirrorTrigger implements Trigger {
     };
   }
 
+  /** A leader's usage: the ledger's, plus buys decided and not yet booked (dropped once the ledger has the coin). */
+  private usage(leader: string, dry: boolean): { entries: number; lamports: bigint } {
+    const u = this.d.ledger.leaderUsage(leader, dry);
+    let entries = u.entries;
+    let lamports = u.lamports;
+    for (const [mint, r] of this.reserved) {
+      if (this.d.ledger.positionsByStatus("opening", "open", "exit_stuck", "closed", "failed").some((p) => p.mint === mint && (p.dry === 1) === dry)) {
+        this.reserved.delete(mint);
+        continue;
+      }
+      if (r.leader !== leader) continue;
+      entries++;
+      lamports += r.lamports;
+    }
+    return { entries, lamports };
+  }
+
   onVerdict(c: Candidate, v: Verdict, ctx: TriggerContext): void {
     const b = c.meta as LeaderBuy;
     if (!b) return;
+    // Not bought (a skip here includes a buy the engine's caps refused): its reservation goes.
+    if (v.verdict !== "buy") this.reserved.delete(c.mint);
     if (v.verdict === "wait") return;
     this.d.ledger.recordCopy(b.leader, c.mint, b.signature, v.verdict, v.reason, ctx.now());
     this.d.log.info(v.verdict === "buy" ? "copy_buy" : "copy_skip", { leader: b.leader, mint: c.mint, signature: b.signature, reason: v.reason });
@@ -245,6 +305,8 @@ export class MirrorTrigger implements Trigger {
  * reason names it has filled, or the position is closed; one that failed is asked for again (on the engine's backoff).
  * Several owed at once are sold together: the remaining share is the product of what each leaves.
  */
+// The position is found by coin: the core allows one entry per coin (buy.maxPerCoin is 1). Raising that cap would
+// need the position id in the strategy's view.
 export class MirrorExit implements ExitStrategy {
   readonly name: string;
   readonly trailMark: boolean;

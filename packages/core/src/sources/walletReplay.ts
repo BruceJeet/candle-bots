@@ -111,6 +111,10 @@ export class ReplayWallets implements WalletFeed {
   head(wallet: string): Anchor | null {
     return this.heads.get(wallet) ?? null;
   }
+  /** A recording has no queue: everything released is handled. */
+  checkpoint(wallet: string): Anchor | null {
+    return this.heads.get(wallet) ?? null;
+  }
   openGaps(): Array<{ wallet: string; fromMs: number; reason: string }> {
     return [];
   }

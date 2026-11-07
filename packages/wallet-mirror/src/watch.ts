@@ -47,6 +47,11 @@ export class LeaderWatcher implements Watcher {
     await this.start();
     for (const g of this.d.source.drainGaps()) this.gap(g);
     for (const e of this.d.source.drain()) this.trade(e);
+    // The restart point: what the source has read and handled (never past a queued transaction).
+    for (const l of this.d.cfg.leaders) {
+      const cp = this.d.source.checkpoint?.(l.address);
+      if (cp) this.d.ledger.db.prepare("insert into watch_cursor (leader, signature, block_time, slot, updated_at) values (?, ?, ?, 0, ?) on conflict(leader) do update set signature = excluded.signature, block_time = excluded.block_time, updated_at = excluded.updated_at").run(l.address, cp.signature, cp.blockTime ?? null, (this.d.now ?? Date.now)());
+    }
   }
 
   /** One leader trade: book it, alert it (by config.notify), move the cursor. */
@@ -55,7 +60,6 @@ export class LeaderWatcher implements Watcher {
     const move = this.book.apply(e);
     if (move.repeat) return;
     this.stats.trades++;
-    this.d.ledger.db.prepare("insert into watch_cursor (leader, signature, block_time, slot, updated_at) values (?, ?, ?, ?, ?) on conflict(leader) do update set signature = excluded.signature, block_time = excluded.block_time, slot = excluded.slot, updated_at = excluded.updated_at where excluded.slot >= watch_cursor.slot").run(e.wallet, e.signature, e.blockTime, e.slot, (this.d.now ?? Date.now)());
     const who = this.labels.get(e.wallet) ?? e.wallet;
     const link = n.link ? ` ${n.link.replace("{mint}", e.mint)}` : "";
     const ago = e.blockTime !== null ? ` ${Math.max(0, Math.round(((this.d.now ?? Date.now)() - e.blockTime * 1000) / 1000))} s ago` : "";

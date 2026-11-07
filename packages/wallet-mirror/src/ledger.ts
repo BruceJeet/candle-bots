@@ -93,19 +93,15 @@ export class Ledger extends CoreLedger {
         .run(e.wallet, e.signature, e.mint, e.side, e.solRaw.toString(), e.tokenRaw.toString(), e.venue, e.slot, e.blockTime, e.seenAtMs, e.via, e.complete ? 1 : 0, move.kind, move.fraction, move.heldBeforeRaw.toString(), move.heldAfterRaw.toString(), move.tracked ? 1 : 0);
       added = Number(r.changes) > 0;
       if (!added) return;
-      this.setCursor(e.wallet, e.signature, e.blockTime, e.seenAtMs, e.slot);
       this.db.prepare("insert into mirror_kv (k, v) values ('leader_book', ?) on conflict(k) do update set v = excluded.v").run(JSON.stringify(book));
     });
     return added;
   }
 
-  /** Move a leader's cursor forward (a newer slot only). */
-  setCursor(leader: string, signature: string, blockTime: number | null, now: number, slot = 0): void {
-    const cur = this.db.prepare("select signature, block_time from mirror_cursor where leader = ?").get(leader) as { signature: string; block_time: number | null } | undefined;
-    if (cur) {
-      const at = this.db.prepare("select slot from leader_trades where leader = ? and signature = ?").get(leader, cur.signature) as { slot: number } | undefined;
-      if (at && slot < at.slot) return;
-    }
+  /** Set a leader's restart point (the source's checkpoint: everything up to it read and handled). */
+  putCursor(leader: string, signature: string, blockTime: number | null, now: number): void {
+    const cur = this.db.prepare("select signature from mirror_cursor where leader = ?").get(leader) as { signature: string } | undefined;
+    if (cur?.signature === signature) return;
     this.db.prepare("insert into mirror_cursor (leader, signature, block_time, updated_at) values (?, ?, ?, ?) on conflict(leader) do update set signature = excluded.signature, block_time = excluded.block_time, updated_at = excluded.updated_at").run(leader, signature, blockTime, now);
   }
 
@@ -118,6 +114,14 @@ export class Ledger extends CoreLedger {
   leaderBook(): unknown {
     const r = this.db.prepare("select v from mirror_kv where k = 'leader_book'").get() as { v: string } | undefined;
     return r ? JSON.parse(r.v) : null;
+  }
+
+  /** Leader sells of a coin after a slot, by any of `leaders`, oldest first. */
+  leaderSellsAfter(mint: string, leaders: string[], slot: number): LeaderTradeRow[] {
+    if (!leaders.length) return [];
+    return this.db
+      .prepare(`select * from leader_trades where mint = ? and side = 'sell' and slot > ? and leader in (${leaders.map(() => "?").join(",")}) order by slot, seen_at`)
+      .all(mint, slot, ...leaders) as unknown as LeaderTradeRow[];
   }
 
   copied(leader: string, mint: string): boolean {
