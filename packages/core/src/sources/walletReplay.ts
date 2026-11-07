@@ -11,7 +11,7 @@
  */
 import { appendFileSync } from "node:fs";
 import { decodeWalletTrade } from "../market/walletTrade.ts";
-import type { Anchor, RecordedTx, WalletEvent, WalletFeed, WalletGap, WalletMove, WalletSkip } from "./wallets.ts";
+import type { Anchor, RecordedTx, WalletEvent, WalletFeed, WalletGap, WalletMove, WalletOrder, WalletSkip } from "./wallets.ts";
 
 /** A recorder that appends one JSON line per fetched transaction to `path`. */
 export function walletRecorder(path: string): (r: RecordedTx) => void {
@@ -40,7 +40,7 @@ export function replayWallets(text: string | RecordedTx[]): { events: WalletEven
     if (seen.has(k)) continue;
     seen.add(k);
     const d = decodeWalletTrade(r.tx, r.wallet, r.signature);
-    if (d.ok) events.push({ ...d.trade, complete: true, seenAtMs: r.at, via: "replay" });
+    if (d.ok) events.push({ ...d.trade, complete: true, seenAtMs: r.at, via: "replay", slotPos: r.slotPos ?? null, slotPosFrom: r.slotPosFrom ?? null });
     else skipped.push({ wallet: r.wallet, signature: r.signature, reason: d.reason });
   }
   return { events, skipped };
@@ -54,6 +54,7 @@ export class ReplayWallets implements WalletFeed {
   private out: WalletEvent[] = [];
   private gaps: WalletGap[] = [];
   private moves: WalletMove[] = [];
+  private orders: WalletOrder[] = [];
   private follow = new Set<string>();
   private heads = new Map<string, Anchor>();
   onNew: (() => void) | null = null;
@@ -92,8 +93,9 @@ export class ReplayWallets implements WalletFeed {
     if (n) this.onNew?.();
   }
   /** Add an event, a gap or a move by hand (tests). */
-  push(e: WalletEvent | WalletGap | WalletMove): void {
+  push(e: WalletEvent | WalletGap | WalletMove | WalletOrder): void {
     if ("beforeRaw" in e) this.moves.push(e);
+    else if ("signatures" in e) this.orders.push(e);
     else if ("signature" in e) {
       this.out.push(e);
       this.heads.set(e.wallet, { signature: e.signature, blockTime: e.blockTime });
@@ -109,6 +111,11 @@ export class ReplayWallets implements WalletFeed {
     const g = this.gaps;
     this.gaps = [];
     return g;
+  }
+  drainOrders(): WalletOrder[] {
+    const o = this.orders;
+    this.orders = [];
+    return o;
   }
   drainMoves(): WalletMove[] {
     const m = this.moves;

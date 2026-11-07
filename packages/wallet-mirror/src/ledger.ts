@@ -21,7 +21,7 @@ create table if not exists leader_trades (
   leader text not null, signature text not null, mint text not null, side text not null, sol_raw text not null,
   token_raw text not null, venue text not null, slot integer not null, block_time integer, seen_at integer not null,
   via text not null, complete integer not null, kind text not null, fraction real, held_before text not null,
-  held_after text not null, tracked integer not null, primary key (leader, signature)
+  held_after text not null, tracked integer not null, slot_pos integer, slot_pos_from text, primary key (leader, signature)
 );
 create table if not exists mirror_copies (
   leader text not null, mint text not null, signature text not null, decided_at integer not null, decision text not null,
@@ -56,6 +56,9 @@ export interface LeaderTradeRow {
   held_before: string;
   held_after: string;
   tracked: number;
+  /** Place among the leader's transactions in its slot, and whose order: "rpc" (the chain's) or "arrival". */
+  slot_pos: number | null;
+  slot_pos_from: string | null;
 }
 
 export interface MirrorSellRow {
@@ -75,6 +78,24 @@ export class Ledger extends CoreLedger {
   constructor(path: string) {
     super(path);
     this.db.exec(TABLES);
+    // A ledger made before the slot positions (an earlier build of this version): add the columns.
+    const cols = new Set((this.db.prepare("pragma table_info(leader_trades)").all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has("slot_pos")) this.db.exec("alter table leader_trades add column slot_pos integer; alter table leader_trades add column slot_pos_from text;");
+  }
+
+  /** The chain's order of a leader's transactions in a slot (oldest first): the recorded trades take those places. */
+  applyOrder(leader: string, slot: number, signatures: string[]): number {
+    let n = 0;
+    this.tx(() => {
+      const st = this.db.prepare("update leader_trades set slot_pos = ?, slot_pos_from = 'rpc' where leader = ? and signature = ? and slot = ?");
+      signatures.forEach((sig, i) => (n += Number(st.run(i, leader, sig, slot).changes)));
+    });
+    return n;
+  }
+
+  /** The leader's last recorded trade of a coin before a slot (its after-balance starts the slot's chain). */
+  leaderTradeBefore(leader: string, mint: string, slot: number): LeaderTradeRow | undefined {
+    return this.db.prepare("select * from leader_trades where leader = ? and mint = ? and slot < ? order by slot desc, coalesce(slot_pos, 0) desc limit 1").get(leader, mint, slot) as LeaderTradeRow | undefined;
   }
 
   hasLeaderTrade(leader: string, signature: string): boolean {
@@ -87,10 +108,10 @@ export class Ledger extends CoreLedger {
     this.tx(() => {
       const r = this.db
         .prepare(
-          `insert or ignore into leader_trades (leader, signature, mint, side, sol_raw, token_raw, venue, slot, block_time, seen_at, via, complete, kind, fraction, held_before, held_after, tracked)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `insert or ignore into leader_trades (leader, signature, mint, side, sol_raw, token_raw, venue, slot, block_time, seen_at, via, complete, kind, fraction, held_before, held_after, tracked, slot_pos, slot_pos_from)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(e.wallet, e.signature, e.mint, e.side, e.solRaw.toString(), e.tokenRaw.toString(), e.venue, e.slot, e.blockTime, e.seenAtMs, e.via, e.complete ? 1 : 0, move.kind, move.fraction, move.heldBeforeRaw.toString(), move.heldAfterRaw.toString(), move.tracked ? 1 : 0);
+        .run(e.wallet, e.signature, e.mint, e.side, e.solRaw.toString(), e.tokenRaw.toString(), e.venue, e.slot, e.blockTime, e.seenAtMs, e.via, e.complete ? 1 : 0, move.kind, move.fraction, move.heldBeforeRaw.toString(), move.heldAfterRaw.toString(), move.tracked ? 1 : 0, e.slotPos ?? null, e.slotPosFrom ?? null);
       added = Number(r.changes) > 0;
       if (!added) return;
       this.db.prepare("insert into mirror_kv (k, v) values ('leader_book', ?) on conflict(k) do update set v = excluded.v").run(JSON.stringify(book));
@@ -116,24 +137,9 @@ export class Ledger extends CoreLedger {
     return r ? JSON.parse(r.v) : null;
   }
 
-  /**
-   * Leader sells of a coin after a copied buy, by any of `leaders`, in chain order. After = a later slot, or the same
-   * slot: for the copied leader only a sell whose before-balance is at least the buy's after-balance (it holds the
-   * bought tokens, so it came after); another leader's same-slot sell counts. The buy's own signature never does.
-   * Within a slot, sells are ordered by the leader's before-balance, highest first (each sell lowers it).
-   */
-  leaderSellsAfter(mint: string, leaders: string[], buy: { leader: string; slot: number; signature: string; heldAfterRaw: bigint }): LeaderTradeRow[] {
-    if (!leaders.length) return [];
-    const rows = this.db
-      .prepare(`select * from leader_trades where mint = ? and side = 'sell' and slot >= ? and signature != ? and leader in (${leaders.map(() => "?").join(",")})`)
-      .all(mint, buy.slot, buy.signature, ...leaders) as unknown as LeaderTradeRow[];
-    return rows
-      .filter((r) => r.slot > buy.slot || r.leader !== buy.leader || BigInt(r.held_before) >= buy.heldAfterRaw)
-      .sort((a, b) => a.slot - b.slot || (BigInt(b.held_before) > BigInt(a.held_before) ? 1 : BigInt(b.held_before) < BigInt(a.held_before) ? -1 : a.seen_at - b.seen_at));
-  }
-
-  /** The leader's trades of a coin from a slot on (both sides), for its holding since a buy. */
-  leaderTradesFrom(leader: string, mint: string, slot: number): LeaderTradeRow[] {
+  /** A leader's trades of a coin from a slot on (both sides; any leader with null), by slot (order inside a slot: order.ts). */
+  leaderTradesFrom(leader: string | null, mint: string, slot: number): LeaderTradeRow[] {
+    if (leader === null) return this.db.prepare("select * from leader_trades where mint = ? and slot >= ? order by slot, seen_at").all(mint, slot) as unknown as LeaderTradeRow[];
     return this.db.prepare("select * from leader_trades where leader = ? and mint = ? and slot >= ? order by slot, seen_at").all(leader, mint, slot) as unknown as LeaderTradeRow[];
   }
 

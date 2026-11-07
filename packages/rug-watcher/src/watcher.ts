@@ -169,6 +169,8 @@ export function assemble(d: { cfg: Config; ledger: Ledger; rpc: Ctx["rpc"]; log:
     if (!wallets) return;
     try {
       const creators = watch.creatorsWatched();
+      // Unread this cycle: no subscription changes, and the events wait for a cycle that can match them.
+      if (!creators) return;
       const add = [...creators.keys()].filter((w) => !wallets.watched().includes(w));
       if (add.length) wallets.subscribe(add);
       // Creators of coins no longer watched (released, sold, closed) are let go.

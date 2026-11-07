@@ -25,7 +25,8 @@ import type { Rpc } from "candle-bot-core/solana/rpc";
 import { LeaderBook } from "candle-bot-core/sources/walletPositions";
 import type { WalletEvent, WalletFeed, WalletGap, WalletMove } from "candle-bot-core/sources/wallets";
 import type { Config, Leader } from "./config.ts";
-import type { Ledger, PositionRow } from "./ledger.ts";
+import { sequence } from "./order.ts";
+import type { Ledger, LeaderTradeRow as LedgerTrade, PositionRow } from "./ledger.ts";
 
 type Ctx = CoreCtx<Config>;
 
@@ -124,6 +125,8 @@ export class MirrorTrigger implements Trigger {
       this.buffer.shift();
       if (c) out.push(c);
     }
+    // The chain's order of slots where a leader had several transactions (from signature lists).
+    for (const o of this.d.source.drainOrders?.() ?? []) if (this.leaders.has(o.wallet)) this.d.ledger.applyOrder(o.wallet, o.slot, o.signatures);
     this.owed(ctx);
     // The restart point: what the source has read and handled for each leader, never past a queued transaction, and
     // not for a leader with events still waiting here (a failed write): a restart then reads them again.
@@ -186,13 +189,16 @@ export class MirrorTrigger implements Trigger {
         /* a position without a leader context: not ours to mirror */
       }
       if (!entry.leader || typeof entry.slot !== "number") continue;
-      const from = m.sellsFrom === "copied" ? [entry.leader] : [...this.leaders.keys()];
-      const buy = { leader: entry.leader, slot: entry.slot, signature: entry.signature ?? "", heldAfterRaw: BigInt(entry.leaderHeldAfterRaw ?? "0") };
+      // The copied leader's trades after our buy, in order (inside a slot too: see order.ts); with sellsFrom any, the
+      // other leaders' sells from the buy's slot on (their order against ours cannot be known inside a slot: counted).
+      const after = this.after(entry.leader, p.mint, entry.slot, entry.signature ?? "");
+      if (after === null) continue;
+      const others = m.sellsFrom === "any" ? this.d.ledger.leaderTradesFrom(null, p.mint, entry.slot).filter((t) => t.leader !== entry.leader && this.leaders.has(t.leader)) : [];
+      const rows = [...after, ...others].filter((t) => t.side === "sell").sort((a, b) => a.slot - b.slot);
       // Small sells (under minSellFraction) add up: once what they leave together falls to 1 - minSellFraction, they
       // are owed together (and compound in the exit). Recomputed from the ledger each poll: the same trades give the
       // same groups, and a row already owed is not owed again.
       let small: Array<{ t: (typeof rows)[number]; f: number }> = [];
-      const rows = this.d.ledger.leaderSellsAfter(p.mint, from, buy);
       const oweOne = (t: (typeof rows)[number], fraction: number) => {
         if (this.d.ledger.addMirrorSell({ positionId: p.id, leader: t.leader, signature: t.signature, mint: p.mint, fraction, kind: t.kind, now })) {
           this.stats.sellsOwed++;
@@ -272,9 +278,9 @@ export class MirrorTrigger implements Trigger {
     if (this.d.ledger.copied(b.leader, c.mint)) return skip("this coin was copied from this leader before");
     // What the leader did with this bag since the buy (recorded trades after it, in chain order: same-slot ones by the
     // leader's balances). Sold out: nothing left to follow. Sold below minLeaderHeldFraction of its peak: not copied.
-    const after = this.d.ledger.leaderTradesFrom(b.leader, c.mint, b.slot).filter((t) => t.signature !== b.signature && (t.slot > b.slot || BigInt(t.held_before) >= BigInt(b.leaderHeldAfterRaw ?? "0")));
+    const after = this.after(b.leader, c.mint, b.slot, b.signature);
+    if (after === null) return skip(`the order of the leader's trades in this coin around slot ${b.slot} is not known`);
     if (after.length) {
-      after.sort((x, y) => x.slot - y.slot || (BigInt(y.held_before) > BigInt(x.held_before) ? 1 : BigInt(y.held_before) < BigInt(x.held_before) ? -1 : 0));
       const now = BigInt(after[after.length - 1].held_after);
       if (now === 0n) return skip("the leader already sold out of this coin");
       let peak = BigInt(b.leaderHeldAfterRaw ?? "0");
@@ -318,6 +324,25 @@ export class MirrorTrigger implements Trigger {
       context: { ...b, leaderAgeMsAtDecision: ageMs },
       log: { leader: b.leader, leaderSignature: b.signature, leaderSol, venue: b.venue, ageMs },
     };
+  }
+
+  /**
+   * The leader's trades of a coin after one of its trades (by signature), in order (order.ts). Null when the order
+   * around it cannot be known (alerted once per slot), or when the trade is not recorded.
+   */
+  private after(leader: string, mint: string, slot: number, signature: string): LedgerTrade[] | null {
+    const rows = this.d.ledger.leaderTradesFrom(leader, mint, slot);
+    const prior = this.d.ledger.leaderTradeBefore(leader, mint, slot);
+    const seq = sequence(rows, prior ? BigInt(prior.held_after) : null);
+    const at = seq.rows.findIndex((r) => r.signature === signature);
+    if (at < 0) {
+      if (seq.unknownSlot !== null) {
+        this.d.alerter.raise(`leader:${leader}:${mint}:order:${seq.unknownSlot}`, `leader ${this.label(leader)}: the order of its trades of ${mint} in slot ${seq.unknownSlot} is not known (their balances fit more than one order); no sell is owed and no copy made from them`);
+      }
+      return null;
+    }
+    if (seq.unknownSlot !== null) this.d.alerter.raise(`leader:${leader}:${mint}:order:${seq.unknownSlot}`, `leader ${this.label(leader)}: the order of its trades of ${mint} in slot ${seq.unknownSlot} is not known (their balances fit more than one order); sells from that slot on are not owed`);
+    return seq.rows.slice(at + 1);
   }
 
   /** Our price over the leader's, bps (null when neither a quote nor a spot price can say). */

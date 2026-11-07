@@ -25,8 +25,9 @@ Built by [Bruce Jeet](https://github.com/BruceJeet).
   the leader's own fill (its SOL over its tokens; that SOL is all-in: venue fees, tips and platform fees it paid).
 - **What it sells:** when a leader sells, each of your positions copied from that leader sells the same share of what
   the leader held before that sell (a leader that sells out: you sell out). The share comes from the leader's own
-  balance in that transaction. Sells in the same slot as the copied buy count when the leader's balance shows they
-  came after it. Small sells under `minSellFraction` add up and are mirrored together once they pass it. Your `exit`
+  balance in that transaction. Inside one slot the order of the leader's trades comes from the chain's signature list,
+  else from the trades' own balances (each one's before-balance is the previous one's after-balance), else from the
+  order they arrived in; when none of these settles it, nothing is owed for that slot and you get an alert. Small sells under `minSellFraction` add up and are mirrored together once they pass it. Your `exit`
   strategy (take profit, stop loss, time, ladder, trail...) runs as well.
 - **Transfers:** a leader moving a coin you hold from it out of its wallet without a trade is alerted (it may sell
   from another wallet). Nothing is sold for it. To see these, the bot also reads the leaders' token transfers.
@@ -118,6 +119,7 @@ The core's sections (`mode`, `payer`, `apiKeyEnv`, `rpcUrlEnv`, `wallet`, `signe
 | `source.reconcileSec` | with a websocket, a poll of each leader this often as a safety net (default 300; 0 off) |
 | `source.poll` / `pollSec` | no websocket: poll each leader every `pollSec` |
 | `source.record` | append every transaction read to this file (JSON lines), for `replay` |
+| `source.transfers` | `run` only: also read the leaders' token transfers, to alert when one moves a coin you hold out of its wallet without a trade (default true; more reads, fetched after trades) |
 
 ### Watch-only config
 

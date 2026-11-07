@@ -66,6 +66,11 @@ export interface Source {
   backfillLimit: number;
   /** Append every fetched transaction to this file (JSON lines), for `replay`. */
   record?: string;
+  /**
+   * Also read the leaders' token transfers, to alert when one moves a coin you hold out of its wallet without a trade
+   * (run mode; default true). More reads: every transfer to or from a leader is fetched (after its trades).
+   */
+  transfers: boolean;
 }
 
 export interface Notify {
@@ -153,7 +158,7 @@ function parseSource(raw: unknown): Source {
   const w = "config.source";
   const s = raw === undefined ? {} : raw;
   if (!isObj(s)) throw new ConfigError(`${w}: must be an object`);
-  only(s, ["rpcUrlEnv", "wsUrlEnv", "poll", "fetchPerSec", "fetchBurst", "pollSec", "reconcileSec", "backfillLimit", "record"], w);
+  only(s, ["rpcUrlEnv", "wsUrlEnv", "poll", "fetchPerSec", "fetchBurst", "pollSec", "reconcileSec", "backfillLimit", "record", "transfers"], w);
   return {
     ...(s.rpcUrlEnv !== undefined ? { rpcUrlEnv: str(s, "rpcUrlEnv", w, { re: ENV_NAME }) } : {}),
     ...(s.wsUrlEnv !== undefined ? { wsUrlEnv: str(s, "wsUrlEnv", w, { re: ENV_NAME }) } : {}),
@@ -163,6 +168,7 @@ function parseSource(raw: unknown): Source {
     pollSec: num(s, "pollSec", w, { min: 1, max: 3600, def: 15 }),
     reconcileSec: num(s, "reconcileSec", w, { min: 0, max: 86_400, def: 300 }),
     backfillLimit: num(s, "backfillLimit", w, { min: 1, max: 10_000, int: true, def: 300 }),
+    transfers: bool(s, "transfers", w, true),
     ...(s.record !== undefined ? { record: str(s, "record", w) } : {}),
   } as Source;
 }

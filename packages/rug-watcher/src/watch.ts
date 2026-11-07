@@ -503,14 +503,14 @@ export class RugWatch {
     return this.d.ledger.db.prepare("select creator, source from rug_creators where mint = ?").get(mint) as any;
   }
 
-  /** (opt-in walletSource) Each known creator of a watched coin (from config or chain), with its coins. */
-  creatorsWatched(): Map<string, string[]> {
+  /** (opt-in walletSource) Each known creator of a watched coin (from config or chain), with its coins; null when unread. */
+  creatorsWatched(): Map<string, string[]> | null {
     const out = new Map<string, string[]>();
     let open: PositionRow[];
     try {
       open = this.d.managed();
     } catch {
-      return out;
+      return null;
     }
     const ours = new Set([this.d.cfg.wallet, ...(this.d.cfg.rules.devDump?.ourWallets ?? [])]);
     for (const p of open) {

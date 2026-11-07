@@ -39,6 +39,20 @@ export interface WalletEvent extends WalletTrade {
   /** When the source decoded it (ms). */
   seenAtMs: number;
   via: "logs" | "backfill" | "poll" | "replay";
+  /**
+   * Where this transaction stands among the wallet's transactions in its slot (0 first), and how that is known: "rpc"
+   * (getSignaturesForAddress's order, the chain's) or "arrival" (the order notifications came in). Null: not known.
+   * Positions of the two kinds are not comparable; a later `drainOrders` gives the chain's order for a slot.
+   */
+  slotPos?: number | null;
+  slotPosFrom?: "rpc" | "arrival" | null;
+}
+
+/** The chain's order of a wallet's transactions in one slot (oldest first), from a signature list. */
+export interface WalletOrder {
+  wallet: string;
+  slot: number;
+  signatures: string[];
 }
 
 export interface WalletGap {
@@ -81,6 +95,9 @@ export interface RecordedTx {
   signature: string;
   via: WalletEvent["via"];
   tx: unknown;
+  /** The transaction's place in its slot as the source knew it (WalletEvent.slotPos / slotPosFrom). */
+  slotPos?: number | null;
+  slotPosFrom?: "rpc" | "arrival" | null;
 }
 
 export interface Anchor {
@@ -146,6 +163,8 @@ interface WalletState {
   pending: number;
   /** The verified point at a moment no job of the wallet was queued: everything up to it was handled (restart point). */
   checkpoint: Anchor | null;
+  /** Notifications seen per slot (their arrival order inside the slot); recent slots only. */
+  arrival: Map<number, number>;
 }
 
 interface Gap {
@@ -164,6 +183,9 @@ interface Job {
   via: WalletEvent["via"];
   tries: number;
   notBefore: number;
+  /** Fetch order: 0 a notification that invokes a venue, 1 a transfer-only notification, 2 a backfill or poll. */
+  prio: number;
+  pos: { n: number; from: "rpc" | "arrival" } | null;
 }
 
 const isRateLimit = (e: unknown) => {
@@ -180,6 +202,8 @@ export interface WalletFeed {
   drainGaps(): WalletGap[];
   /** (opt-in) Token balances that fell without a trade. */
   drainMoves?(): WalletMove[];
+  /** The chain's order of slots where the wallet had several transactions, as signature lists show it. */
+  drainOrders?(): WalletOrder[];
   /** Stop following these wallets. */
   unsubscribe?(wallets: string[]): void;
   onNew: (() => void) | null;
@@ -205,6 +229,7 @@ export class WalletSource implements WalletFeed {
   private events: WalletEvent[] = [];
   private gapsOut: WalletGap[] = [];
   private movesOut: WalletMove[] = [];
+  private ordersOut: WalletOrder[] = [];
   private socket: MultiLogsSocket | null = null;
   private running = false;
   private stopped = false;
@@ -239,7 +264,7 @@ export class WalletSource implements WalletFeed {
     for (const w of wallets) {
       if (this.wallets.has(w)) continue;
       const since = this.o.since?.[w];
-      this.wallets.set(w, { head: since ? { ...since, slot: 0 } : null, dirty: false, gap: null, nextGap: null, reading: false, polledAt: 0, okAt: this.now(), verified: since ?? null, pending: 0, checkpoint: since ?? null });
+      this.wallets.set(w, { head: since ? { ...since, slot: 0 } : null, dirty: false, gap: null, nextGap: null, reading: false, polledAt: 0, okAt: this.now(), verified: since ?? null, pending: 0, checkpoint: since ?? null, arrival: new Map() });
       added = true;
     }
     if (added && this.running) this.attach();
@@ -285,6 +310,12 @@ export class WalletSource implements WalletFeed {
     const g = this.gapsOut;
     this.gapsOut = [];
     return g;
+  }
+
+  drainOrders(): WalletOrder[] {
+    const o = this.ordersOut;
+    this.ordersOut = [];
+    return o;
   }
 
   drainMoves(): WalletMove[] {
@@ -383,7 +414,10 @@ export class WalletSource implements WalletFeed {
       return;
     }
     // Arriving while a gap is open: the backfill will read back to the gap's anchor; this one is queued now.
-    this.enqueue(wallet, signature, "logs", slot);
+    const n = s.arrival.get(slot) ?? 0;
+    s.arrival.set(slot, n + 1);
+    if (s.arrival.size > 2000) s.arrival.delete(s.arrival.keys().next().value!);
+    this.enqueue(wallet, signature, "logs", slot, null, { n, from: "arrival" }, logsInvokeVenue(logs) ? 0 : 1);
   }
 
   private openGap(wallet: string, reason: string, at: number): void {
@@ -488,7 +522,17 @@ export class WalletSource implements WalletFeed {
       return { ok: true, newest: n ? { signature: n.signature, blockTime: n.blockTime } : null };
     }
     const newest = found[0] ? { signature: found[0].signature, blockTime: found[0].blockTime } : null;
-    for (const x of found.reverse()) {
+    // The list is the chain's order (newest first): each signature's place in its slot, and the order of any slot
+    // with several of the wallet's transactions (a consumer reconciles what it ordered by arrival).
+    found.reverse();
+    const bySlot = new Map<number, string[]>();
+    for (const x of found) {
+      const l = bySlot.get(x.slot) ?? [];
+      l.push(x.signature);
+      bySlot.set(x.slot, l);
+    }
+    for (const [slot, sigs] of bySlot) if (sigs.length > 1) this.ordersOut.push({ wallet, slot, signatures: sigs });
+    for (const x of found) {
       if (this.seen.has(key(wallet, x.signature))) continue;
       if (x.err !== null) {
         this.markSeen(key(wallet, x.signature));
@@ -499,7 +543,7 @@ export class WalletSource implements WalletFeed {
         this.stats.missedByLogs++;
         this.o.log.warn("wallet_logs_missed", { wallet, signature: x.signature });
       }
-      this.enqueue(wallet, x.signature, via, x.slot, x.blockTime);
+      this.enqueue(wallet, x.signature, via, x.slot, x.blockTime, { n: bySlot.get(x.slot)!.indexOf(x.signature), from: "rpc" }, 2);
     }
     return reached ? { ok: true, newest } : { ok: false, why: `more than ${this.o.backfillLimit} signatures since the last one read`, retry: false, newest };
   }
@@ -584,12 +628,12 @@ export class WalletSource implements WalletFeed {
     if (!s.head || a.slot >= s.head.slot) s.head = { signature: a.signature, slot: a.slot, blockTime: a.blockTime ?? s.head?.blockTime ?? null };
   }
 
-  private enqueue(wallet: string, signature: string, via: WalletEvent["via"], slot: number, blockTime: number | null = null): void {
+  private enqueue(wallet: string, signature: string, via: WalletEvent["via"], slot: number, blockTime: number | null = null, pos: Job["pos"] = null, prio = 2): void {
     const s = this.state(wallet);
     if (!s || this.seen.has(key(wallet, signature))) return;
     this.markSeen(key(wallet, signature));
     this.advance(s, { signature, slot, blockTime });
-    this.queue.push({ wallet, signature, via, tries: 0, notBefore: 0 });
+    this.queue.push({ wallet, signature, via, tries: 0, notBefore: 0, prio, pos });
     s.pending++;
     this.wakeQueue?.();
   }
@@ -631,9 +675,13 @@ export class WalletSource implements WalletFeed {
   private async fetchLoop(): Promise<void> {
     while (!this.stopped) {
       const t = this.now();
-      // Live notifications first: a long backfill must not age a fresh trade past a consumer's limit.
-      let i = this.queue.findIndex((j) => j.notBefore <= t && j.via === "logs");
-      if (i < 0) i = this.queue.findIndex((j) => j.notBefore <= t);
+      // Live notifications that invoke a venue first, then transfer-only ones, then backfills: a long backfill must not
+      // age a fresh trade past a consumer's limit. FIFO within a level.
+      let i = -1;
+      for (let k = 0; k < this.queue.length; k++) {
+        const j = this.queue[k];
+        if (j.notBefore <= t && (i < 0 || j.prio < this.queue[i].prio)) i = k;
+      }
       if (i < 0) {
         const next = this.queue.length ? Math.max(10, Math.min(...this.queue.map((j) => j.notBefore)) - t) : 1000;
         await new Promise<void>((r) => {
@@ -669,13 +717,13 @@ export class WalletSource implements WalletFeed {
     this.stats.fetched++;
     if (this.o.record) {
       try {
-        this.o.record({ at: this.now(), wallet: job.wallet, signature: job.signature, via: job.via, tx });
+        this.o.record({ at: this.now(), wallet: job.wallet, signature: job.signature, via: job.via, tx, slotPos: job.pos?.n ?? null, slotPosFrom: job.pos?.from ?? null });
       } catch (e) {
         this.o.log.warn("wallets_record_failed", { error: String((e as Error)?.message ?? e).slice(0, 200) });
       }
     }
     try {
-      this.handle(job.wallet, job.signature, job.via, tx);
+      this.handle(job.wallet, job.signature, job.via, tx, job.pos);
     } finally {
       this.done(job);
     }
@@ -698,7 +746,7 @@ export class WalletSource implements WalletFeed {
   }
 
   /** Decode one fetched transaction for its wallet (also the replay's entry point). */
-  handle(wallet: string, signature: string, via: WalletEvent["via"], tx: any): WalletEvent | null {
+  handle(wallet: string, signature: string, via: WalletEvent["via"], tx: any, pos: Job["pos"] = null): WalletEvent | null {
     const s = this.state(wallet);
     if (!s) return null;
     const d = decodeWalletTrade(tx, wallet, signature);
@@ -707,7 +755,9 @@ export class WalletSource implements WalletFeed {
       this.stats.skipReasons[d.reason.replace(/ \(.*$/, "")] = (this.stats.skipReasons[d.reason.replace(/ \(.*$/, "")] ?? 0) + 1;
       this.o.log.info("wallet_tx_skipped", { wallet, signature, reason: d.reason });
       if (this.o.transfers) {
-        for (const x of walletTokenDeltas(tx, wallet)) {
+        // A move out only: when another token rose in the same transaction it is a swap of one for the other.
+        const deltas = walletTokenDeltas(tx, wallet);
+        for (const x of deltas.some((y) => y.afterRaw > y.beforeRaw) ? [] : deltas) {
           if (x.afterRaw >= x.beforeRaw) continue;
           this.movesOut.push({ wallet, mint: x.mint, beforeRaw: x.beforeRaw, afterRaw: x.afterRaw, signature, slot: Number(tx?.slot ?? 0), blockTime: typeof tx?.blockTime === "number" ? tx.blockTime : null, reason: d.reason });
           this.notify();
@@ -715,7 +765,7 @@ export class WalletSource implements WalletFeed {
       }
       return null;
     }
-    const e: WalletEvent = { ...d.trade, complete: !s.dirty, seenAtMs: this.now(), via };
+    const e: WalletEvent = { ...d.trade, complete: !s.dirty, seenAtMs: this.now(), via, slotPos: pos?.n ?? null, slotPosFrom: pos?.from ?? null };
     s.dirty = false;
     if (s.head && s.head.signature === signature && s.head.blockTime == null) s.head.blockTime = e.blockTime;
     this.stats.trades++;

@@ -55,8 +55,8 @@ function modeOf(path: string): string | null {
 
 async function runMirror(ctx: Ctx): Promise<number> {
   return run(ctx, openLedger(ctx), async (ledger) => {
-    // Transfers too: a leader moving a coin we hold out of its wallet is alerted.
-    const source = load(() => makeSource({ source: ctx.cfg.source, rpc: ctx.rpc, wsUrl: ctx.wsUrl, log: ctx.log, configDir: ctx.cfg.configDir, since: ledger.cursors(), extra: { transfers: true } }));
+    // source.transfers (default on): a leader moving a coin we hold out of its wallet is alerted.
+    const source = load(() => makeSource({ source: ctx.cfg.source, rpc: ctx.rpc, wsUrl: ctx.wsUrl, log: ctx.log, configDir: ctx.cfg.configDir, since: ledger.cursors(), extra: { transfers: ctx.cfg.source.transfers } }));
     const { engine, trigger } = await makeMirror(ctx, ledger, source);
     return { engine, trigger };
   }, { leaders: ctx.cfg.leaders.length, ticket: ctx.cfg.mirror.ticket.mode, copy: ctx.cfg.mirror.copy, sells: ctx.cfg.mirror.sells });
