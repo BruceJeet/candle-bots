@@ -11,8 +11,9 @@
  *  - The venue's position on each managed coin is checked against the book's (the sum of its fills). A difference
  *    freezes the coin at once (no opens, no closes) and is alerted after perps.mismatchSec, or on the first step when
  *    the hedger starts with it. The hedger only ever closes what its book explains: a frozen coin's short is closed
- *    (when nothing should be hedged there) only when the freeze is the hedger's own order in doubt, or the book holds
- *    a short at least as large as the venue's. Anything else waits for `accept <coin>`.
+ *    (when nothing should be hedged there) only when the freeze is the hedger's own order in doubt (at most the book's
+ *    short plus that order's size), or the book holds a short at least as large as the venue's. Anything else waits
+ *    for `accept <coin>`.
  *  - An order signed but never submitted, then written off, may still land (Candle perps builds carry no expiry): its
  *    coin gets no opens for 48 h or until `accept`.
  *  - Opens: never while PAUSE_OPENS exists. FLATTEN closes every managed position (reduce-only) while it exists.
@@ -63,8 +64,8 @@ export class Hedger {
   private nextSampleAt = 0;
   private spotOkAt: number | null = null;
   private firstCheck = true;
-  /** Frozen coins whose short the hedger may close (see the header). */
-  closable = new Set<string>();
+  /** Frozen coins whose short the hedger may close, with the most it may close (see the header). */
+  closable = new Map<string, number>();
   private readonly startedAt: number;
   /** Bags left out this read: a venue thinner than spot.minLiquiditySol. */
   thin: Array<{ mint: string; liquiditySol: number }> = [];
@@ -184,12 +185,14 @@ export class Hedger {
    */
   private freeze(account: PerpAccount, markets: Map<string, PerpMarket>, managed: Set<string>): Map<string, string> {
     const frozen = new Map<string, string>();
-    this.closable = new Set<string>();
-    for (const r of this.d.book.unresolved())
-      if (!frozen.has(r.coin)) {
-        frozen.set(r.coin, `order ${r.id} (${r.status}) not reconciled yet`);
-        this.closable.add(r.coin);
-      }
+    this.closable = new Map<string, number>();
+    for (const r of this.d.book.unresolved()) {
+      if (!frozen.has(r.coin)) frozen.set(r.coin, `order ${r.id} (${r.status}) not reconciled yet`);
+      // At most the book's short plus every open in doubt on the coin: no more than the hedger may have made.
+      const add = r.action === "open" && r.side === "short" && r.size !== null ? Number(r.size) : 0;
+      const base = this.closable.get(r.coin) ?? Math.max(0, -this.d.book.expected(r.coin));
+      this.closable.set(r.coin, base + add);
+    }
     const t = this.now();
     const first = this.firstCheck;
     this.firstCheck = false;
@@ -203,7 +206,7 @@ export class Hedger {
       }
       // The book's own short covers the venue's (a partial liquidation, a close the book has not booked yet): closing
       // it closes no more than the hedger made.
-      if (book < 0 && venue < 0 && -venue <= -book + step / 2) this.closable.add(coin);
+      if (book < 0 && venue < 0 && -venue <= -book + step / 2) this.closable.set(coin, -book);
       const m = this.mismatch.get(coin);
       if (!m) this.mismatch.set(coin, { since: t, reads: 1, venue, book });
       else {

@@ -18,7 +18,7 @@ import { bagUsd, readSpotBags } from "candle-bot-core/perps/spot";
 import { DatabaseSync } from "node:sqlite";
 import { perpsClient, resolvePerpsWallet } from "candle-bot-core/perps/wallet";
 import { ConfigError, loadConfig, type Config } from "./config.ts";
-import { Hedger } from "./hedger.ts";
+import { Hedger, SIGNED_WRITE_OFF_HOLD_MS } from "./hedger.ts";
 
 export const HELP = `candle-perps-hedger: hedges the spot bags of a Solana wallet with Hyperliquid perps through Candle. A short on the
 coin's own perp when Hyperliquid lists it (named in config), else on a proxy (SOL), sized by a ratio or a fitted beta;
@@ -168,13 +168,21 @@ async function accept(ctx: Ctx, coin: string): Promise<number> {
   const lock = acquireLock(ctx.cfg.stateDir);
   if (!lock) die(`the hedger is running (${ctx.cfg.stateDir}/lock): stop it first, then accept`);
   const book = new HedgeBook(join(ctx.cfg.stateDir, "hedge.sqlite"));
-  const venue = await makeVenue(ctx, { readOnly: true });
+  // Dry: the paper positions as the book file holds them (no market read). Live: the account on /info, no key.
+  const venue = ctx.cfg.mode === "live" ? await makeVenue(ctx, { readOnly: true }) : null;
   try {
     if (book.unresolved().length) die(`orders not reconciled yet (${book.unresolved().map((r) => r.id).join(", ")}): run the hedger until they are`);
-    const acct = await venue.account();
-    const venuePos = acct.positions.find((p) => p.coin === coin)?.szi ?? 0;
+    const positions = venue ? (await venue.account()).positions : readStateReadOnly(ctx.cfg.stateDir).paper.map((p) => ({ coin: p.coin, szi: p.szi }));
+    const venuePos = positions.find((p) => p.coin === coin)?.szi ?? 0;
     const delta = +(venuePos - book.expected(coin)).toPrecision(12);
     if (delta === 0) {
+      // A 0-size accepted row still ends the hold a signed, written-off order put on the coin.
+      if (book.signedWriteOffs(SIGNED_WRITE_OFF_HOLD_MS).some((w) => w.coin === coin)) {
+        book.accept(coin, 0, `accept command: account ${venuePos} matches the book; ends the hold of a signed, written-off order`, newClientId());
+        ctx.log.info("position_accepted", { coin, venue: venuePos, delta: 0, endsHold: true });
+        process.stdout.write(`${coin}: the book already matches the account (${venuePos}); the hold on opens is lifted\n`);
+        return 0;
+      }
       process.stdout.write(`${coin}: the book already matches the account (${venuePos})\n`);
       return 0;
     }
@@ -184,7 +192,6 @@ async function accept(ctx: Ctx, coin: string): Promise<number> {
     return 0;
   } finally {
     book.close();
-    if (venue instanceof PaperPerpsVenue) venue.close_();
     lock.release();
   }
 }

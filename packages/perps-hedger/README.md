@@ -59,7 +59,9 @@ count against the caps first.
 - One order per coin per step. More short: a market open. Less short: a reduce-only close of the difference. A bag
   sold, a bag unpriced past `unpricedCloseSec`, or `FLATTEN`: a reduce-only close of the whole position. A long on a
   hedge coin is closed. A bag missing from one wallet read gets one more read before its hedge is closed.
-- `maxMarginUsd` is a hard ceiling: while the positions use more margin than it, the reduce goes out with no band.
+- `maxMarginUsd` is a hard ceiling: while the positions use more margin than it, by at least `minOrderUsd` of
+  notional, the reduce goes out with no band. No sized reduce is ever under `minOrderUsd`; only a close of the whole
+  position may be smaller.
 - No venue read, no order.
 - Before the venue is asked, every order is written to the book (`hedge.sqlite`) under a fresh client id (the order's
   cloid). An order with no clear answer (a timeout, a submit that failed, an unreadable leg) freezes its coin. The bot
@@ -88,7 +90,9 @@ count against the caps first.
   and not counted.
 
 Controls in the state folder: `STOP` ends the run. `PAUSE_OPENS` blocks new or larger hedges; closes still run.
-`FLATTEN` (the `flatten` command) closes every hedge and holds flat until `resume`.
+`FLATTEN` (the `flatten` command) closes every hedge and holds flat until `resume`. FLATTEN closes only what the book
+explains: a coin whose position differs from the book is left alone, so run `accept <coin>` first (bot stopped).
+`accept` on a coin whose position already matches the book still lifts the hold of a signed, written-off order.
 
 `status.json` holds the account, each coin's target and position, each bag (venue, value, hedge, status), the frozen
 coins, orders in doubt, the book, fees, funding and closed P&L, and the last orders.
