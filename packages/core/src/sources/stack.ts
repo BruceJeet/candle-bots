@@ -25,6 +25,12 @@ export interface SeriesSection {
   maxBars: number;
   /** A trade notification more than this many slots behind the chain marks the bars incomplete (about 400 ms a slot). */
   maxSlotLag: number;
+  /**
+   * A feed coin whose trade-log stream averages more than this (KB a minute, over 10 min) is dropped from the watchlist
+   * for `busyRecheckMin`: a cost cap on a metered RPC (Helius bills 2 credits per 0.1 MB). Null: off (the default).
+   */
+  maxCoinKbPerMin: number | null;
+  busyRecheckMin: number;
 }
 
 export const parseWatchlistSection: SectionParser<WatchlistSection> = (raw) => {
@@ -50,11 +56,13 @@ export const parseWatchlistSection: SectionParser<WatchlistSection> = (raw) => {
 export const parseSeriesSection: SectionParser<SeriesSection> = (raw) => {
   const r = raw === undefined ? {} : raw;
   if (!isObj(r)) throw new ConfigError("config.series: an object");
-  only(r, ["maxSubscriptions", "maxBars", "maxSlotLag"], "config.series");
+  only(r, ["maxSubscriptions", "maxBars", "maxSlotLag", "maxCoinKbPerMin", "busyRecheckMin"], "config.series");
   return {
     maxSubscriptions: num(r, "maxSubscriptions", "config.series", { min: 1, max: 500, int: true, def: 50 }),
     maxBars: num(r, "maxBars", "config.series", { min: 10, max: 1440, int: true, def: 1440 }),
     maxSlotLag: num(r, "maxSlotLag", "config.series", { min: 10, max: 100_000, int: true, def: 150 }),
+    maxCoinKbPerMin: r.maxCoinKbPerMin === undefined ? null : num(r, "maxCoinKbPerMin", "config.series", { min: 1, max: 1_000_000 }),
+    busyRecheckMin: num(r, "busyRecheckMin", "config.series", { min: 1, max: 10_080, int: true, def: 180 }),
   };
 };
 
@@ -73,10 +81,10 @@ export interface StackDeps {
 /** The LogsSeries, the Candle feed (when the watchlist names buckets) and the Watchlist over them. */
 export function seriesStack(d: StackDeps, w: WatchlistSection, s: SeriesSection): { series: LogsSeries; feed: CandleFeed | null; watchlist: Watchlist } {
   const now = d.now ?? Date.now;
-  const series = new LogsSeries({ rpc: d.rpc, wsUrl: d.wsUrl, log: d.log, alerter: d.alerter, now, ...(d.socket ? { socket: d.socket } : {}) }, { maxSubscriptions: s.maxSubscriptions, maxCoins: w.maxCoins, maxBars: s.maxBars, maxSlotLag: s.maxSlotLag });
+  const series = new LogsSeries({ rpc: d.rpc, wsUrl: d.wsUrl, log: d.log, alerter: d.alerter, now, ...(d.socket ? { socket: d.socket } : {}) }, { maxSubscriptions: s.maxSubscriptions, maxCoins: w.maxCoins, maxBars: s.maxBars, maxSlotLag: s.maxSlotLag, ...(s.maxCoinKbPerMin !== null ? { maxCoinKbPerMin: s.maxCoinKbPerMin } : {}) });
   const f = w.feed;
   const feed = f ? new CandleFeed({ apiUrl: d.apiUrl, log: d.log, alerter: d.alerter, now, ...(d.fetch ? { fetch: d.fetch } : {}) }, { buckets: f.buckets, ...(f.where ? { where: f.where } : {}), everyMs: f.everySec * 1000 }) : null;
-  const watchlist = new Watchlist({ series, feed, alerter: d.alerter, log: d.log, now }, { mints: w.mints, maxCoins: w.maxCoins, ...(f ? { maxFeedCoins: f.maxCoins } : {}), dropAfterMs: w.dropAfterMin * 60_000 });
+  const watchlist = new Watchlist({ series, feed, alerter: d.alerter, log: d.log, now }, { mints: w.mints, maxCoins: w.maxCoins, ...(f ? { maxFeedCoins: f.maxCoins } : {}), dropAfterMs: w.dropAfterMin * 60_000, busyRecheckMs: s.busyRecheckMin * 60_000 });
   return { series, feed, watchlist };
 }
 

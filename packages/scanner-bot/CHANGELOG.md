@@ -1,5 +1,12 @@
 # Changelog: candle-scanner-bot
 
+## 0.1.1
+
+- **A coin that stays hot alerts once.** A rule alerts again on a coin only after it has not held there for its
+  `cooldownMin` (it was: once per cooldown while it held). `feedVolume` defaults to 60 min (others 30). The ledger's
+  `scan_fired` gains a `seen` column (added to an older ledger). Status: `heldByCooldown`.
+- core 0.8.0: the watchlist keeps only coins the series can read; a complete pump curve quoted in another token no longer holds a watch place. Watch-only, as before. (The previous npm release pinned core 0.6.0.)
+
 ## 0.1.0
 
 First release, on candle-bot-core 0.6.0 (pinned exactly).

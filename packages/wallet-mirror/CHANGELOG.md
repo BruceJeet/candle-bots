@@ -1,5 +1,9 @@
 # Changelog: candle-wallet-mirror
 
+## 0.1.1
+
+- core 0.8.0: bracketed sell floor, exit-read alerts (`engine:exits_unread`, `sell_floor_unread`); dry fills charge Candle's fee and the network fee.
+
 ## 0.1.0
 
 First release, on candle-bot-core 0.7.0 (pinned exactly; it ships the wallet watcher).

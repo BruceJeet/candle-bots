@@ -1,5 +1,9 @@
 # Changelog: candle-profit-sweeper
 
+## 0.1.2
+
+- core 0.8.0: bracketed sell floor, exit-read alerts (`engine:exits_unread`, `sell_floor_unread`); dry fills charge Candle's fee and the network fee. (The previous npm release pinned core 0.6.0.)
+
 ## 0.1.1
 
 - Pins candle-bot-core 0.6.0 (batch 3: opt-in additions only; no change in this package).

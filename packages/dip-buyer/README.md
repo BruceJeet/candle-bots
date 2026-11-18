@@ -49,12 +49,23 @@ drift against the decision fill (`retry.maxPriceDriftBps`, else `maxImpactBps`).
 
 ## Exits
 
-Any core strategy (`tpsl`, `trail`, `ladder`, `time`, `hold`), or `fade`, which reads the series too:
+Any core strategy (`tpsl`, `trail`, `ladder`, `time`, `hold`), or `fade`, which reads the series too. The example
+uses fade's price rules only (stop loss, take profit, max hold), so a dip has time to bounce:
+
+```json
+{ "strategy": "fade", "stopLoss": 0.7, "takeProfit": 2, "maxHoldMin": 360 }
+```
+
+The series rules are opt-in:
 
 ```json
 { "strategy": "fade", "stopLoss": 0.7, "takeProfit": 2, "fadeRecentBars": 5, "fadeBaselineBars": 20,
-  "fadeBelowRatio": 0.25, "dropWindowBars": 15, "dropFromHighPct": 25, "minHoldMin": 5, "maxHoldMin": 360 }
+  "fadeBelowRatio": 0.25, "dropWindowBars": 15, "dropFromHighPct": 25, "minHoldMin": 26, "maxHoldMin": 360 }
 ```
+
+With the volume rule, `minHoldMin` must be at least `fadeRecentBars + fadeBaselineBars + 1` (refused at load
+otherwise): the baseline must be bars after entry, the entry minute's own bar excluded. A baseline that reaches back into the fall the bot bought makes any calm after
+the dip look like "the buyers are gone", and sells before a bounce can show.
 
 `fade` sells everything on the first of: take profit or stop loss (multiples of entry), the last `fadeRecentBars`
 trading under `fadeBelowRatio` of the `fadeBaselineBars` before them, the last close `dropFromHighPct` under the high
@@ -68,6 +79,8 @@ after `minHoldMin`. They hold on a gap, so with them `stopLoss` or `maxHoldMin` 
 - Volume comes from pump.fun and PumpSwap trade logs only (Candle curve and DAMM v2 coins have no volume here, and are
   never bought). The public RPC holds about 100 log subscriptions; a private RPC is better for a large watchlist.
 - Sparse gaps (an unreadable log here and there) can make long stretches of bars read incomplete; the rule then waits.
+- Dry fills: the venue's own quote (its fee included), plus Candle's 0.25 % a side and 5,000 lamports of network fee
+  a transaction. Token-account rent is not in dry P&L.
 - Spend: `buy.lifetimeSol` counts tickets only. Candle's platform fee (0.25 % a side), network fees and about
   0.002 SOL of token-account rent per new coin come on top: fund the wallet with some room above `lifetimeSol`.
 

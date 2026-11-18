@@ -1,6 +1,6 @@
 {
   "name": "candle-rebalancer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Holds a Solana wallet at target weights across coins and SOL: on a schedule it sells what is over its band, then buys what is under, with a minimum trade size and a cap on SOL moved per run. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

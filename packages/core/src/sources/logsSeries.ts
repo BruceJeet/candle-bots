@@ -9,7 +9,17 @@
  *   from an event.
  * - Gaps (sources/series): a coin still subscribing, a reconnect, a subscription refused or not confirmed, the
  *   subscription cap, the coin cap, a venue with no trade-log source in this version (the Candle curve, DAMM v2), a
- *   coin quoted in something other than SOL. Each is alerted once per coin and reason.
+ *   coin quoted in something other than SOL.
+ * - (0.8.0) A coin with no trade-log source is logged once per coin (`series_no_log_source`) and listed by
+ *   `unreadable()`, not alerted: the watchlist drops such feed coins, and alerts a listed or pushed one itself. A
+ *   transaction log that cannot be read to its end is logged once per coin (`series_log_unreadable`, with why it
+ *   stopped, its line count and bytes) and counted in status (`logReads`: transactions read, partial, and partial by
+ *   reason, all since start); its minute stays a gap.
+ * - Stream cost: every notification's bytes are counted per coin (10 s buckets), and the socket's whole stream (every
+ *   frame). A metered RPC bills that stream (Helius: 2 credits per 0.1 MB, uncompressed). Status `stream` gives the
+ *   last hour's rate as MB and credits a day, and the busiest coins. With `maxCoinKbPerMin` set, a coin whose stream
+ *   averaged more than that over the last `busyWindowMs` (or since it was subscribed, once that is `busyMinObsMs`) is
+ *   listed by `busy()`: the watchlist drops such feed coins (a cost verdict, not a data gap; its bars are not touched).
  * Nothing is backfilled: a gap stays a gap.
  */
 import type { Alerter } from "../alerts.ts";
@@ -51,12 +61,35 @@ export interface LogsSeriesOptions {
    */
   silenceMs?: number;
   silencePct?: number;
+  /** A coin streaming more than this (KB a minute, averaged) is busy (see `busy()`). Unset or 0: never busy. */
+  maxCoinKbPerMin?: number;
+  /** The window the busy rate is averaged over (ms, default 10 min). */
+  busyWindowMs?: number;
+  /** A coin is judged busy only once this much of its stream is in the judged span (ms, default 60 s). */
+  busyMinObsMs?: number;
+  /**
+   * The last this-long of the stream is left out of the busy rate (ms, default 3 min): a coin spiking now is judged on
+   * its stream before the spike, so the cap never drops the coin the rule is about to fire on.
+   */
+  busySkipRecentMs?: number;
 }
+
+/** Stream bytes are counted in buckets this long (ms). */
+const STREAM_BUCKET_MS = 10_000;
 
 /** Socket gap reasons, closed when the subscription is confirmed. */
 const SOCKET_REASONS = ["subscribing", "reconnect", "stalled", "subscription not confirmed", "subscription refused"];
 /** Venue gap reasons (each "no trade log for venue X"): all closed once the coin has a log source. */
 const VENUES = ["unknown", "curve", "damm", "pump-curve", "pumpswap"];
+
+/** Reader problems that are verdicts on the coin (market/reader, market/pump), not read failures. */
+const SETTLED_PROBLEMS = new Set(["no_venue", "pump_quote_not_sol", "pump_mayhem", "pump_pool_mismatch"]);
+
+/** Remember a coin as logged; bounded (past 5,000 the oldest is forgotten, so it may be logged once more). */
+function once(set: Set<string>, mint: string): void {
+  set.add(mint);
+  if (set.size > 5000) set.delete(set.values().next().value as string);
+}
 
 export class LogsSeries implements SeriesSource {
   readonly store: SeriesStore;
@@ -75,13 +108,19 @@ export class LogsSeries implements SeriesSource {
   private seen = new Map<string, Set<string>>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private inflight: Promise<void> | null = null;
-  /** Coins with no trade-log source (venue -> why), alerted as one summary when the set changes. */
+  /** Coins with no trade-log source (mint -> why). */
   private noSource = new Map<string, string>();
+  /** Of those, the settled verdicts (not a curve between curve and pool): what `unreadable()` gives. */
+  private settled = new Set<string>();
+  /** Coins already logged once (no log source; a partial log), bounded. */
+  private loggedNoSource = new Set<string>();
+  private loggedPartial = new Set<string>();
+  /** Since start: transactions read from the logs, how many only in part, and why (readTrades' reason). */
+  private reads = { txs: 0, partial: 0, byReason: {} as Record<string, number> };
   /** Coins subscribed and not yet resolved (resolved on the next poll, without re-reading every coin's venue). */
   private fresh = new Set<string>();
   /** Transactions whose log could not be read to its end. */
   partialLogs = 0;
-  private noSourceAlerted = "";
   /** The chain's slot as last read, and when; the socket's lag state. */
   private chainSlot: { slot: number; at: number } | null = null;
   private slotReadAt = 0;
@@ -93,14 +132,19 @@ export class LogsSeries implements SeriesSource {
   /** When the price first moved past silencePct since the last log (cleared by a log, or a return within the band). */
   private movedAt = new Map<string, number>();
   silentResubscribes = 0;
+  /** Per coin: when its stream count began (its log address set), and bytes per STREAM_BUCKET_MS bucket. */
+  private stream = new Map<string, { since: number; buckets: Map<number, number> }>();
+  /** The socket's whole stream: (when, bytes received so far) samples, the last hour's. */
+  private streamSamples: Array<{ at: number; bytes: number }> = [];
 
   constructor(d: LogsSeriesDeps, o: LogsSeriesOptions = {}) {
     this.d = d;
     this.now = d.now ?? Date.now;
-    this.o = { maxSubscriptions: o.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS, maxCoins: o.maxCoins ?? 200, maxBars: o.maxBars ?? 1440, priceEveryMs: o.priceEveryMs ?? 5_000, venueEveryMs: o.venueEveryMs ?? 60_000, slotEveryMs: o.slotEveryMs ?? 30_000, maxSlotLag: o.maxSlotLag ?? 150, silenceMs: o.silenceMs ?? 45_000, silencePct: o.silencePct ?? 1 };
+    this.o = { maxSubscriptions: o.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS, maxCoins: o.maxCoins ?? 200, maxBars: o.maxBars ?? 1440, priceEveryMs: o.priceEveryMs ?? 5_000, venueEveryMs: o.venueEveryMs ?? 60_000, slotEveryMs: o.slotEveryMs ?? 30_000, maxSlotLag: o.maxSlotLag ?? 150, silenceMs: o.silenceMs ?? 45_000, silencePct: o.silencePct ?? 1, maxCoinKbPerMin: o.maxCoinKbPerMin ?? 0, busyWindowMs: o.busyWindowMs ?? 600_000, busyMinObsMs: o.busyMinObsMs ?? 60_000, busySkipRecentMs: o.busySkipRecentMs ?? 180_000 };
     this.store = d.store ?? new SeriesStore({ maxCoins: this.o.maxCoins, maxBars: this.o.maxBars, now: this.now });
     const handlers: MultiLogsHandlers = {
       onLogs: (e) => {
+        this.countStream(e.address, e.bytes ?? 0);
         this.checkLag(e.slot);
         this.onLogs(e.address, e.signature, e.err, e.logs);
       },
@@ -184,11 +228,13 @@ export class LogsSeries implements SeriesSource {
       this.venueOf.delete(m);
       this.venueAt.delete(m);
       this.noSource.delete(m);
+      this.settled.delete(m);
       this.fresh.delete(m);
       this.lastLogAt.delete(m);
       this.refPrice.delete(m);
       this.silent.delete(m);
       this.movedAt.delete(m);
+      this.stream.delete(m);
     }
     this.applySockets();
   }
@@ -205,6 +251,7 @@ export class LogsSeries implements SeriesSource {
 
   private async poll(force: boolean): Promise<void> {
     try {
+      this.sampleStream();
       const coins = this.store.watched();
       if (!coins.length) return;
       await this.readSlot();
@@ -219,7 +266,6 @@ export class LogsSeries implements SeriesSource {
         if (force || this.fresh.has(m) || !this.venueAt.has(m) || this.now() - (this.venueAt.get(m) ?? 0) >= this.o.venueEveryMs || this.venueOf.get(m) !== r.venue) this.resolve(m, r);
       }
       this.applySockets();
-      this.alertNoSource();
     } catch (e) {
       this.d.log.warn("series_read_failed", { error: String((e as Error)?.message ?? e).slice(0, 160) });
     }
@@ -250,10 +296,20 @@ export class LogsSeries implements SeriesSource {
       const why = r.venue === "unknown" ? `no pump.fun curve or canonical PumpSwap pool found${r.problem ? ` (${r.problem})` : ""}` : `on ${r.venue === "curve" ? "the Candle curve" : r.venue === "damm" ? "a DAMM v2 pool" : r.venue}`;
       this.store.gapStart(mint, `no trade log for venue ${r.venue}`);
       this.noSource.set(mint, why);
+      // Settled only on what the chain said: a Candle curve or DAMM v2 venue read, or a pump verdict (no curve or pool,
+      // quoted in another token, mayhem, a pool of another coin). A failed or partial read (an RPC error, a vault batch
+      // that did not come back, a decode error) and a migrating curve are not verdicts: the coin stays.
+      if (r.venue === "curve" || r.venue === "damm" || (r.venue === "unknown" && SETTLED_PROBLEMS.has(r.problem ?? ""))) this.settled.add(mint);
+      else this.settled.delete(mint);
+      if (!this.loggedNoSource.has(mint)) {
+        once(this.loggedNoSource, mint);
+        this.d.log.info("series_no_log_source", { mint, venue: r.venue, why, settled: this.settled.has(mint) });
+      }
     } else {
       // A log source now: every venue gap closes (a coin can pass through several, e.g. unknown, then the pool).
       for (const v of VENUES) this.store.gapEnd(mint, `no trade log for venue ${v}`);
       this.noSource.delete(mint);
+      this.settled.delete(mint);
     }
     const old = this.addrOf.get(mint);
     if (old !== addr) {
@@ -261,7 +317,12 @@ export class LogsSeries implements SeriesSource {
       if (addr) {
         this.addrOf.set(mint, addr);
         this.mintOf.set(addr, mint);
-      } else this.addrOf.delete(mint);
+        // A new log address: its stream is counted from here (a venue change starts the count again).
+        this.stream.set(mint, { since: this.now(), buckets: new Map() });
+      } else {
+        this.addrOf.delete(mint);
+        this.stream.delete(mint);
+      }
     }
   }
 
@@ -338,15 +399,86 @@ export class LogsSeries implements SeriesSource {
     }
   }
 
-  /** One summary alert when the set of coins without a trade-log source changes (not one per coin). */
-  private alertNoSource(): void {
-    for (const m of [...this.noSource.keys()]) if (!this.store.isWatched(m)) this.noSource.delete(m);
-    const key = [...this.noSource.keys()].sort().join(",");
-    if (key === this.noSourceAlerted) return;
-    this.noSourceAlerted = key;
-    if (!this.noSource.size) return;
-    const list = [...this.noSource].slice(0, 5).map(([m, why]) => `${m} (${why})`).join("; ");
-    this.d.alerter.raise(`series:no_log_source:${this.noSource.size}:${key.length}`, `series: ${this.noSource.size} watched coin(s) have no trade-log source in this version (pump.fun curves and PumpSwap only), so their volume is unknown: ${list}${this.noSource.size > 5 ? `; and ${this.noSource.size - 5} more (status.json)` : ""}`);
+  /** A notification's bytes, on its coin's current bucket (a failed transaction's too: it is billed). */
+  private countStream(address: string, bytes: number): void {
+    const mint = this.mintOf.get(address);
+    const s = mint ? this.stream.get(mint) : undefined;
+    if (!s || !(bytes > 0)) return;
+    const now = this.now();
+    const b = now - (now % STREAM_BUCKET_MS);
+    s.buckets.set(b, (s.buckets.get(b) ?? 0) + bytes);
+    // Keep the window's buckets only (and the one in progress).
+    const keep = now - this.o.busyWindowMs - STREAM_BUCKET_MS;
+    for (const k of s.buckets.keys()) {
+      if (k >= keep) break;
+      s.buckets.delete(k);
+    }
+  }
+
+  /**
+   * A coin's stream rate, KB a minute: over [the window's start (or when its count began), now], or with `skipRecent`
+   * over the same span less its last busySkipRecentMs. Whole buckets only. Null while the span is under busyMinObsMs.
+   */
+  private kbPerMin(mint: string, skipRecent = false): number | null {
+    const s = this.stream.get(mint);
+    if (!s) return null;
+    const now = this.now();
+    const end = skipRecent ? now - this.o.busySkipRecentMs : now;
+    const start = Math.max(s.since, now - this.o.busyWindowMs);
+    const span = end - start;
+    if (span < this.o.busyMinObsMs) return null;
+    let bytes = 0;
+    // A bucket counts when it ends inside the span (without skipRecent, the one in progress too).
+    for (const [k, v] of s.buckets) if (k + STREAM_BUCKET_MS > start && (!skipRecent || k + STREAM_BUCKET_MS <= end)) bytes += v;
+    return bytes / 1024 / (span / 60_000);
+  }
+
+  /** The socket's bytes so far, sampled each poll; samples older than an hour are dropped (one kept as the base). */
+  private sampleStream(): void {
+    const total = this.socket.bytesReceived?.();
+    if (typeof total !== "number") return;
+    const now = this.now();
+    this.streamSamples.push({ at: now, bytes: total });
+    while (this.streamSamples.length > 2 && now - this.streamSamples[1].at >= 3_600_000) this.streamSamples.shift();
+  }
+
+  /**
+   * Watched coins whose stream averaged more than maxCoinKbPerMin (mint -> why). A cost verdict for the watchlist: a
+   * feed coin here is dropped and looked at again later; a listed or pushed (held) coin is kept. Empty when unset.
+   */
+  busy(): ReadonlyMap<string, string> {
+    const out = new Map<string, string>();
+    const cap = this.o.maxCoinKbPerMin;
+    if (!(cap > 0)) return out;
+    for (const m of this.stream.keys()) {
+      if (!this.store.isWatched(m)) continue;
+      const r = this.kbPerMin(m, true);
+      if (r !== null && r > cap) out.set(m, `stream ${Math.round(r)} KB/min over ${cap} KB/min`);
+    }
+    return out;
+  }
+
+  /** The stream's cost: since start, the last hour as MB and Helius credits a day, the busiest coins now. */
+  private streamStatus(): Record<string, unknown> {
+    const total = this.socket.bytesReceived?.() ?? null;
+    const a = this.streamSamples[0];
+    const z = this.streamSamples[this.streamSamples.length - 1];
+    const span = a && z ? z.at - a.at : 0;
+    const mbPerDay = span >= 60_000 ? Math.round((((z.bytes - a.bytes) / span) * 86_400_000) / 1e6) : null;
+    const top = [...this.stream.keys()]
+      .map((m) => ({ mint: m, kbPerMin: this.kbPerMin(m) }))
+      .filter((x): x is { mint: string; kbPerMin: number } => x.kbPerMin !== null)
+      .sort((x, y) => y.kbPerMin - x.kbPerMin)
+      .slice(0, 5)
+      .map((x) => ({ mint: x.mint, kbPerMin: Math.round(x.kbPerMin) }));
+    return { mbSinceStart: total === null ? null : Math.round(total / 1e6), mbPerDay, heliusCreditsPerDay: mbPerDay === null ? null : mbPerDay * 20, overMinutes: Math.round(span / 60_000), maxCoinKbPerMin: this.o.maxCoinKbPerMin || null, busy: this.busy().size, top };
+  }
+
+  /** Watched coins with no trade-log source, settled verdicts only (see SeriesSource.unreadable). */
+  unreadable(): ReadonlyMap<string, string> {
+    const out = new Map<string, string>();
+    for (const m of this.settled) if (this.store.isWatched(m) && this.noSource.has(m)) out.set(m, this.noSource.get(m)!);
+    return out;
   }
 
   private applySockets(): void {
@@ -378,12 +510,20 @@ export class LogsSeries implements SeriesSource {
     this.seen.set(mint, seen);
     const at = this.now();
     const read = readTrades(logs, err);
+    this.reads.txs++;
     if (read.partial) {
       // Part of this transaction's log could not be read: a trade may be missing, so this minute is unknown.
       const m0 = at - (at % this.store.barMs);
       this.store.gap(mint, m0, m0 + this.store.barMs, "log unreadable");
       this.partialLogs++;
-      this.d.alerter.raise(`series:log_unreadable:${mint}`, `series: a transaction's log for ${mint} could not be read to its end (truncated or an unaccounted invoke stack); that minute's volume is unknown (${this.partialLogs} so far)`);
+      this.reads.partial++;
+      const reason = read.reason ?? "unknown";
+      this.reads.byReason[reason] = (this.reads.byReason[reason] ?? 0) + 1;
+      // Logged once per coin (the counts are in status), not alerted: a data gap, not something to act on.
+      if (!this.loggedPartial.has(mint)) {
+        once(this.loggedPartial, mint);
+        this.d.log.info("series_log_unreadable", { mint, signature, reason, lines: logs.length, bytes: logs.reduce((n, l) => n + l.length + 1, 0), tradesBeforeStop: read.trades.length, partialLogs: this.partialLogs });
+      }
     }
     for (const t of read.trades) {
       if (t.kind === "pump-curve") {
@@ -408,6 +548,6 @@ export class LogsSeries implements SeriesSource {
   }
 
   status(): Record<string, unknown> {
-    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, partialLogs: this.partialLogs, silent: [...this.silent], silentResubscribes: this.silentResubscribes, noTradeLogSource: Object.fromEntries(this.noSource) };
+    return { watched: this.store.watched().length, subscribed: this.socket.held().length, up: this.socket.isUp(), maxSubscriptions: this.o.maxSubscriptions, maxCoins: this.o.maxCoins, behindChain: this.behind, partialLogs: this.partialLogs, logReads: { txs: this.reads.txs, partial: this.reads.partial, byReason: { ...this.reads.byReason } }, silent: [...this.silent], silentResubscribes: this.silentResubscribes, noTradeLogSource: Object.fromEntries(this.noSource), stream: this.streamStatus() };
   }
 }

@@ -487,6 +487,8 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
 - **One websocket carries every coin** (`solana/logs-multi`), up to `maxSubscriptions` (default 50; a probe on the
   public RPC held 100). Coins past the cap are a gap, and alerted.
 - Candle curve and DAMM v2 coins have no trade-log source in this version: price only, and their volume is a gap.
+  Such a coin is logged once (`series_no_log_source`) and listed by `unreadable()` (settled verdicts only), which the
+  watchlist uses to drop feed coins.
 - **Which events count:** a trade event counts only from its own program's frame in the log's invoke stack: pump for
   `TradeEvent`, PumpSwap for `BuyEvent`/`SellEvent`. A line any other program logs is ignored, and a stack the log
   cannot account for (a depth mismatch, `Log truncated`) ends reading for that transaction. The log copy of each
@@ -509,7 +511,8 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
   - Unsubscribes the server leaves unanswered (each may keep a subscription on its side) are counted; past
     `maxUnansweredUnsubscribes` (20) the socket is rebuilt, which drops them all.
   - A transaction whose log cannot be read to its end (truncated, or an unaccounted invoke stack) makes that minute a
-    gap, counted (`partialLogs`) and alerted. So does a trade event whose quote cannot be read. A coin quoted in
+    gap, counted (`partialLogs`; `logReads` since start: transactions, partial, and `byReason`) and logged once per
+    coin (`series_log_unreadable`, with the reason, line count, bytes and trades read before the cut), not alerted. A trade event whose quote cannot be read is a gap too. A coin quoted in
     another token is an open gap for as long as it is watched (its SOL volume is never known).
 - **Times:** a trade is placed in the bar of the moment it was received, not its block time (usually seconds apart,
   more under a lag, which is then a gap). While a coin moves from its curve to its pool, the market read says
@@ -534,6 +537,11 @@ It is a poll: lag is the interval plus about a second. A streamed source can rep
   newcomer takes a place only by trading 25 % more than the coin it displaces, so coins at the cut do not churn,
   and a much hotter coin gets in at once.
 - The cap is alerted when it leaves coins out.
+- **Readable coins only** (`dropUnreadable`, default true): a feed coin the series reports unreadable is dropped and
+  its place goes to the next feed coin, logged once per coin (`watchlist_dropped_unreadable`), and tried again after
+  `recheckMs` (60 min, one coin a step) or when it comes back to the feed. A listed or pushed coin is kept and
+  alerted once. Only the chain's verdicts count (a failed read never drops a coin). A feed coin pushed out of the set
+  stays subscribed for `lingerMs` (2 min, while the series has room), so it comes back with its bars.
 
 `market/indicators` (pure, on ended bars, each with `complete`): `fallFromHigh`, `riseFromLow`, `volumeVsBaseline`
 (ratio and z-score), `vwap`. `market/pumpEvents` (pure) decodes pump.fun `TradeEvent` and PumpSwap `BuyEvent` /

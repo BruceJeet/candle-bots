@@ -49,6 +49,18 @@ type Ending = { status: "failed" | "rejected"; code: string; detail?: string; at
 export const RISK_LIMIT = "RISK_LIMIT_REACHED";
 export const RISK_LIMIT_KEY = "profile_risk_limit";
 
+/**
+ * (0.8.0) What a dry fill charges besides the venue's own fee (in the pricer's quote), so dry P&L reads like live:
+ * Candle's platform fee on each side (on top of a buy, out of a sell's proceeds, as a live fill books it) and the
+ * base network fee per transaction (live fills, Nov 2026: 25 bps and 5,000 lamports). Token-account rent is not
+ * charged: it depends on the account, and live fills show it on a coin's first buy (see the README).
+ */
+export interface DryCosts {
+  feeBps: number;
+  networkFeeLamports: bigint;
+}
+export const DRY_COSTS: DryCosts = { feeBps: 25, networkFeeLamports: 5_000n };
+
 export interface DryPricer {
   /** Tokens out (raw) for spending `lamports` on the coin now. */
   buyOut(mint: string, lamports: bigint): Promise<bigint>;
@@ -66,6 +78,8 @@ export interface ExecutorDeps {
   log: Logger;
   alerter: Alerter;
   dry?: DryPricer;
+  /** (0.8.0) Costs a dry fill charges (default DRY_COSTS); { feeBps: 0, networkFeeLamports: 0n } for the old fills. */
+  dryCosts?: DryCosts;
   now?: () => number;
   random?: () => number;
   /** PAUSE_BUYS: a queued buy is not built while this says true. */
@@ -105,6 +119,8 @@ export interface ExecutorDeps {
    * it answers null and only Candle's own floor applies.
    */
   sellFloor?: (mint: string, amountRaw: bigint, decimals: number) => Promise<bigint | null>;
+  /** Log `attempt_timing` (each attempt's phase times) for attempts that are submitted or refused by the sell floor. Off by default, so other bots' event logs stay as they were. */
+  logTimings?: boolean;
   /**
    * (0.6.0) Linked payer, buys: a build whose minOutRaw is under the order's decision fill less the order's slippage
    * and this many bps is never signed (rejected, BUY_FLOOR, alerted). The decision fill is the engine's checked value at
@@ -117,6 +133,13 @@ export interface ExecutorDeps {
 const UNREAD = new Set(["vault_missing", "pump_fees_unread", "supply_unread", "no_venue", "migrating"]);
 /** (0.6.0) How long a pumpBuys retry waits on a venue it cannot read before it is refused (VENUE). */
 export const PUMP_UNREAD_MAX_MS = 30 * 60_000;
+/**
+ * The bracketed sell floor: once the read after the build has answered, the read started with
+ * the build gets at most this long to answer too (else it counts as missing), so a stalled read never holds a built sell.
+ */
+export const FLOOR_BEFORE_GRACE_MS = 250;
+/** The first read lowers the floor only if it is above 0 and at most this far under the read after the build (bps). */
+export const FLOOR_BEFORE_MAX_DROP_BPS = 2_500;
 
 type Outcome =
   | { kind: "filled"; fill: Fill | null; result?: any; source: QtySource }
@@ -188,6 +211,8 @@ export class Executor {
   private d: ExecutorDeps;
   private now: () => number;
   private random: () => number;
+  /** Sells signed with Candle's floor only because the bot's own sell floor was unread (since start). */
+  sellFloorUnread = 0;
 
   constructor(d: ExecutorDeps) {
     if (typeof d.maxBuyImpactBps !== "number" || !Number.isFinite(d.maxBuyImpactBps) || d.maxBuyImpactBps < 0) throw new Error("Executor: maxBuyImpactBps must be a number >= 0");
@@ -530,6 +555,24 @@ export class Executor {
     const cfg = this.d.cfg;
     const prio = o.side === "buy" ? cfg.buy.maxPriorityFeeLamports : cfg.sell.maxPriorityFeeLamports;
     let phase: "build" | "sign" | "submit" = "build";
+    // Phase times of this attempt, logged once it is submitted or refused by the sell floor (`attempt_timing`): where
+    // a stop's seconds go. buildMs: from here to Candle's answer; floorMs: the read after the build plus any wait left
+    // on the first one; totalMs: from here to that point (submitted: before the confirm read in landed()).
+    const t0 = this.now();
+    const tm: Record<string, number> = {};
+    // A logger that throws must never turn a submitted sell into an attempt error: the log line is dropped.
+    const timing = (outcome: string) => {
+      if (!this.d.logTimings) return;
+      try {
+        this.d.log.info("attempt_timing", { order: o.id, side: o.side, mint: pos.mint, attempt: n, outcome, ...tm, totalMs: this.now() - t0 });
+      } catch {
+        /* the log line only */
+      }
+    };
+    // A linked-payer sell's first venue read for the sell floor starts with the build (see the floor below). Never
+    // throws, not even synchronously: a read that fails is null.
+    const sellFloor = this.d.sellFloor;
+    const floorBefore = o.side === "sell" && sellFloor && !main ? Promise.resolve().then(() => sellFloor(pos.mint, BigInt(o.amount_raw), pos.decimals)).catch(() => null) : null;
     try {
       const built = await this.d.rail.build({
         clientTradeId: o.client_trade_id,
@@ -540,6 +583,7 @@ export class Executor {
         maxSlippageBps: o.slippage_bps,
         ...(prio !== undefined ? { maxPriorityFeeLamports: prio } : {}),
       });
+      tm.buildMs = this.now() - t0;
       if (built.status === "executed") {
         // Payer main: Candle signed and sent it inside this call. Linked: an idempotent replay of a landed id.
         this.d.ledger.updateOrder(o.id, { signature: built.signature, signed_at: o.signed_at ?? this.now(), ever_signed: 1, fee_bps: Number(built.fee?.bps ?? 0), min_out_raw: String(built.amounts?.minOutRaw ?? "") });
@@ -578,10 +622,40 @@ export class Executor {
       }
       if (o.side === "sell" && this.d.sellFloor) {
         // (0.5.0) Candle's floor must not sit under what the venue itself pays (less the slippage and a margin).
-        const floor = await this.d.sellFloor(pos.mint, BigInt(o.amount_raw), pos.decimals).catch(() => null);
+        // Fail-open by design (never strand an exit): an unread floor leaves Candle's own floor only. Logged and counted.
+        // Two venue reads bracket Candle's quote in time: one started with the build, one after it, and the
+        // floor is the lower of the two. A market that moved between them no longer refuses a sound build: two live
+        // stops (Nov 12-13) were refused when the price bounced during the build (minOut 1.1 % and 7.6 % under a floor
+        // read after it), and sold 3 s and 2 min later, lower. A build under both reads is refused, as before. The read
+        // after the build decides whether there is a check (missing: none, counted as unread, as before); the first
+        // read can only lower it, and only by FLOOR_BEFORE_MAX_DROP_BPS at most. So no sell is refused that the old
+        // check would have signed, and the first read can never switch the check off.
+        const tf = this.now();
+        let unread: string | null = null;
+        const after = await this.d.sellFloor(pos.mint, BigInt(o.amount_raw), pos.decimals).catch((e) => {
+          unread = String((e as Error)?.message ?? e).slice(0, 160);
+          return null;
+        });
+        // The first read gets FLOOR_BEFORE_GRACE_MS more once the read after the build has answered: a stalled read
+        // (the RPC's own timeout is 15 s) must not hold a built sell while its blockhash ages. Late: missing.
+        let grace: ReturnType<typeof setTimeout> | undefined;
+        const before = floorBefore
+          ? await Promise.race([floorBefore, new Promise<null>((r) => (grace = setTimeout(() => r(null), FLOOR_BEFORE_GRACE_MS)))]).finally(() => clearTimeout(grace))
+          : null;
+        tm.floorMs = this.now() - tf;
+        // The first read only ever lowers the floor, and only when it is a real price: above 0 (pump's sell math answers
+        // 0 when the fee covers the gross, which would switch the check off) and no more than
+        // FLOOR_BEFORE_MAX_DROP_BPS under the read after the build. Otherwise the read after the build alone decides.
+        const usable = before !== null && after !== null && before > 0n && before * 10_000n >= after * BigInt(10_000 - FLOOR_BEFORE_MAX_DROP_BPS);
+        const floor = after === null ? null : usable && before! < after ? before! : after;
+        if (floor === null) {
+          this.sellFloorUnread++;
+          this.d.log.warn("sell_floor_unread", { order: o.id, mint: pos.mint, why: unread ?? "no venue price (not a pump venue, or the read had no answer)", count: this.sellFloorUnread });
+        }
         const minOut = /^\d+$/.test(String(built.minOutRaw ?? "")) ? BigInt(String(built.minOutRaw)) : null;
         if (floor !== null && (minOut === null || minOut < floor)) {
-          this.d.ledger.endAttempt(att, this.now(), "rejected", "SELL_FLOOR", JSON.stringify({ minOutRaw: String(built.minOutRaw ?? ""), floor: floor.toString() }));
+          timing("SELL_FLOOR");
+          this.d.ledger.endAttempt(att, this.now(), "rejected", "SELL_FLOOR", JSON.stringify({ minOutRaw: String(built.minOutRaw ?? ""), floor: floor.toString(), floorBefore: before?.toString() ?? null, floorAfter: after?.toString() ?? null }));
           this.alert(`order:${o.id}:SELL_FLOOR`, `order ${o.id} sell ${pos.mint}: not signed, Candle's floor ${String(built.minOutRaw ?? "none")} is under ${floor} lamports (the venue's own price less slippage)`);
           return this.apply(o, pos, { kind: "rejected", code: "SELL_FLOOR", detail: `minOut ${String(built.minOutRaw ?? "none")} < ${floor}` });
         }
@@ -615,11 +689,16 @@ export class Executor {
         return this.apply(o, pos, { kind: "rejected", code: "TX_VERSION", detail: "transaction version 1 or later" });
       }
       phase = "sign";
+      const ts = this.now();
       const signed = await this.d.rail.sign(built.artifacts.transactionBase64);
+      tm.signMs = this.now() - ts;
       const sig = signatureOfSigned(signed);
       this.d.ledger.updateOrder(o.id, { signature: sig, signed_at: this.now(), blockhash: blockhashOfSigned(signed), ever_signed: 1, updated_at: this.now() });
       phase = "submit";
+      const tu = this.now();
       const res = await this.d.rail.submit(o.client_trade_id, signed);
+      tm.submitMs = this.now() - tu;
+      timing("submitted");
       const r = await this.landed(this.d.ledger.order(o.id)!, pos, res.signature ?? sig, res);
       this.d.ledger.endAttempt(att, this.now(), r.kind, null, null);
       return this.apply(o, pos, r);
@@ -1252,14 +1331,20 @@ export class Executor {
     if (!this.d.dry) throw new Error("dry order without a pricer");
     try {
       const amount = BigInt(o.amount_raw);
+      const costs = this.d.dryCosts ?? DRY_COSTS;
+      const feeBps = BigInt(Math.round(costs.feeBps));
+      const net = costs.networkFeeLamports;
       let fill: Fill;
       if (o.side === "buy") {
         const out = await this.d.dry.buyOut(pos.mint, amount);
-        fill = { signature: "dry", slot: null, blockTimeMs: this.now(), tokenDeltaRaw: out, solDeltaLamports: -amount, networkFeeLamports: 0n, rentLamports: 0n, swapLamports: -amount, err: null };
+        const swap = -(amount + (amount * feeBps) / 10_000n);
+        fill = { signature: "dry", slot: null, blockTimeMs: this.now(), tokenDeltaRaw: out, solDeltaLamports: swap - net, networkFeeLamports: net, rentLamports: 0n, swapLamports: swap, err: null };
       } else {
         const out = await this.d.dry.sellOut(pos.mint, amount, pos.decimals);
-        fill = { signature: "dry", slot: null, blockTimeMs: this.now(), tokenDeltaRaw: -amount, solDeltaLamports: out, networkFeeLamports: 0n, rentLamports: 0n, swapLamports: out, err: null };
+        const swap = out - (out * feeBps) / 10_000n;
+        fill = { signature: "dry", slot: null, blockTimeMs: this.now(), tokenDeltaRaw: -amount, solDeltaLamports: swap - net, networkFeeLamports: net, rentLamports: 0n, swapLamports: swap, err: null };
       }
+      if (feeBps > 0n) this.d.ledger.updateOrder(o.id, { fee_bps: Number(feeBps) });
       this.d.ledger.endAttempt(att, this.now(), "filled", null, null);
       this.bookFill(this.d.ledger.order(o.id)!, pos, fill, null, "dry");
     } catch (e) {

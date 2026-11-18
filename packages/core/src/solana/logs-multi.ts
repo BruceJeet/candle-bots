@@ -19,6 +19,8 @@ export interface MultiLogsEvent {
   err: unknown;
   logs: string[];
   slot: number;
+  /** The notification's size as received (bytes, uncompressed): what a metered RPC bills for it (a test socket may leave it out). */
+  bytes?: number;
 }
 
 export interface MultiLogsHandlers {
@@ -64,6 +66,8 @@ export interface MultiLogsSocket {
   resubscribe?(address: string): void;
   held(): string[];
   isUp(): boolean;
+  /** Bytes received on this socket since it was made, every frame (notifications, answers, pongs), uncompressed. */
+  bytesReceived?(): number;
   close(): void;
 }
 
@@ -105,6 +109,8 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
   let failures = 0;
   let reqId = 1000;
   let lastMsg = now();
+  /** Every frame's bytes since start (a metered RPC bills the uncompressed stream). */
+  let received = 0;
   let ping: ReturnType<typeof setInterval> | null = null;
   let queue: string[] = [];
   let pumping = false;
@@ -240,8 +246,13 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
       if (ws !== mine) return;
       lastMsg = now();
       let msg: any;
+      let size = 0;
       try {
-        msg = JSON.parse(typeof m.data === "string" ? m.data : Buffer.from(m.data as ArrayBuffer).toString());
+        // Decoded inside the guard: a frame this cannot read (a Blob) must never throw out of the socket's handler.
+        const text = typeof m.data === "string" ? m.data : Buffer.from(m.data as ArrayBuffer).toString();
+        size = Buffer.byteLength(text);
+        received += size;
+        msg = JSON.parse(text);
       } catch {
         return;
       }
@@ -281,7 +292,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
         const a = bySub.get(sub);
         const v = msg.params?.result?.value;
         if (!a || !want.includes(a) || !v || typeof v.signature !== "string") return;
-        h.onLogs({ address: a, signature: v.signature, err: v.err ?? null, logs: Array.isArray(v.logs) ? v.logs : [], slot: msg.params?.result?.context?.slot ?? 0 });
+        h.onLogs({ address: a, signature: v.signature, err: v.err ?? null, logs: Array.isArray(v.logs) ? v.logs : [], slot: msg.params?.result?.context?.slot ?? 0, bytes: size });
       }
     };
     ws.onerror = () => {
@@ -404,6 +415,7 @@ export function multiLogs(url: string, h: MultiLogsHandlers, o: MultiLogsOptions
     },
     held: () => [...want],
     isUp: () => up,
+    bytesReceived: () => received,
     close() {
       closed = true;
       clearConnectTimer();

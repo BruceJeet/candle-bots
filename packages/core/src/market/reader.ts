@@ -212,7 +212,9 @@ async function readMarketsWide(rpc: Rpc, coins: CoinRef[], nowMs: number, opts: 
         }
       }
       if (!v(3)) {
-        base.problem = pc ? "migrating" : "no_venue";
+        // A complete curve quoted in another token (USD1, a stock token) has no SOL pool to migrate to: that is
+        // a verdict on the coin (pump_quote_not_sol), not a migration still under way.
+        base.problem = pc ? (pc.quoteMint !== WSOL ? "pump_quote_not_sol" : "migrating") : "no_venue";
         return;
       }
       const pool = decodePumpPool(v(3));

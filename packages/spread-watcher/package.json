@@ -1,6 +1,6 @@
 {
   "name": "candle-spread-watcher",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Watches a coin's price on every venue it trades on (its pump.fun or Candle curve, PumpSwap and Meteora DAMM v2 pools by address, its Hyperliquid perp) and alerts on Telegram, Discord or a webhook when the spread between two venues holds above a threshold, with each venue's SOL depth. Watch-only: no wallet, no key, never trades. Built on candle-bot-core.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

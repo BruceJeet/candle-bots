@@ -11,7 +11,8 @@ export type { Config, Mode, Payer, SignerConfig, SectionParser, Sections, BotCon
 export { Ledger } from "./ledger.ts";
 export type { PositionRow, OrderRow, PositionStatus, OrderStatus, Side, QtySource } from "./ledger.ts";
 export { Executor, errorInfo } from "./exec/executor.ts";
-export type { ExecutorDeps, DryPricer, ErrorInfo } from "./exec/executor.ts";
+export type { ExecutorDeps, DryPricer, DryCosts, ErrorInfo } from "./exec/executor.ts";
+export { DRY_COSTS } from "./exec/executor.ts";
 export type { TradeRail } from "./exec/trader.ts";
 export { programIdsOf, KNOWN_PROGRAMS, CandleCliSignerStore, cliConfigDir } from "./exec/trader.ts";
 export { readCliEntry, cliStoreRefs, cliFingerprint, cliStoreWarnings, CliStoreError, CLI_STORE_FORMAT } from "./exec/cliStore.ts";

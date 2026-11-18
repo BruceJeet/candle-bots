@@ -1,5 +1,9 @@
 # Changelog: candle-rug-watcher
 
+## 0.1.3
+
+- core 0.8.0: bracketed sell floor, exit-read alerts (`engine:exits_unread`, `sell_floor_unread`); dry fills charge Candle's fee and the network fee.
+
 ## 0.1.2
 
 - On candle-bot-core 0.7.0 (pinned exactly).

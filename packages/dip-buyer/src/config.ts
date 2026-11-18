@@ -58,9 +58,28 @@ function parseDip(raw: unknown): Dip {
 
 export const SECTIONS = { watchlist: parseWatchlistSection, series: parseSeriesSection, dip: parseDip };
 
-/** The rule's and the exit's windows must fit in the bars the series keeps. */
+/**
+ * (0.2.0) The fade exit's volume rule against a dip entry: its baseline bars, read back from now, must lie wholly after
+ * entry. Otherwise the baseline holds the fall the bot bought (the busiest minutes), and any calm after the dip reads as
+ * "the buyers are gone": in the step 0 dry run (Nov 2026) every one of 8 trades was sold that way 6-9 min after entry.
+ * So with the volume rule, exit.minHoldMin must cover fadeRecentBars + fadeBaselineBars + 1 (1 min bars; the entry
+ * minute's own bar is the +1). No volume rule
+ * (stop loss, take profit, drop from high, max hold): nothing to check.
+ */
+function checkDipFade(exit: Record<string, unknown>): void {
+  if (exit.strategy !== "fade") return;
+  if (exit.fadeBelowRatio === undefined && exit.fadeRecentBars === undefined && exit.fadeBaselineBars === undefined) return;
+  const n = (k: string, def: number) => (typeof exit[k] === "number" ? (exit[k] as number) : def);
+  // +1: the ended bars still include the entry minute's bar (the bounce before the fill) until one more bar ends.
+  const need = n("fadeRecentBars", 3) + n("fadeBaselineBars", 10) + 1;
+  const hold = n("minHoldMin", 0);
+  if (hold < need) throw new ConfigError(`config.exit: the volume fade (fadeRecentBars + fadeBaselineBars + the entry bar = ${need} bars) would compare against the fall the dip bought; set exit.minHoldMin to ${need} or more, or drop the fade rule (stopLoss, takeProfit and maxHoldMin still apply)`);
+}
+
+/** The rule's and the exit's windows must fit in the bars the series keeps; the fade rule must not read the dip. */
 function checked(c: Config): Config {
   checkWindows(c.series.maxBars, [{ key: "dip.windowBars", bars: c.dip.windowBars }], c.exit as Record<string, unknown>);
+  checkDipFade(c.exit as Record<string, unknown>);
   return c;
 }
 

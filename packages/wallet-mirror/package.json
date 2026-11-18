@@ -1,6 +1,6 @@
 {
   "name": "candle-wallet-mirror",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Copies the trades of the wallets you list on Candle: a fixed ticket (or a share of the leader's SOL) per copied buy, once per coin, the leader's sells mirrored as the same share of what it held, your exit strategy alongside. Watches leaders on chain (pump.fun, PumpSwap, Candle curve, Meteora DAMM v2, Jupiter routes); a watch-only mode alerts without a wallet. Built on candle-bot-core.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

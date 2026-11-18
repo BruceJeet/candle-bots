@@ -1,6 +1,6 @@
 {
   "name": "candle-spike-rider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Buys pump.fun and PumpSwap coins on a volume spike with buyers behind it (on a live price and volume series), and exits them by a pluggable strategy. A Solana bot built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

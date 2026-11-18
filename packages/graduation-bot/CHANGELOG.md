@@ -1,5 +1,9 @@
 # Changelog: candle-graduation-bot
 
+## 0.1.3
+
+- core 0.8.0: exit-read alert (`engine:exits_unread`); dry fills charge Candle's fee and the network fee. This bot wires no sell floor. (The previous npm release pinned core 0.6.0.)
+
 ## 0.1.2
 
 - Pins candle-bot-core 0.6.0 (batch 3: opt-in additions only; no change in this package).

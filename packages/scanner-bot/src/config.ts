@@ -30,7 +30,8 @@ const parseRules: SectionParser<Rules> = (raw) => {
   if (!isObj(raw)) throw new ConfigError(`${w}: required, with at least one of volumeSpike, dip, breakout, feedVolume`);
   only(raw, ["volumeSpike", "dip", "breakout", "feedVolume", "allowIncomplete", "link"], w);
   const out: Rules = { allowIncomplete: bool(raw, "allowIncomplete", w, false), link: str(raw, "link", w, { def: "https://alpha.candle.tv/token/{mint}" })! };
-  const cd = (o: Record<string, unknown>, k: string) => num(o, "cooldownMin", `${w}.${k}`, { min: 1, max: 10_080, int: true, def: 30 });
+  // (0.2.0) feedVolume's default is 60 min: a feed bucket's coins stay hot for hours.
+  const cd = (o: Record<string, unknown>, k: string) => num(o, "cooldownMin", `${w}.${k}`, { min: 1, max: 10_080, int: true, def: k === "feedVolume" ? 60 : 30 });
   const sec = (k: string, keys: string[]) => {
     const o = raw[k];
     if (o === undefined) return null;

@@ -119,7 +119,7 @@ interface Buy {
 
 type Decided = Buy | { readonly verdict: "wait"; readonly reason: string } | { readonly verdict: "skip"; readonly reason: string };
 
-const CORE_STATUS_KEYS = new Set(["at", "mode", "wallet", "strategy", "paused", "stopping", "cycles", "lastCycleMs", "equity", "caps", "queue", "alertsSent", "positions", "stats"]);
+const CORE_STATUS_KEYS = new Set(["at", "mode", "wallet", "strategy", "paused", "stopping", "cycles", "lastCycleMs", "equity", "caps", "queue", "alertsSent", "exitReads", "positions", "stats"]);
 
 function skip(reason: string): Decided {
   return Object.freeze({ verdict: "skip" as const, reason });
@@ -197,6 +197,12 @@ export class Engine {
   lanes = 0;
   /** Exit ticks run (run()). */
   exitTicks = 0;
+  /**
+   * The exit read (the batched market read for the held coins) failing as a whole (an RPC down, 429s, credits out):
+   * since when, how many in a row, the last error. Past alerts.holdAlertMs it is alerted (`engine:exits_unread`): no
+   * stop-loss, take-profit or time exit can run meanwhile. Cleared by a read that answers, or when nothing is held.
+   */
+  private exitReadFail: { since: number; n: number; error: string } | null = null;
   /** Decides in flight (the entries loop), by mint. */
   private inflight = new Map<string, Promise<void>>();
   /** When a waiting candidate is asked again (the entries loop). */
@@ -776,6 +782,19 @@ export class Engine {
     return true;
   }
 
+  /** A whole exit read failed: count it, and alert once it has lasted alerts.holdAlertMs (renotified as any alert). */
+  private exitReadFailed(held: number, e: unknown): void {
+    const now = this.now();
+    const error = String((e as Error)?.message ?? e).slice(0, 160);
+    const f = this.exitReadFail ?? { since: now, n: 0, error };
+    f.n++;
+    f.error = error;
+    this.exitReadFail = f;
+    const forMs = now - f.since;
+    if (forMs >= this.d.cfg.alerts.holdAlertMs)
+      this.d.alerter.raise("engine:exits_unread", `exit reads for ${held} held position(s) have failed for ${Math.round(forMs / 60_000)} min (${f.n} in a row; ${error}): no stop-loss, take-profit or time exit can run until the RPC answers`);
+  }
+
   private async guard(what: string, fn: () => Promise<void>): Promise<void> {
     try {
       await fn();
@@ -1277,8 +1296,20 @@ export class Engine {
   private async exits(): Promise<void> {
     const open = this.mine("open", "exit_stuck");
     const toSell: Array<{ p: PositionRow; fraction: number; reason: string; resetTrail: number | null }> = [];
-    if (!open.length) return;
-    this.markets = await readMarkets(this.d.rpc, open.map((p) => ({ mint: p.mint, decimals: p.decimals })), this.now(), this.d.venues);
+    if (!open.length) {
+      this.exitReadFail = null;
+      return;
+    }
+    try {
+      this.markets = await readMarkets(this.d.rpc, open.map((p) => ({ mint: p.mint, decimals: p.decimals })), this.now(), this.d.venues);
+    } catch (e) {
+      this.exitReadFailed(open.length, e);
+      throw e;
+    }
+    if (this.exitReadFail) {
+      this.d.log.info("exits_read_back", { afterMs: this.now() - this.exitReadFail.since, failures: this.exitReadFail.n });
+      this.exitReadFail = null;
+    }
     // (0.5.0) The trail mark (strategies with trailMark): the highest price since entry, or since the last sell that
     // asked resetTrail; kept in the ledger so a restart does not reset it.
     const trail = this.d.strategy.trailMark === true;
@@ -1706,6 +1737,9 @@ export class Engine {
       alertsSent: this.d.alerter.sent,
       ...extra,
       positions: open,
+      // Only when there is something to say (exit reads failing now, or a sell signed without its floor), so a clean
+      // run's status.json is what it always was.
+      ...(this.exitReadFail || (this.d.executor.sellFloorUnread ?? 0) > 0 ? { exitReads: { failingSince: this.exitReadFail ? new Date(this.exitReadFail.since).toISOString() : null, failuresInARow: this.exitReadFail?.n ?? 0, lastError: this.exitReadFail?.error ?? null, sellFloorUnread: this.d.executor.sellFloorUnread ?? 0 } } : {}),
       stats: { [this.d.trigger.candidateLabel ?? "candidates"]: candidates, ...counts },
     });
   }

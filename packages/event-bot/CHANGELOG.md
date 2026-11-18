@@ -1,5 +1,9 @@
 # Changelog: candle-event-bot
 
+## 0.1.1
+
+- core 0.8.0: bracketed sell floor, exit-read alerts (`engine:exits_unread`, `sell_floor_unread`); dry fills charge Candle's fee and the network fee. (The previous npm release pinned core 0.6.0.)
+
 ## 0.1.0
 
 First version, on candle-bot-core 0.6.0.

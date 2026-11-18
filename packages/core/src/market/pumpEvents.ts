@@ -192,30 +192,33 @@ export function tradesFromLogs(logs: string[], err: unknown = null): PumpTrade[]
   return readTrades(logs, err).trades;
 }
 
+/** (0.8.0) Why a log could not be read to its end. */
+export type PartialReason = "log_truncated" | "depth_mismatch" | "return_mismatch";
+
 /**
  * tradesFromLogs, and whether the log could be read to its end. `partial`: a `Log truncated`, or a stack the log cannot
  * account for, stopped the reading; trades after that point (a pump trade inside a long aggregator route) may be
- * missing, so the caller must treat that moment as unknown.
+ * missing, so the caller must treat that moment as unknown. (0.8.0) `reason` says which, on a partial read.
  */
-export function readTrades(logs: string[], err: unknown = null): { trades: PumpTrade[]; partial: boolean } {
+export function readTrades(logs: string[], err: unknown = null): { trades: PumpTrade[]; partial: boolean; reason?: PartialReason } {
   if (err) return { trades: [], partial: false };
   const out: PumpTrade[] = [];
   const stack: string[] = [];
-  const stop = () => ({ trades: out, partial: true });
+  const stop = (reason: PartialReason) => ({ trades: out, partial: true, reason });
   for (const l of logs) {
     const inv = INVOKE.exec(l);
     if (inv) {
       stack.push(inv[1]);
-      if (stack.length !== Number(inv[2])) return stop(); // the depth the log claims is not the depth it shows
+      if (stack.length !== Number(inv[2])) return stop("depth_mismatch"); // the depth the log claims is not the depth it shows
       continue;
     }
     const ret = RETURN.exec(l);
     if (ret) {
-      if (stack[stack.length - 1] !== ret[1]) return stop(); // a return from a program that is not running
+      if (stack[stack.length - 1] !== ret[1]) return stop("return_mismatch"); // a return from a program that is not running
       stack.pop();
       continue;
     }
-    if (l.startsWith("Log truncated")) return stop();
+    if (l.startsWith("Log truncated")) return stop("log_truncated");
     if (!l.startsWith("Program data: ")) continue;
     const top = stack[stack.length - 1];
     if (top !== PUMP_PROGRAM && top !== PUMP_AMM_PROGRAM) continue;

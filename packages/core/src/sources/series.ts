@@ -58,6 +58,17 @@ export interface SeriesSource {
   subscribe(mints: string[]): void;
   unsubscribe(mints: string[]): void;
   watched(): string[];
+  /**
+   * (0.8.0, optional) Watched coins this source has found it cannot read volume for (no trade-log source on their venue),
+   * mint -> why. Only settled verdicts: a coin still resolving, a failed read or a curve between curve and pool is not
+   * here. The watchlist drops these feed coins and fills from the feed.
+   */
+  unreadable?(): ReadonlyMap<string, string>;
+  /**
+   * (optional) Watched coins whose data costs more than the source's limit (LogsSeries: a stream over maxCoinKbPerMin),
+   * mint -> why. A cost verdict, not a data gap: the watchlist drops these feed coins and keeps listed or pushed ones.
+   */
+  busy?(): ReadonlyMap<string, string>;
 }
 
 interface Agg {

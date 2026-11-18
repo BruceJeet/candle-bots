@@ -1,5 +1,9 @@
 # Changelog: candle-spread-watcher
 
+## 0.1.1
+
+- core 0.8.0: a complete pump.fun curve quoted in another token reads `pump_quote_not_sol` (it read as migrating). Nothing else changes for this bot.
+
 ## 0.1.0
 
 First release, on candle-bot-core 0.7.0 (pinned exactly; it ships `market/venues`).

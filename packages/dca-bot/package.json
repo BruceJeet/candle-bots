@@ -1,6 +1,6 @@
 {
   "name": "candle-dca-bot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Buys or sells a fixed amount of a Solana coin on a timer (dollar-cost averaging): schedules that survive a restart without firing twice, price and impact guards, a budget, optional exits. Candle coins, pump.fun curves and PumpSwap. Built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

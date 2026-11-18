@@ -1,5 +1,14 @@
 # Changelog: candle-dip-buyer
 
+## 0.1.1
+
+- **The fade exit's volume rule needs `exit.minHoldMin` >= `fadeRecentBars + fadeBaselineBars + 1`** (refused at
+  load otherwise), so its baseline is bars after entry, the entry minute's bar excluded. With the baseline reaching back into the fall the bot bought, every
+  calm after a dip read as a fade: in a dry run all 8 trades were sold that way 6-9 min after entry.
+- The example's exit is fade's price rules only (stop loss 0.7, take profit 2, max hold 360 min).
+- Core: the watchlist keeps only coins the series can read.
+- core 0.8.0: bracketed sell floor, exit-read alerts (`engine:exits_unread`, `sell_floor_unread`); dry fills charge Candle's fee and the network fee. (The previous npm release pinned core 0.6.0.)
+
 ## 0.1.0
 
 First version, on candle-bot-core 0.6.0.

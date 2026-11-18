@@ -67,8 +67,10 @@ only.
 | `breakout` | the last close is `minRisePct` % over the low of the last `windowBars` minutes |
 | `feedVolume` | the feed's rolling 5 min volume is at least `minVolume5mUsd` USD (needs `watchlist.feed`) |
 
-Each rule takes `cooldownMin`: one alert per coin and rule per cooldown, kept in the ledger, so a restart does not
-repeat one. `rules.link` (default `https://alpha.candle.tv/token/{mint}`, `""` for none) goes at the end of each alert.
+Each rule takes `cooldownMin` (default 30 min; `feedVolume` 60): one alert per coin and rule, and another only after
+the rule has not held on that coin for the cooldown. A coin that stays hot alerts once, however long it stays hot: a coin that keeps firing at least once per cooldown
+never alerts again until it has been quiet (or off the watchlist) for the cooldown. Kept
+in the ledger, so a restart does not repeat one. `rules.link` (default `https://alpha.candle.tv/token/{mint}`, `""` for none) goes at the end of each alert.
 
 ## Controls and state
 

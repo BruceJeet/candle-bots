@@ -1,5 +1,16 @@
 # Changelog: candle-spike-rider
 
+## 0.1.1
+
+On candle-bot-core 0.8.0 (pinned exactly). Nothing in the rule changes.
+
+- `series.maxCoinKbPerMin` / `series.busyRecheckMin`: a cap on the trade-log stream's cost (Helius meters websocket
+  data). A feed coin streaming over the cap is dropped for a while; held coins never are. `status.json` shows the
+  stream's cost under `spike.series.stream`.
+- Completed pump.fun curves quoted in another token no longer hold a watch place forever.
+- `engine:exits_unread` alert when exit reads for held coins keep failing; `sell_floor_unread` logged and counted.
+- core 0.8.0: bracketed sell floor; dry fills charge Candle's fee and the network fee. (The previous npm release pinned core 0.6.0.)
+
 ## 0.1.0
 
 First version, on candle-bot-core 0.6.0.

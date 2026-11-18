@@ -11,5 +11,5 @@
   "watchlist": { "feed": { "buckets": ["onfire"], "maxCoins": 20, "everySec": 30 }, "maxCoins": 25, "dropAfterMin": 30 },
   "series": { "maxSubscriptions": 25 },
   "dip": { "windowBars": 30, "minFallPct": 35, "minWindowVolumeSol": 10, "bounceBars": 3, "minBouncePct": 5, "maxImpactBps": 300, "cooldownMin": 120, "buyWithinSec": 30 },
-  "exit": { "strategy": "fade", "stopLoss": 0.7, "takeProfit": 2, "fadeRecentBars": 5, "fadeBaselineBars": 20, "fadeBelowRatio": 0.25, "minHoldMin": 5, "maxHoldMin": 360 }
+  "exit": { "strategy": "fade", "stopLoss": 0.7, "takeProfit": 2, "maxHoldMin": 360 }
 }

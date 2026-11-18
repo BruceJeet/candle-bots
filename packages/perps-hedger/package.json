@@ -1,6 +1,6 @@
 {
   "name": "candle-perps-hedger",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hedges the spot bags of a Solana wallet with Hyperliquid perps through Candle: a short on the coin's own perp when Hyperliquid lists it, else on a proxy (SOL), sized by a ratio or a fitted beta; rebalances outside a band, caps leverage and margin, closes reduce-only, books fees and funding. Dry runs on paper. Built on candle-bot-core.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

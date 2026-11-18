@@ -1,7 +1,9 @@
 /**
  * The scanner: a watch-only Watcher. Each step: the watchlist (list, feed bucket), the series poll (prices; trades come
- * on the trade-log socket), then each rule on each watched coin. A firing alerts once per coin and rule per cooldown;
- * the last firing is kept in the ledger (table `scan_fired`, created on first use), so a restart does not repeat it.
+ * on the trade-log socket), then each rule on each watched coin. A firing alerts once per coin and rule; (0.2.0) it
+ * alerts again only after the rule has not held on that coin for its cooldown, so a coin that stays hot alerts once,
+ * not once per cooldown. The last firing and the last time the rule held are kept in the ledger (table `scan_fired`,
+ * created on first use, column `seen` added to an older table), so a restart does not repeat them.
  * By default a rule acts only on complete numbers (no gap in the bars it reads).
  */
 import type { Alerter, Logger, Ledger, Watcher } from "candle-bot-core";
@@ -20,7 +22,7 @@ export interface Firing {
   numbers: Record<string, number | string | boolean>;
 }
 
-const TABLE = "create table if not exists scan_fired (mint text not null, rule text not null, at integer not null, primary key (mint, rule))";
+const TABLE = "create table if not exists scan_fired (mint text not null, rule text not null, at integer not null, seen integer, primary key (mint, rule))";
 
 const r2 = (x: number) => Math.round(x * 100) / 100;
 const sig = (x: number) => Number(x.toPrecision(4));
@@ -69,11 +71,16 @@ export class Scanner implements Watcher {
   private now: () => number;
   private last = new Map<string, Firing[]>();
   fired = 0;
+  /** Hits not alerted because the rule kept holding inside its cooldown. */
+  held = 0;
 
   constructor(d: ScannerDeps) {
     this.d = d;
     this.now = d.now ?? Date.now;
     d.ledger.db.exec(TABLE);
+    // A ledger from 0.1.x has no `seen`: added (null reads as the last firing).
+    const cols = d.ledger.db.prepare("pragma table_info(scan_fired)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "seen")) d.ledger.db.exec("alter table scan_fired add column seen integer");
   }
 
   private cooldownMs(rule: RuleName): number {
@@ -92,12 +99,19 @@ export class Scanner implements Watcher {
     }
   }
 
-  /** Alert once per coin and rule per cooldown (kept in the ledger across restarts). */
+  /**
+   * Alert once per coin and rule; again only once the rule has not held for the cooldown (kept in the ledger across
+   * restarts). Every hit inside the cooldown moves `seen` on, so a coin that stays hot never re-arms.
+   */
   fire(h: Firing): boolean {
     const now = this.now();
-    const row = this.d.ledger.db.prepare("select at from scan_fired where mint = ? and rule = ?").get(h.mint, h.rule) as { at: number } | undefined;
-    if (row && now - row.at < this.cooldownMs(h.rule)) return false;
-    this.d.ledger.db.prepare("insert into scan_fired (mint, rule, at) values (?, ?, ?) on conflict(mint, rule) do update set at = excluded.at").run(h.mint, h.rule, now);
+    const row = this.d.ledger.db.prepare("select at, seen from scan_fired where mint = ? and rule = ?").get(h.mint, h.rule) as { at: number; seen: number | null } | undefined;
+    if (row && now - (row.seen ?? row.at) < this.cooldownMs(h.rule)) {
+      this.d.ledger.db.prepare("update scan_fired set seen = ? where mint = ? and rule = ?").run(now, h.mint, h.rule);
+      this.held++;
+      return false;
+    }
+    this.d.ledger.db.prepare("insert into scan_fired (mint, rule, at, seen) values (?, ?, ?, ?) on conflict(mint, rule) do update set at = excluded.at, seen = excluded.seen").run(h.mint, h.rule, now, now);
     const link = this.d.cfg.rules.link ? ` ${this.d.cfg.rules.link.replace("{mint}", h.mint)}` : "";
     const sym = this.d.feed?.coin(h.mint)?.symbol;
     this.d.alerter.raise(`scan:${h.rule}:${h.mint}:${now}`, `${sym ? `$${sym} ` : ""}${h.mint}: ${h.text}.${link}`, { mint: h.mint, rule: h.rule, ...h.numbers });
@@ -109,6 +123,7 @@ export class Scanner implements Watcher {
   status(): Record<string, unknown> {
     return {
       fired: this.fired,
+      heldByCooldown: this.held,
       rules: Object.keys(this.d.cfg.rules).filter((k) => !["allowIncomplete", "link"].includes(k)),
       watchlist: this.d.watchlist.status(),
       series: this.d.series.status?.() ?? null,

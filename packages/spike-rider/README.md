@@ -69,6 +69,11 @@ after `minHoldMin`. They hold on a gap, so with them `stopLoss` or `maxHoldMin` 
 - Volume comes from pump.fun and PumpSwap trade logs only (Candle curve and DAMM v2 coins have no volume here, and are
   never bought). The public RPC holds about 100 log subscriptions; a private RPC is better for a large watchlist.
 - Sparse gaps (an unreadable log here and there) can make long stretches of bars read incomplete; the rule then waits.
+- RPC cost: on a metered RPC the trade-log stream is most of the spend (Helius bills 2 credits per 0.1 MB of websocket
+  data; one busy coin can stream several MB a minute). `status.json` shows it under `series.stream` (MB and credits a
+  day). `series.maxCoinKbPerMin` drops feed coins that stream more than that (a coin that busy rarely trades six times
+  its own baseline anyway); `watchlist.maxCoins` bounds the rest. A feed `where` of `{ "launchpad": { "eq": "pump.fun" } }`
+  keeps other launchpads' coins, which this bot cannot read, off the watchlist.
 - Spend: `buy.lifetimeSol` counts tickets only. Candle's platform fee (0.25 % a side), network fees and about
   0.002 SOL of token-account rent per new coin come on top: fund the wallet with some room above `lifetimeSol`.
 

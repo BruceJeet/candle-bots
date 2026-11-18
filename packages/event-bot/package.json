@@ -1,6 +1,6 @@
 {
   "name": "candle-event-bot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Buys coins tied to a dated event in a window before it, and exits them in phases keyed to the event: ride the build-up, hedge at the event, keep a moonshot core. A Solana bot built on @candledottv/agent-sdk.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

@@ -1,6 +1,6 @@
 {
   "name": "candle-scanner-bot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Watches pump.fun and PumpSwap coins (a list, or a Candle feed bucket) and alerts on Telegram, Discord or a webhook when a rule fires: a volume spike, a dip, a breakout, a hot 5 m on the feed. Watch-only: no wallet, no key, never trades. Built on candle-bot-core.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "candle-bot-core": "0.7.0"
+    "candle-bot-core": "0.8.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

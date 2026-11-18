@@ -1,5 +1,69 @@
 # Changelog: candle-bot-core
 
+## 0.8.0
+
+Exit safety and stream cost. Two changes reach every bot that wires them at its next build: the bracketed sell floor
+and the exit-read alert. Everything else is opt-in or a fix to a watchlist verdict.
+
+- **A sell's floor brackets Candle's quote.** A linked-payer sell's own floor (`ExecutorDeps.sellFloor`) now also reads
+  the venue as the build starts (in parallel with it), besides the read after the build (as before), and the floor is
+  the lower of the two. Candle quotes between the two, so a price that moved during the build no longer refuses a sound
+  sell: two live stop-loss sells (Nov 12-13) were refused `SELL_FLOOR` when the price bounced during the build
+  (Candle's minOut 1.1 % and 7.6 % under a floor read after it) and sold 3 s and 2 min later, lower. A minOut under both
+  reads is still refused, and the refused attempt's row records `floorBefore` and `floorAfter`. The read after the
+  build still decides whether there is a check (missing: none, as before); the first read can only lower the floor, so
+  no sell is refused that the old check would have signed. The first read counts only if it is above 0 (pump's sell
+  math answers 0 when the fee covers the gross) and at most 25 % under the read after the build
+  (`FLOOR_BEFORE_MAX_DROP_BPS`), so it can never switch the check off; and once the read after the build has answered
+  it gets at most 250 ms more (`FLOOR_BEFORE_GRACE_MS`), so a stalled read never holds a built sell.
+  Every bot that wires `sellFloor` gets this at its next build and redeploy (dip-buyer, exit-manager, dca-bot,
+  rebalancer, event-bot, wallet-mirror, spike-rider, rug-watcher, profit-sweeper). Cost: one more venue
+  read per linked sell attempt, attempts that end early included (WRONG_WALLET, UNKNOWN_PROGRAM, a failed build).
+- **`attempt_timing`** (opt-in: `ExecutorDeps.logTimings`, off by default so other bots' event logs are unchanged).
+  Each live attempt that is submitted or refused by the sell floor logs `buildMs`, `floorMs` (the read after the build
+  plus any wait left on the first), `signMs`, `submitMs` and `totalMs` (to that point, before the confirm read).
+- **Watchlist keeps only coins the series can read.** `SeriesSource.unreadable()` (optional) lists watched coins with
+  no trade-log source (settled verdicts only: a pump curve between curve and pool is not one). The watchlist drops such
+  feed coins and fills the place from the feed; each is logged once (`watchlist_dropped_unreadable`) and tried again
+  after `recheckMs` (60 min) or when it returns to the feed. A listed or pushed coin is kept and alerted once.
+  `dropUnreadable: false` keeps the old behaviour. Status: `skippedUnreadable`, `droppedUnreadable`. Only verdicts
+  from the chain count (no curve or pool, another quote, mayhem, a Candle curve or DAMM v2 venue): a failed read never
+  drops a coin. Rechecks come back one coin a step. A displaced feed coin stays subscribed for `lingerMs` (2 min,
+  while the series has room), so it comes back with its bars if its replacement turns out unreadable (`lingering`). Lingering coins never hold
+  a place a new coin needs: past the cap, the ones nearest their end leave first.
+- **Fewer alerts from the series.** A coin with no trade-log source and a partial transaction log are logged once per
+  coin (`series_no_log_source`, `series_log_unreadable`), not alerted (they were ~700 and ~530 alerts in 40 h per
+  bot). Status adds `logReads`: transactions read, how many only in part, and `byReason` (`log_truncated`,
+  `depth_mismatch`, `return_mismatch`), all since start. `readTrades` returns the `reason` of a partial read; the
+  `series_log_unreadable` line carries it with the log's line count, bytes and the trades read before the cut.
+- **A lasting exit-read failure is alerted.** When the batched market read for the held coins fails as a whole (an RPC
+  down, 429s, credits out, as on Nov 13), no stop-loss, take-profit or time exit can run; before this only
+  `cycle_step_failed` was logged. Past `alerts.holdAlertMs` (default 5 min) it raises `engine:exits_unread`
+  (renotified as any alert). A read that answers logs `exits_read_back`. status.json has `exitReads` (since when, how
+  many in a row, the last error) only while reads fail, so a clean run's status is unchanged.
+- **An unread sell floor is logged and counted.** With a linked payer's sell floor (`sellFloor`), a read that throws or
+  answers nothing still signs the sell with Candle's floor only (never strand an exit), and now logs `sell_floor_unread`
+  (why) and counts it (`Executor.sellFloorUnread`; status `exitReads.sellFloorUnread` once above 0).
+- **The trade-log stream's cost, and a cap on it.** A metered RPC bills websocket data (Helius: 2 credits per 0.1 MB,
+  uncompressed), and a busy coin's logs are most of a series bot's spend: a dry spike-rider's own counts on Nov 10-12 (45.6M
+  transactions read in 3.3 days, about 4.9 KB a notification) come to about 68 GB a day. The socket now counts every
+  frame's bytes (`bytesReceived()`; each notification carries its `bytes`), and LogsSeries' status has `stream`: MB since
+  start, the last hour's MB a day and Helius credits a day, and the five busiest coins in KB a minute (10 min window).
+  New `series.maxCoinKbPerMin` (off by default): a feed coin whose stream averages more than that over the last 10 min
+  before its last 3 min, so a coin spiking now is judged on its stream before the spike; judged once that span holds
+  60 s, i.e. after about 4 min watched) is dropped from the watchlist (`watchlist_dropped_busy`, once per coin, never
+  alerted) and tried again after `series.busyRecheckMin` (180). Held, listed and pushed coins are never dropped for
+  it. Watchlist status adds `droppedBusy` and `busyRecheckMin`.
+- **A completed pump curve quoted in another token is a verdict, not a migration.** With no canonical SOL pool, the
+  reader said `migrating` (not settled), so the watchlist never dropped these coins: on Nov 14 they were 9 of the 27
+  pump.fun coins in the onfire bucket, each holding a watch place it could never use. They now read
+  `pump_quote_not_sol`, as an incomplete curve in another quote already did. A SOL-quoted complete curve without its
+  pool is still `migrating`.
+- **Dry fills charge Candle's fee and the network fee.** 25 bps a side (on top of a buy, out of a sell's proceeds, as
+  a live fill books it) and 5,000 lamports a transaction (`DRY_COSTS`; `ExecutorDeps.dryCosts` overrides). A dry round
+  trip now costs about 0.5 % of the ticket and 10,000 lamports more than before. Token-account rent is not charged
+  (live fills book it on a coin's first buy; it depends on the account).
+
 ## 0.7.0
 
 Batches 4 to 6. New modules only, all opt-in: no existing module changed, and nothing changes for an existing bot.
